@@ -97,12 +97,12 @@ def render_sidebar_filters(default_days: int = 30,
             help="Vacio = todas las sedes",
         )
 
-        # Fechas. Default = hoy (rango de 1 dia), clipped al rango real de datos.
-        # El parametro default_days queda por compatibilidad pero el default
-        # global es hoy/hoy para que el cierre operativo sea inmediato.
+        # Fechas. Default = ultimos 3 dias (hoy - 2 .. hoy), clipped al rango
+        # real de datos. El parametro default_days queda por compatibilidad
+        # pero el default global es 3 dias.
         today = dt.date.today()
         default_hasta = min(today, d_max)
-        default_desde = default_hasta
+        default_desde = max(d_min, default_hasta - dt.timedelta(days=2))
         if "v2_fechas" not in st.session_state:
             st.session_state["v2_fechas"] = (default_desde, default_hasta)
         rango = st.date_input(

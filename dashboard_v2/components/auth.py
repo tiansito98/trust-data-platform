@@ -38,7 +38,7 @@ def require_auth() -> None:
 
     with st.form("login_form", clear_on_submit=False):
         user = st.text_input("Usuario", key="login_user")
-        pwd = st.text_input("Contrasenia", type="password", key="login_pwd")
+        pwd = st.text_input("Contraseña", type="password", key="login_pwd")
         submitted = st.form_submit_button("Entrar")
 
     if submitted:
@@ -53,7 +53,7 @@ def require_auth() -> None:
             st.session_state["dashboard_user"] = user
             st.rerun()
         else:
-            st.error("Usuario o contrasenia incorrectos.")
+            st.error("Usuario o contraseña incorrectos.")
     st.stop()
 
 
