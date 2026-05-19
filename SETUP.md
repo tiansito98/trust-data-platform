@@ -9,7 +9,7 @@
 - **Windows 10/11** con PowerShell.
 - **Python 3.10 o superior** ([python.org](https://www.python.org/downloads/) → marcar "Add Python to PATH").
 - **Acceso al Redshift Data Exchange de Sixt** ya configurado:
-  - SSH private key en `C:\Users\Sebastian\.ssh\sixt_redshift.pem`.
+  - SSH private key en `C:\Users\Sebastian\.ssh\sixt_key.pem`.
   - User + password Redshift de Sven.
   - Tu IP whitelisted del lado de Sixt.
 
@@ -52,37 +52,39 @@ notepad .env
 Llenar todos los campos. Los datos correctos a fecha 2026-04-30:
 
 ```env
-SIXT_SSH_HOST=bastion_redshift.datashop.sixt.com
+SIXT_SSH_HOST=<sixt-bastion-host>
 SIXT_SSH_PORT=22
-SIXT_SSH_USER=redshift-user
-SIXT_SSH_KEY_PATH=C:/Users/Sebastian/.ssh/sixt_redshift.pem
+SIXT_SSH_USER=<ssh-user>
+SIXT_SSH_KEY_PATH=<path-to-your-ssh-key.pem>
 SIXT_SSH_KEY_PASSPHRASE=
 
-SIXT_REDSHIFT_HOST=sds-prod-redshift-consumption-cluster.ctictghdoqz4.eu-west-1.redshift.amazonaws.com
+SIXT_REDSHIFT_HOST=<sixt-redshift-cluster>.redshift.amazonaws.com
 SIXT_REDSHIFT_PORT=5439
-SIXT_REDSHIFT_DB=prod_database
-SIXT_REDSHIFT_USER=franchise_co_409_user
-SIXT_REDSHIFT_PASSWORD=<TU_PASSWORD>
+SIXT_REDSHIFT_DB=<redshift-db>
+SIXT_REDSHIFT_USER=<redshift-user>
+SIXT_REDSHIFT_PASSWORD=<your-password>
 
 TRUST_MNDT_CODE=409
-TRUST_OPRT_EMAIL=co1025@franchise.sixt.com
+TRUST_OPRT_EMAIL=<your-trust-operator-email>
 
 LOCAL_PORT=8990
 ```
+
+> Los valores reales viven en tu `.env` local (gitignored). Ver `.env.example` para la lista completa de variables.
 
 ---
 
 ## 4. Verificar la SSH key tiene permisos correctos
 
 ```powershell
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem"
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem"
 ```
 
 Debe mostrar **solo** tu usuario con `(R)`. Si ves `BUILTIN\Users` o similar, corregir:
 
 ```powershell
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem" --% /inheritance:r
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem" --% /grant:r "%USERNAME%:R"
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem" --% /inheritance:r
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem" --% /grant:r "%USERNAME%:R"
 ```
 
 ---
@@ -97,7 +99,7 @@ Debe mostrar:
 ```
 [1] OK tunnel abierto en localhost:8990
 [2] OK Redshift conectado
-[3] user=franchise_co_409_user db=prod_database
+[3] user=<redshift-user> db=<redshift-db>
     Tablas accesibles: 20
 ```
 

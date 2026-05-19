@@ -51,3 +51,7 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Notebooks (pueden contener data/queries reales — solo locales)
+*.ipynb
+notebooks/

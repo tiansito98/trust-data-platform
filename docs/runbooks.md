@@ -24,9 +24,9 @@ python -c "import paramiko; print(paramiko.__version__)"   # debe ser 3.5.x
 
 **Fix:**
 ```powershell
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem" --% /inheritance:r
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem" --% /grant:r "%USERNAME%:R"
-icacls "$env:USERPROFILE\.ssh\sixt_redshift.pem"   # debe mostrar solo tu user con (R)
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem" --% /inheritance:r
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem" --% /grant:r "%USERNAME%:R"
+icacls "$env:USERPROFILE\.ssh\sixt_key.pem"   # debe mostrar solo tu user con (R)
 ```
 
 ---
@@ -48,7 +48,7 @@ Si difiere de la última IP que mandaste a Florian, escribirle:
 
 ---
 
-### Síntoma: `password authentication failed for user "franchise_co_409_user"`
+### Síntoma: `password authentication failed for user "<redshift-user>"`
 
 **Causa:** Password mal copiada en `.env` (espacios al inicio/final, caracteres rotos).
 

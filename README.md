@@ -204,5 +204,5 @@ Migración futura a cloud cuando el volumen lo justifique:
 ## Contacto técnico
 
 - Trust Colombia mandant: `409`
-- Operator email: `co1025@franchise.sixt.com`
-- Sixt corporate IT lead: Florian Merkel (cred. via Sven)
+- Operator email: en `.env` local (`TRUST_OPRT_EMAIL`)
+- Sixt corporate IT lead: contacto privado

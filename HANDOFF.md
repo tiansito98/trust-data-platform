@@ -74,10 +74,10 @@ Sanity check del ranking ejecutivo (`vw_ranking_sedes`):
 
 ### ✅ Conexión Redshift — VALIDADA
 
-- **SSH tunnel:** `bastion_redshift.datashop.sixt.com:22` con user `redshift-user` y key OpenSSH (en `C:\Users\Sebastian\.ssh\sixt_redshift.pem`).
-- **Cluster Redshift:** `sds-prod-redshift-consumption-cluster.ctictghdoqz4.eu-west-1.redshift.amazonaws.com:5439`.
-- **Database:** `prod_database`.
-- **User:** `franchise_co_409_user` (RLS aplicado server-side, solo ve mandant 409).
+- **SSH tunnel:** `<sixt-bastion-host>:22` con user `<ssh-user>` y key OpenSSH (path en `.env` local).
+- **Cluster Redshift:** `<sixt-redshift-cluster>.redshift.amazonaws.com:5439`.
+- **Database:** `<redshift-db>` (valor real en `.env`).
+- **User:** `<redshift-user>` (RLS aplicado server-side, solo ve mandant 409).
 - **Password:** vive en `.env` local.
 - **Stack que funcionó:** Python + `paramiko<4.0` + `sshtunnel` + `redshift-connector` + `sslmode=require`.
 
