@@ -126,12 +126,17 @@ if contrato_str.isdigit():
                 .fillna(0).astype("Int64").astype(str)
             )
 
-            view = df_items.copy()
-            view["subtotal_con_iva_cop"] = view["subtotal_con_iva_cop"].apply(
+            # Linea por cargo
+            det_view = df_items[[
+                "cargo_inty", "cargo_codigo", "cargo_descripcion",
+                "cargo_categoria", "cantidad",
+                "subtotal_con_iva_cop", "subtotal_con_iva_usd",
+            ]].copy()
+            det_view["subtotal_con_iva_cop"] = det_view["subtotal_con_iva_cop"].apply(
                 lambda v: fmt_money(v, "COP"))
-            view["subtotal_con_iva_usd"] = view["subtotal_con_iva_usd"].apply(
+            det_view["subtotal_con_iva_usd"] = det_view["subtotal_con_iva_usd"].apply(
                 lambda v: fmt_money(v, "USD"))
-            view = view.rename(columns={
+            det_view = det_view.rename(columns={
                 "cargo_inty": "Tipo",
                 "cargo_codigo": "Cod",
                 "cargo_descripcion": "Descripcion",
@@ -140,7 +145,36 @@ if contrato_str.isdigit():
                 "subtotal_con_iva_cop": "Subtotal c/IVA (COP)",
                 "subtotal_con_iva_usd": "Subtotal c/IVA (USD)",
             })
-            st.dataframe(view, use_container_width=True, hide_index=True)
+
+            # Footer estilo factura: bruto, descuento, TOTAL CON IVA.
+            # Los items en df_items ya vienen con IVA, asi que multiplicamos
+            # bruto/descuento del head por 1.19 para que las sumas cuadren.
+            iva_factor = 1.19
+            try:
+                bruto_iva_cop = float(head["bruto_cop"]) * iva_factor if pd.notna(head["bruto_cop"]) else 0.0
+                bruto_iva_usd = float(head["bruto_usd"]) * iva_factor if pd.notna(head["bruto_usd"]) else 0.0
+                desc_iva_cop = float(head["descuento_cop"]) * iva_factor if pd.notna(head["descuento_cop"]) else 0.0
+                desc_iva_usd = float(head["descuento_usd"]) * iva_factor if pd.notna(head["descuento_usd"]) else 0.0
+            except Exception:
+                bruto_iva_cop = bruto_iva_usd = desc_iva_cop = desc_iva_usd = 0.0
+
+            footer = pd.DataFrame([
+                {"Tipo": "", "Cod": "", "Descripcion": "--- Subtotal bruto ---",
+                 "Categoria": "", "Cant": "",
+                 "Subtotal c/IVA (COP)": fmt_money(bruto_iva_cop, "COP"),
+                 "Subtotal c/IVA (USD)": fmt_money(bruto_iva_usd, "USD")},
+                {"Tipo": "", "Cod": "", "Descripcion": "--- Descuento ---",
+                 "Categoria": "", "Cant": "",
+                 "Subtotal c/IVA (COP)": fmt_money(-desc_iva_cop, "COP"),
+                 "Subtotal c/IVA (USD)": fmt_money(-desc_iva_usd, "USD")},
+                {"Tipo": "", "Cod": "", "Descripcion": "*** TOTAL CON IVA ***",
+                 "Categoria": "", "Cant": "",
+                 "Subtotal c/IVA (COP)": fmt_money(total_cop, "COP"),
+                 "Subtotal c/IVA (USD)": fmt_money(total_usd, "USD")},
+            ])
+
+            factura = pd.concat([det_view, footer], ignore_index=True)
+            st.dataframe(factura, use_container_width=True, hide_index=True)
 elif contrato_str:
     st.warning("El numero de contrato debe ser solo digitos.")
 
