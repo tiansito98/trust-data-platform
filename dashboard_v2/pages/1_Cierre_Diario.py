@@ -181,7 +181,7 @@ else:
     FROM vw_rentals_detail
     WHERE fuente_cargo = 'RENTAL_COUNTER'
       AND rental_currency = 'USD'
-      AND CAST(numero_contrato AS INTEGER) IN ({placeholders})
+      AND CAST(numero_contrato AS BIGINT) IN ({placeholders})
     ORDER BY DATE(fecha_handover_real) DESC, numero_contrato,
              cargo_inty, cargo_posicion
     """
