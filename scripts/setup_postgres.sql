@@ -23,6 +23,11 @@ COMMENT ON SCHEMA operational IS 'Datos capturados por Trust: facturas, novedade
 -- silver primero, bronze segundo: queries del dashboard usan nombres no-prefijados.
 ALTER DATABASE postgres SET search_path TO silver, bronze, operational, public;
 
+-- statement_timeout: el default de Supabase (2 min) mata vw_rentals_detail
+-- y otras queries grandes. Subimos a 15 min para el rol postgres (que es
+-- el que usan los pipelines y el dashboard).
+ALTER ROLE postgres SET statement_timeout = '15min';
+
 -- En la sesion actual tambien, para que el resto de este script funcione sin prefijos.
 SET search_path TO silver, bronze, operational, public;
 

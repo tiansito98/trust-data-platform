@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 # Resolver root del proyecto para importar scripts/get_secret.py
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -41,14 +41,24 @@ def get_engine():
     """SQLAlchemy engine cacheado, apuntando a Supabase Postgres.
 
     search_path: silver primero (analytics), operational despues (invoices form).
+    El pooler de Supabase ignora `-c options` en algunos casos; un event
+    listener lo aplica via SET inmediatamente despues de cada connect, lo cual
+    es 100% confiable.
     """
     url = get_secret("SUPABASE_DB_URL")
-    return create_engine(
+    engine = create_engine(
         url,
         pool_pre_ping=True,
         pool_recycle=300,
-        connect_args={"options": "-csearch_path=silver,operational,public"},
     )
+
+    @event.listens_for(engine, "connect")
+    def _set_session_state(dbapi_conn, _conn_record):
+        with dbapi_conn.cursor() as cur:
+            cur.execute("SET search_path TO silver, operational, public")
+            cur.execute("SET statement_timeout = '60s'")
+
+    return engine
 
 
 # user-scoped caching: incluimos el usuario autenticado en la cache key para
@@ -85,6 +95,10 @@ def load_query(sql: str, params: tuple | dict = (),
         sql = "".join(out_sql)
         params = named
     with engine.connect() as conn:
+        # Set search_path explicitly en ESTA conexion antes de la query.
+        # El pooler de Supabase no honora el event-listener ni connect_args
+        # consistentemente, asi que lo seteamos inline. Cheapo (~1ms).
+        conn.execute(text("SET search_path TO silver, operational, public"))
         if isinstance(params, dict):
             return pd.read_sql_query(text(sql), conn, params=params)
         if not params:
@@ -96,6 +110,7 @@ def execute_write(sql: str, params: dict) -> None:
     """Para forms del dashboard (invoice entry). Escribe y commit."""
     engine = get_engine()
     with engine.begin() as conn:
+        conn.execute(text("SET LOCAL search_path TO silver, operational, public"))
         conn.execute(text(sql), params)
 
 
@@ -234,9 +249,17 @@ def get_fecha_range() -> tuple:
         "FROM vw_rentals_resumen WHERE rental_currency = 'USD'"
     )
     import datetime as dt
-    d_min = dt.date.fromisoformat(df["d_min"].iloc[0])
-    d_max = dt.date.fromisoformat(df["d_max"].iloc[0])
-    return d_min, d_max
+
+    def _to_date(v):
+        # Postgres devuelve DATE como dt.date; SQLite legacy lo daba como str.
+        # Aceptamos ambos para mantener compatibilidad.
+        if isinstance(v, dt.date):
+            return v
+        if isinstance(v, dt.datetime):
+            return v.date()
+        return dt.date.fromisoformat(str(v))
+
+    return _to_date(df["d_min"].iloc[0]), _to_date(df["d_max"].iloc[0])
 
 
 @st.cache_data(ttl=600)

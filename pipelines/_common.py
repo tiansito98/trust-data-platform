@@ -139,10 +139,13 @@ def get_engine(schema: str | None = None) -> Engine:
 
     url = _ensure_pg()
 
-    connect_args: dict = {}
+    # Supabase aplica statement_timeout=2min por defecto al role postgres; el
+    # build de silver tiene queries (vw_rentals_detail, vw_kpi_*) que tardan
+    # mas. Subimos a 15 min para esta conexion. Tambien seteamos search_path.
+    options = ["-cstatement_timeout=900000"]  # 15 min en ms
     if schema:
-        # Postgres acepta options="-c search_path=..." al conectar.
-        connect_args["options"] = f"-csearch_path={schema},operational,public"
+        options.append(f"-csearch_path={schema},operational,public")
+    connect_args = {"options": " ".join(options)}
 
     engine = create_engine(
         url,

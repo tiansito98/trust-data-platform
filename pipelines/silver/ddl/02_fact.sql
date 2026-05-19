@@ -36,12 +36,16 @@ DROP TABLE IF EXISTS silver.fact_charges_rs CASCADE;
 CREATE TABLE silver.fact_charges_rs AS
 SELECT * FROM bronze.rent_shop_ch_fct_rs_charges_franchise;
 CREATE INDEX IF NOT EXISTS idx_fact_charges_rs_resn ON silver.fact_charges_rs(chrs_resn);
+-- Composite para acelerar el self-join konr en vw_rentals_detail / vw_charges_rs_enriched
+CREATE INDEX IF NOT EXISTS idx_fact_charges_rs_key  ON silver.fact_charges_rs(chrs_resn, chrs_inty, chrs_pos, chrs_konr);
 
 
 DROP TABLE IF EXISTS silver.fact_charges_ra CASCADE;
 CREATE TABLE silver.fact_charges_ra AS
 SELECT * FROM bronze.rent_shop_ch_fct_ra_charges_franchise;
 CREATE INDEX IF NOT EXISTS idx_fact_charges_ra_mvnr ON silver.fact_charges_ra(chra_mvnr);
+-- Composite para acelerar el self-join konr en vw_rentals_detail / vw_charges_ra_enriched / vw_rentals_full
+CREATE INDEX IF NOT EXISTS idx_fact_charges_ra_key  ON silver.fact_charges_ra(chra_mvnr, chra_inty, chra_pos, chra_konr);
 
 
 DROP TABLE IF EXISTS silver.fact_damages CASCADE;

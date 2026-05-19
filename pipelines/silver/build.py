@@ -44,6 +44,11 @@ def log(msg: str):
 
 def _exec(engine, sql: str):
     with engine.begin() as conn:
+        # Apaga el statement_timeout para esta transaccion. Necesario para
+        # queries grandes como vw_rentals_detail (~100K rows + self-joins).
+        # Requiere que ALTER ROLE postgres SET statement_timeout='15min'
+        # se haya corrido una vez via setup_postgres.sql.
+        conn.execute(text("SET LOCAL statement_timeout = 0"))
         conn.execute(text(sql))
 
 
