@@ -119,12 +119,13 @@ def inject_styles():
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
-def render_header(subtitle: str = "Analitica"):
+def render_header(subtitle: str = ""):
+    sub_html = f"<span> &mdash; </span>{subtitle}" if subtitle else ""
     st.markdown(
         f"""
         <div class="sixt-header">
-            <h1>TRUST<span> v2 </span>{subtitle}</h1>
-            <div class="badge">Sixt Colombia · Mandant 409</div>
+            <h1>TRUST{sub_html}</h1>
+            <div class="badge">SIXT COLOMBIA</div>
         </div>
         """,
         unsafe_allow_html=True,

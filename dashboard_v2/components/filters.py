@@ -97,10 +97,12 @@ def render_sidebar_filters(default_days: int = 30,
             help="Vacio = todas las sedes",
         )
 
-        # Fechas
-        # Default range: ultimos default_days, clipped al rango de datos.
-        default_hasta = d_max
-        default_desde = max(d_min, default_hasta - dt.timedelta(days=default_days))
+        # Fechas. Default = hoy (rango de 1 dia), clipped al rango real de datos.
+        # El parametro default_days queda por compatibilidad pero el default
+        # global es hoy/hoy para que el cierre operativo sea inmediato.
+        today = dt.date.today()
+        default_hasta = min(today, d_max)
+        default_desde = default_hasta
         if "v2_fechas" not in st.session_state:
             st.session_state["v2_fechas"] = (default_desde, default_hasta)
         rango = st.date_input(
@@ -111,8 +113,21 @@ def render_sidebar_filters(default_days: int = 30,
         )
         if isinstance(rango, tuple) and len(rango) == 2:
             fecha_desde, fecha_hasta = rango
+        elif isinstance(rango, dt.date):
+            # Streamlit devuelve un solo date cuando aun no se cierra el rango
+            fecha_desde = fecha_hasta = rango
         else:
             fecha_desde, fecha_hasta = default_desde, default_hasta
+
+        # Caption inline para feedback visual del rango seleccionado.
+        if fecha_desde == fecha_hasta:
+            st.caption(f"Mostrando: **{fecha_desde.isoformat()}** (1 dia)")
+        else:
+            dias = (fecha_hasta - fecha_desde).days + 1
+            st.caption(
+                f"Mostrando: **{fecha_desde.isoformat()}** &rarr; "
+                f"**{fecha_hasta.isoformat()}** ({dias} dias)"
+            )
 
         # Moneda + TRM
         moneda = st.radio(

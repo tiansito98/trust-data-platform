@@ -29,7 +29,7 @@ from components.common import (
 from components.filters import render_sidebar_filters, render_active_filters_banner
 from components.auth import require_auth, logout_button
 
-st.set_page_config(page_title="Trust v2 - Cierre Diario", layout="wide")
+st.set_page_config(page_title="TRUST - Cierre Diario", layout="wide")
 require_auth()
 inject_styles()
 logout_button()
@@ -289,11 +289,3 @@ else:
             ])
             factura = pd.concat([det_view, footer], ignore_index=True)
             st.dataframe(factura, use_container_width=True, hide_index=True)
-
-# ---------- Footer de validacion ----------
-st.markdown("---")
-st.caption(
-    "Validacion: contrato 9523073821 (MEDELLIN AP JOSE MARIA CORDOVA, "
-    "2026-04-28) debe sumar $826.95 USD total con IVA. "
-    "Buscalo arriba para verificar visualmente."
-)

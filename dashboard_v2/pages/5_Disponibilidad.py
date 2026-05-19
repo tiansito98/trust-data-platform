@@ -23,7 +23,7 @@ from components.common import (
 from components.filters import render_sidebar_filters, render_active_filters_banner
 from components.auth import require_auth, logout_button
 
-st.set_page_config(page_title="Trust v2 - Disponibilidad", layout="wide")
+st.set_page_config(page_title="TRUST - Disponibilidad", layout="wide")
 require_auth()
 inject_styles()
 logout_button()

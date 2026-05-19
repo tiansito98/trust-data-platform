@@ -21,7 +21,7 @@ from components.filters import render_sidebar_filters, render_active_filters_ban
 from components.auth import require_auth, logout_button
 
 st.set_page_config(
-    page_title="Trust v2",
+    page_title="TRUST",
     layout="wide",
     initial_sidebar_state="expanded",
 )
