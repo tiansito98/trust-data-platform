@@ -55,3 +55,10 @@ desktop.ini
 # Notebooks (pueden contener data/queries reales — solo locales)
 *.ipynb
 notebooks/
+
+# Auto-generated docs que pueden incluir sample values con PII real (emails,
+# nombres, cedulas, telefonos). Solo locales.
+docs/data_dictionary.md
+docs/*_samples.md
+docs/*_samples.yml
+docs/*_dump.md
