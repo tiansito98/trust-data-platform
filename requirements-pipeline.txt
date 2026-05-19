@@ -1,0 +1,18 @@
+# =============================================================================
+# Trust Data Platform - dependencias del PIPELINE (GitHub Actions)
+# =============================================================================
+# Esto lo instala el self-hosted runner antes de correr scripts/run_pipeline.py.
+# Incluye todo lo del dashboard + lo que necesita para Redshift via SSH.
+# =============================================================================
+
+-r requirements.txt
+
+# Redshift source via SSH tunnel
+redshift-connector>=2.1.0
+sshtunnel>=0.4.0
+paramiko>=3.5,<4.0      # IMPORTANTE: paramiko 4.0 rompe sshtunnel (DSSKey deprecado)
+
+# Config + utilidades
+python-dotenv>=1.0.0
+pyyaml>=6.0
+tqdm>=4.66.0

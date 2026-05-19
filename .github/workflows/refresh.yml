@@ -1,0 +1,71 @@
+name: refresh
+
+# Pipeline 3x al dia: 06:00, 12:00 y 18:00 Colombia (UTC-5).
+# Cron de GitHub corre en UTC, asi que: 11, 17, 23 UTC.
+#
+# Self-hosted runner: corre en una maquina con IP estable que el bastion de
+# Sixt ya tiene en allowlist. Ver scripts/run_pipeline.py para el flujo.
+#
+# Manual: dispatch desde la pestana Actions con el boton "Run workflow".
+
+on:
+  schedule:
+    - cron: '0 11 * * *'   # 06:00 COT
+    - cron: '0 17 * * *'   # 12:00 COT
+    - cron: '0 23 * * *'   # 18:00 COT
+  workflow_dispatch:
+    inputs:
+      full_load:
+        description: 'Hacer FULL load de bronze (en lugar de incremental). Lento, usar solo si watermark esta corrupto.'
+        type: boolean
+        default: false
+        required: false
+
+concurrency:
+  group: trust-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    env:
+      # Supabase
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      # SSH tunnel a Sixt (la llave la escribe run_pipeline.py desde SIXT_SSH_PRIVATE_KEY)
+      SIXT_SSH_HOST: ${{ secrets.SIXT_SSH_HOST }}
+      SIXT_SSH_PORT: ${{ secrets.SIXT_SSH_PORT }}
+      SIXT_SSH_USER: ${{ secrets.SIXT_SSH_USER }}
+      SIXT_SSH_PRIVATE_KEY: ${{ secrets.SIXT_SSH_PRIVATE_KEY }}
+      SIXT_SSH_KEY_PASSPHRASE: ${{ secrets.SIXT_SSH_KEY_PASSPHRASE }}
+      # Redshift Sixt
+      SIXT_REDSHIFT_HOST: ${{ secrets.SIXT_REDSHIFT_HOST }}
+      SIXT_REDSHIFT_PORT: ${{ secrets.SIXT_REDSHIFT_PORT }}
+      SIXT_REDSHIFT_DB: ${{ secrets.SIXT_REDSHIFT_DB }}
+      SIXT_REDSHIFT_USER: ${{ secrets.SIXT_REDSHIFT_USER }}
+      SIXT_REDSHIFT_PASSWORD: ${{ secrets.SIXT_REDSHIFT_PASSWORD }}
+      # Pipeline
+      TRUST_MNDT_CODE: ${{ secrets.TRUST_MNDT_CODE }}
+      LOCAL_PORT: ${{ secrets.LOCAL_PORT }}
+      BRONZE_INITIAL_LOOKBACK_DAYS: ${{ secrets.BRONZE_INITIAL_LOOKBACK_DAYS }}
+      BRONZE_PAGE_SIZE: ${{ secrets.BRONZE_PAGE_SIZE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-pipeline.txt
+
+      - name: Run pipeline
+        run: |
+          python scripts/run_pipeline.py ${{ github.event.inputs.full_load == 'true' && '--full' || '' }}

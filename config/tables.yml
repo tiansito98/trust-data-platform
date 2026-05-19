@@ -1,0 +1,194 @@
+# ===================================================================
+#  Configuracion de tablas Bronze
+#  Mapea cada tabla del Redshift Data Exchange a su pipeline.
+# ===================================================================
+#
+#  Formato:
+#    - source: <schema>.<tabla>          # tabla origen en Redshift
+#      target: <tabla_local>             # nombre en bronze.db (espejo, '_' en lugar de '.')
+#      order_by: "<columnas>"            # para paginar el SELECT (debe ser determinístico)
+#      filter_mandant: true|false        # si filtra por mndt_code = 409
+#      mode: full | incremental_watermark | incremental_pk_diff
+#      watermark_col: <columna>          # solo si mode = incremental_watermark
+#      pk: ["col1", "col2"]              # solo para upsert / incremental_pk_diff
+#      notes: "..."                      # observaciones libres
+#
+# ===================================================================
+
+tables:
+
+  # ---- Common ----
+  - source: common_shop.br_dim_branches
+    target: common_shop_br_dim_branches
+    order_by: "brnc_code"
+    filter_mandant: true
+    mode: full        # poco volátil, full reload barato
+    pk: ["brnc_code"]
+    notes: "Sedes. ~6 filas para Trust CO. Full reload."
+
+  - source: common_shop.mn_dim_mandants
+    target: common_shop_mn_dim_mandants
+    order_by: "mndt_code"
+    filter_mandant: true
+    mode: full
+    pk: ["mndt_code"]
+    notes: "Mandantes. 1 fila (409). Full reload."
+
+  # ---- Customer ----
+  - source: customer_shop.pa_dim_partners_franchise
+    target: customer_shop_pa_dim_partners_franchise
+    order_by: "prtn_kdnr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["prtn_kdnr"]
+    notes: "Partners (KDNRs). PK confirmada via SVV_REDSHIFT_COLUMNS: prtn_kdnr."
+
+  - source: customer_shop.pa_dim_agencies_franchise
+    target: customer_shop_pa_dim_agencies_franchise
+    order_by: "agnc_age"
+    filter_mandant: true
+    mode: full
+    pk: ["agnc_age"]
+    notes: "Agencias. Confirmar PK exacta."
+
+  # ---- Fleet ----
+  - source: fleet_shop.ve_dim_vehicle_groups_franchise
+    target: fleet_shop_ve_dim_vehicle_groups_franchise
+    order_by: "vhgr_crs"
+    filter_mandant: true
+    mode: full
+    pk: ["vhgr_crs"]
+    notes: "Vehicle groups (ACRISS codes). Pequeña, full reload."
+
+  - source: fleet_shop.ve_dim_vehicle_models
+    target: fleet_shop_ve_dim_vehicle_models
+    order_by: "vhmd_cdef"
+    filter_mandant: false  # confirmar
+    mode: full
+    pk: ["vhmd_cdef"]
+    notes: "Modelos. Confirmar si tiene mndt_code o es global."
+
+  - source: fleet_shop.ve_dim_vehicles
+    target: fleet_shop_ve_dim_vehicles
+    order_by: "vhcl_int_num"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["vhcl_int_num"]
+    notes: "Master de vehículos. SCD2 va a vivir en silver."
+
+  - source: fleet_shop.ve_fct_vehicles_current
+    target: fleet_shop_ve_fct_vehicles_current
+    order_by: "vhcl_int_num"
+    filter_mandant: true
+    mode: full   # snapshot, hacer full reload diario
+    pk: ["vhcl_int_num"]
+    notes: "Snapshot del estado actual de cada vehículo. Full reload."
+
+  - source: fleet_shop.ve_fct_vehicles_current_incl_history
+    target: fleet_shop_ve_fct_vehicles_current_incl_history
+    order_by: "vhcl_int_num"
+    filter_mandant: true
+    mode: full   # 183 filas; full reload barato. Las columnas SCD2 reales (no _valid_from) se descubren en explore.py
+    pk: []
+    notes: "Historia de vehiculos. SCD2 columns reales pendientes de identificar via PRAGMA en bronze; full reload mientras tanto."
+
+  # ---- Rent ----
+  - source: rent_shop.rs_fct_reservations
+    target: rent_shop_rs_fct_reservations
+    order_by: "rsrv_resn"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "rsrv_last_urs_rs_datm"   # según data dictionary
+    pk: ["rsrv_resn"]
+    notes: "Reservas. ~28K filas para Trust CO. Watermark en última acción."
+
+  - source: rent_shop.rs_dim_scd_channels_franchise
+    target: rent_shop_rs_dim_scd_channels_franchise
+    order_by: "rsrv_resn"
+    filter_mandant: true
+    mode: full
+    pk: ["rsrv_resn"]
+    notes: "Canales SCD por reserva. PK natural rsrv_resn (1 fila por reserva con su level0/1/2)."
+
+  - source: rent_shop.ra_fct_rentals_vwt_franchise
+    target: rent_shop_ra_fct_rentals_vwt_franchise
+    order_by: "rntl_mvnr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["rntl_mvnr"]
+    notes: "Rentals (RAs). Vista 'vwt' = Vehicle/Wheels/Tires."
+
+  - source: rent_shop.ra_fct_rental_vehicles_franchise
+    target: rent_shop_ra_fct_rental_vehicles_franchise
+    order_by: "rntl_mvnr, vhcl_int_num"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["rntl_mvnr", "vhcl_int_num"]
+    notes: "Historia de vehículos asignados a un rental (puede haber upgrades)."
+
+  - source: rent_shop.ra_dim_scd_channels_franchise
+    target: rent_shop_ra_dim_scd_channels_franchise
+    order_by: "rntl_mvnr"
+    filter_mandant: true
+    mode: full
+    pk: ["rntl_mvnr"]
+    notes: "Canales SCD asociados a rentals."
+
+  - source: rent_shop.ch_fct_rs_charges_franchise
+    target: rent_shop_ch_fct_rs_charges_franchise
+    order_by: "chrs_resn, chrs_konr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["chrs_resn", "chrs_konr"]
+    notes: "Charges sobre reservas. Watermark estandar sys_upd_datm (no chrs_date)."
+
+  - source: rent_shop.ch_fct_ra_charges_franchise
+    target: rent_shop_ch_fct_ra_charges_franchise
+    order_by: "chra_mvnr, chra_konr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["chra_mvnr", "chra_konr"]
+    notes: "Charges sobre rental agreements. Watermark estandar sys_upd_datm (no chra_date)."
+
+  - source: rent_shop.rt_dim_rates_franchise
+    target: rent_shop_rt_dim_rates_franchise
+    order_by: "rate_prl, rate_gdat"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "rate_gdat"
+    pk: ["rate_prl", "rate_gdat"]
+    notes: "Tarifas con historico. PK real es rate_prl (price list) + rate_gdat (effective date). NO rate_code (no existe)."
+
+  # ---- Damage ----
+  - source: damage_shop.dm_fct_damages
+    target: damage_shop_dm_fct_damages
+    order_by: "damg_snr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "damg_date"
+    pk: ["damg_snr"]
+    notes: "Daños cabecera. Trust CO tiene 0 al 2026-04-30 (verificar)."
+
+  - source: damage_shop.dm_fct_damage_details_franchise
+    target: damage_shop_dm_fct_damage_details_franchise
+    order_by: "damg_snr, ddet_dmn"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "ddet_last_timestamp"
+    pk: ["damg_snr", "ddet_dmn"]
+    notes: "Detalles por dano. PK real damg_snr + ddet_dmn (no damg_pos). Tabla vacia globalmente al 2026-05-04."
+
+  - source: damage_shop.dm_dim_damage_cases_franchise
+    target: damage_shop_dm_dim_damage_cases_franchise
+    order_by: "damg_snr"
+    filter_mandant: true
+    mode: incremental_watermark
+    watermark_col: "sys_upd_datm"
+    pk: ["damg_snr", "damg_damage_case_id"]
+    notes: "Damage case IDs. PK compuesta damg_snr + damg_damage_case_id (no damg_case_id). Vacia globalmente."

@@ -1,0 +1,85 @@
+# Watermarks y PKs inferidos automaticamente desde explore.py
+
+# Generado: 2026-05-04T11:40:24.249807
+
+inferred:
+
+  common_shop_br_dim_branches:
+    pk: ['brnc_code', 'brnc_name', 'brnc_code_pqi_parent', 'brnc_amadeus', 'brnc_toma', 'brnc_street', 'brnc_latitude', 'brnc_longitude', 'brnc_phone_external', 'brnc_return_name', 'brnc_return_street', 'pk']
+    watermark_candidates: ['brnc_opening_date']
+
+  common_shop_mn_dim_mandants:
+    pk: ['mndt_code', 'mndt_name', 'mndt_iso_code', 'mndt_country_code', 'mndt_country', 'mndt_country_eng', 'mndt_tax_rate', 'mndt_operator', 'mndt_bank_block', 'mndt_corp_card_num', 'mndt_debit_account', 'mndt_debit_account_from', 'mndt_debit_account_to', 'mndt_long_time_rental_flg', 'mndt_long_time_rental_days', 'mndt_software', 'mndt_online_flg', 'mndt_prepaid_flg', 'mndt_currency_code', 'mndt_active_flg', 'mndt_corporate_flg', 'mndt_franchise_flg', 'mndt_franchise_reporting_flg', 'mndt_drive_now_flg', 'mndt_leasing_flg', 'mndt_yield_relevant_flg', 'mndt_yield_main_fir_flg', 'cstc_code_franchise', 'glac_code_clearing', 'mndt_header_1', 'mndt_header_2', 'mndt_header_3', 'mndt_header_4', 'mndt_header_5', 'mndt_header_6', 'mndt_vat_id', 'mndt_vat_details', 'mndt_footer_1', 'mndt_footer_2', 'mndt_footer_3', 'mndt_footer_4', 'mndt_footer_5', 'mndt_footer_6', 'pk', 'sys_ins_datm', 'sys_upd_datm']
+    watermark_candidates: ['sys_ins_datm', 'sys_upd_datm']
+
+  customer_shop_pa_dim_agencies_franchise:
+    pk: ['agnc_age']
+    watermark_candidates: []
+
+  customer_shop_pa_dim_partners_franchise:
+    pk: ['prtn_kdnr']
+    watermark_candidates: ['prtn_customer_created_date']
+
+  damage_shop_dm_dim_damage_cases_franchise:
+    pk: []
+    watermark_candidates: []
+
+  damage_shop_dm_fct_damage_details_franchise:
+    pk: []
+    watermark_candidates: []
+
+  damage_shop_dm_fct_damages:
+    pk: []
+    watermark_candidates: []
+
+  fleet_shop_ve_dim_vehicle_groups_franchise:
+    pk: ['vhgr_crs', 'vhgr_category_level4', 'vhgr_order', 'pk']
+    watermark_candidates: []
+
+  fleet_shop_ve_dim_vehicle_models:
+    pk: ['vhmd_cdef', 'pk']
+    watermark_candidates: []
+
+  fleet_shop_ve_dim_vehicles:
+    pk: ['vhcl_int_num', 'vhcl_def_num', 'pk']
+    watermark_candidates: ['vhcl_delivery_date', 'vhcl_reg_date', 'vhcl_first_reg_date', 'vhcl_last_reg_date', 'vhcl_start_depr_date', 'vhcl_defleet_plan_date', 'vhcl_min_abm_date', 'vhcl_first_ci_date', 'vhcl_first_rental_date']
+
+  fleet_shop_ve_fct_vehicles_current:
+    pk: ['vhcl_int_num', 'vhcl_pickup_date', 'vhcl_ra_int_num', 'pk']
+    watermark_candidates: ['vhcl_start_depr_date', 'vhcl_pickup_date', 'vhcl_return_date', 'vhcl_first_rental_date', 'vhcl_max_mileage_changed_at', 'vhcl_holding_days_changed_at']
+
+  fleet_shop_ve_fct_vehicles_current_incl_history:
+    pk: ['vhcl_int_num', 'pk']
+    watermark_candidates: ['vhcl_start_depr_date', 'vhcl_pickup_date', 'vhcl_return_date', 'vhcl_first_rental_date']
+
+  rent_shop_ch_fct_ra_charges_franchise:
+    pk: ['pk']
+    watermark_candidates: []
+
+  rent_shop_ch_fct_rs_charges_franchise:
+    pk: ['pk']
+    watermark_candidates: []
+
+  rent_shop_ra_dim_scd_channels_franchise:
+    pk: []
+    watermark_candidates: []
+
+  rent_shop_ra_fct_rental_vehicles_franchise:
+    pk: ['pk']
+    watermark_candidates: ['rvnc_handover_datm', 'rvnc_handover_utc_datm', 'rvnc_return_datm', 'rvnc_return_utc_datm']
+
+  rent_shop_ra_fct_rentals_vwt_franchise:
+    pk: ['rntl_mvnr', 'rntl_contract_num', 'pk']
+    watermark_candidates: ['rntl_handover_datm', 'rntl_handover_utc_datm', 'rntl_return_datm', 'rntl_return_utc_datm']
+
+  rent_shop_rs_dim_scd_channels_franchise:
+    pk: ['rsrv_resn']
+    watermark_candidates: []
+
+  rent_shop_rs_fct_reservations:
+    pk: ['rsrv_resn', 'rsrv_security_code', 'pk']
+    watermark_candidates: ['rsrv_datm', 'rsrv_cet_datm', 'rsrv_handover_datm', 'rsrv_handover_utc_datm', 'rsrv_return_datm', 'rsrv_return_utc_datm', 'rsrv_last_urs_rs_datm']
+
+  rent_shop_rt_dim_rates_franchise:
+    pk: ['pk']
+    watermark_candidates: []

@@ -1,0 +1,130 @@
+/* Sixt brand: naranja primario #ff6900, negro #000000 */
+
+:root {
+    --sixt-orange: #ff6900;
+    --sixt-orange-dark: #e55a00;
+    --sixt-black: #000000;
+    --sixt-gray-light: #f5f5f5;
+    --sixt-gray-mid: #e0e0e0;
+    --sixt-gray-text: #333333;
+}
+
+/* Header banner */
+.sixt-header {
+    background: linear-gradient(90deg, #000000 0%, #1a1a1a 100%);
+    padding: 1.2rem 2rem;
+    border-bottom: 4px solid var(--sixt-orange);
+    margin: -1rem -1rem 1rem -1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.sixt-header h1 {
+    color: white !important;
+    font-family: 'Helvetica Neue', sans-serif;
+    font-weight: 800;
+    margin: 0;
+    font-size: 1.4rem;
+    letter-spacing: 0.5px;
+}
+
+.sixt-header h1 span {
+    color: var(--sixt-orange);
+}
+
+.sixt-header .badge {
+    background: var(--sixt-orange);
+    color: black;
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+/* KPI cards */
+.kpi-card {
+    background: white;
+    border-left: 5px solid var(--sixt-orange);
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    margin-bottom: 0.5rem;
+}
+
+.kpi-label {
+    font-size: 0.75rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+}
+
+.kpi-value {
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: var(--sixt-black);
+    line-height: 1.2;
+}
+
+.kpi-delta {
+    font-size: 0.85rem;
+    color: #666;
+    margin-top: 0.2rem;
+}
+
+/* Section title */
+.section-title {
+    border-bottom: 2px solid var(--sixt-orange);
+    padding-bottom: 0.4rem;
+    margin: 1.5rem 0 1rem 0;
+    color: var(--sixt-black);
+    font-weight: 700;
+}
+
+/* Status badges */
+.status-ok { background: #2e7d32; color: white; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.75rem; font-weight: 600; }
+.status-warning { background: #f59e0b; color: black; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.75rem; font-weight: 600; }
+.status-critical { background: #d32f2f; color: white; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.75rem; font-weight: 600; }
+.status-info { background: var(--sixt-orange); color: black; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.75rem; font-weight: 600; }
+
+/* Streamlit overrides */
+[data-testid="stSidebar"] {
+    background-color: var(--sixt-black);
+}
+
+[data-testid="stSidebar"] * {
+    color: white !important;
+}
+
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+    color: var(--sixt-orange) !important;
+}
+
+button[kind="primary"] {
+    background-color: var(--sixt-orange) !important;
+    border-color: var(--sixt-orange) !important;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+    border-bottom: 2px solid var(--sixt-gray-mid);
+}
+
+.stTabs [data-baseweb="tab"] {
+    background-color: var(--sixt-gray-light);
+    border-radius: 4px 4px 0 0;
+    color: var(--sixt-black) !important;
+    font-weight: 600;
+}
+
+.stTabs [aria-selected="true"] {
+    background-color: var(--sixt-orange) !important;
+    color: black !important;
+}
+
+footer {visibility: hidden;}
+#MainMenu {visibility: hidden;}
+header {visibility: hidden;}

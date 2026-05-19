@@ -1,0 +1,53 @@
+# Credenciales y secretos
+.env
+*.env
+.env.local
+.env.*.local
+*.pem
+*.ppk
+*.key
+*_rsa
+*_ed25519
+*.pub
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Claude Code local config (paths + permission allowlist, machine-specific)
+.claude/settings.local.json
+
+# Data local (SQLite legacy + cualquier dump)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.duckdb
+data/*.duckdb.wal
+data/*.csv
+data/*.parquet
+data/*.dump
+data/*.sql.gz
+
+# Logs de pipelines
+logs/*.log
+logs/*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

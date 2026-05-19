@@ -1,0 +1,15 @@
+# =============================================================================
+# Trust Data Platform - dependencias del DASHBOARD (Streamlit Cloud)
+# =============================================================================
+# Esto es lo que Streamlit Community Cloud instala. Mantenerlo MINIMO: la app
+# solo lee de Postgres, no toca Redshift ni hace SSH tunnels.
+#
+# Pipeline tiene su propio requirements-pipeline.txt (lo instala GitHub
+# Actions, no Streamlit Cloud).
+# =============================================================================
+
+streamlit>=1.30.0
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+pandas>=2.0.0
+plotly>=5.18.0
