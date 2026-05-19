@@ -22,9 +22,15 @@ class FilterState:
     fecha_desde: dt.date
     fecha_hasta: dt.date
     moneda: str              # 'USD' o 'COP'
-    trm_source: str          # 'Banrep' o 'Sixt' (solo aplica si moneda='COP')
-    acriss: list             # categorias ACRISS (vacia = todas)
-    canal: list              # canales (vacia = todos)
+    trm_source: str = "Banrep"  # SIEMPRE Banrep — la TRM Sixt ya no se ofrece
+    acriss: list = None      # categorias ACRISS (vacia = todas)
+    canal: list = None       # canales (vacia = todos)
+
+    def __post_init__(self):
+        if self.acriss is None:
+            self.acriss = []
+        if self.canal is None:
+            self.canal = []
 
     @property
     def sede_label(self) -> str:
@@ -38,7 +44,7 @@ class FilterState:
     def moneda_label(self) -> str:
         if self.moneda == "USD":
             return "USD"
-        return f"COP ({self.trm_source})"
+        return "COP (Banrep)"
 
     @property
     def revenue_col_usd(self) -> str:
@@ -46,8 +52,8 @@ class FilterState:
 
     @property
     def revenue_col_cop(self) -> str:
-        # Cuando TRM=Banrep, dashboard recalcula in-memory hacia neto_cop.
-        # Cuando TRM=Sixt, neto_cop ya viene del view.
+        # Siempre recalculamos COP a partir de USD x TRM Banrep para que el
+        # numero coincida con lo oficial del Banco de la Republica.
         return "neto_cop"
 
     def where_clause(self, table_alias: str = "") -> tuple:
@@ -84,27 +90,40 @@ def render_sidebar_filters(default_days: int = 30,
     sedes_df = get_sedes()
     d_min, d_max = get_fecha_range()
 
+    nombres = sedes_df["nombre"].tolist()
+
+    # Pre-seed session_state ONCE para que la persistencia entre paginas funcione
+    # bien. En Streamlit, pasar `default=` + `key=` a un widget puede causar que
+    # el `default` gane sobre lo guardado en session_state al navegar entre
+    # paginas; solo usar `key=` (con session_state pre-seedeado) es el patron
+    # confiable.
+    today = dt.date.today()
+    default_hasta = min(today, d_max)
+    default_desde = max(d_min, default_hasta - dt.timedelta(days=2))
+    if "v2_sedes" not in st.session_state:
+        st.session_state["v2_sedes"] = []
+    if "v2_fechas" not in st.session_state:
+        st.session_state["v2_fechas"] = (default_desde, default_hasta)
+    if "v2_moneda" not in st.session_state:
+        st.session_state["v2_moneda"] = "USD"
+    if "v2_acriss" not in st.session_state:
+        st.session_state["v2_acriss"] = []
+    if "v2_canal" not in st.session_state:
+        st.session_state["v2_canal"] = []
+
     with st.sidebar:
         st.markdown("## Filtros")
 
-        # Sede multiselect
-        nombres = sedes_df["nombre"].tolist()
+        # Sede multiselect — solo key=, sin default= (anti-pattern).
         sedes_sel = st.multiselect(
             "Sedes",
             options=nombres,
-            default=st.session_state.get("v2_sedes", []),
             key="v2_sedes",
-            help="Vacio = todas las sedes",
+            help="Vacio = todas las sedes. Tu seleccion se mantiene entre paginas.",
         )
 
-        # Fechas. Default = ultimos 3 dias (hoy - 2 .. hoy), clipped al rango
-        # real de datos. El parametro default_days queda por compatibilidad
-        # pero el default global es 3 dias.
-        today = dt.date.today()
-        default_hasta = min(today, d_max)
-        default_desde = max(d_min, default_hasta - dt.timedelta(days=2))
-        if "v2_fechas" not in st.session_state:
-            st.session_state["v2_fechas"] = (default_desde, default_hasta)
+        # Fechas. Default ya pre-seedeado a (hoy - 2 .. hoy) arriba; aqui solo
+        # se renderiza el widget que persiste via session_state["v2_fechas"].
         rango = st.date_input(
             "Rango de fechas",
             key="v2_fechas",
@@ -129,31 +148,25 @@ def render_sidebar_filters(default_days: int = 30,
                 f"**{fecha_hasta.isoformat()}** ({dias} dias)"
             )
 
-        # Moneda + TRM
+        # Moneda. TRM siempre Banrep (oficial datos.gov.co).
+        # La opcion 'Sixt TRM' se retiro: usar siempre la TRM oficial para
+        # que los reportes en COP coincidan con cifras del Banco de la Republica.
         moneda = st.radio(
             "Moneda",
             options=["USD", "COP"],
             horizontal=True,
             key="v2_moneda",
         )
+        trm_source = "Banrep"
         if moneda == "COP":
-            trm_source = st.radio(
-                "Fuente TRM",
-                options=["Banrep", "Sixt"],
-                horizontal=True,
-                key="v2_trm",
-                help="Banrep = TRM oficial datos.gov.co. Sixt = la que cargo el sistema (~1% mas alta).",
-            )
-        else:
-            trm_source = "Banrep"  # irrelevante, no aplica
+            st.caption("COP recalculado con TRM Banrep oficial (datos.gov.co).")
 
-        # Opcionales: ACRISS y canal
+        # Opcionales: ACRISS y canal. Mismo patron — solo key=, sin default=.
         acriss_sel = []
         if show_acriss:
             acriss_sel = st.multiselect(
                 "Categoria ACRISS",
                 options=get_acriss_options(),
-                default=st.session_state.get("v2_acriss", []),
                 key="v2_acriss",
             )
 
@@ -162,7 +175,6 @@ def render_sidebar_filters(default_days: int = 30,
             canal_sel = st.multiselect(
                 "Canal principal",
                 options=get_canal_options(),
-                default=st.session_state.get("v2_canal", []),
                 key="v2_canal",
             )
 
