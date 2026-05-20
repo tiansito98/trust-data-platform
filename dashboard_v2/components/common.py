@@ -199,7 +199,7 @@ def fmt_pct(value, decimals: int = 1) -> str:
 
 @st.cache_data(ttl=600)
 def get_trm_table() -> pd.DataFrame:
-    """Devuelve fecha (str ISO) -> trm_cop_per_usd. Hereda fin de semana."""
+    """Devuelve TRM Banrep diaria. fecha viene como dt.date desde Postgres."""
     return load_query(
         "SELECT fecha, trm_cop_per_usd FROM dim_trm_diaria ORDER BY fecha"
     )
@@ -210,18 +210,35 @@ def apply_trm(df: pd.DataFrame, trm_source: str, date_col: str,
     """Devuelve copia de df con columnas COP recalculadas segun trm_source.
 
     trm_source = 'Banrep' -> usd_cols * TRM oficial del dia de date_col.
-    trm_source = 'Sixt'   -> deja cop_cols_sixt como vienen (Sixt internal).
+    trm_source != 'Banrep' -> deja cop_cols_sixt como vienen (legacy).
 
-    usd_cols y cop_cols_sixt deben tener la misma longitud (mismo orden).
-    Las columnas finales se llaman como las cop_cols_sixt para que el
-    consumidor pueda mostrar sin saber el origen.
+    Sobreescribe las columnas en cop_cols_sixt con USD * TRM Banrep del dia
+    correspondiente. Si una fecha no esta en la TRM table (raro, hay 1 fila
+    por dia calendario), forward-fill con la TRM mas reciente; ultimo fallback
+    = TRM promedio del rango disponible.
     """
     out = df.copy()
     if trm_source != "Banrep":
         return out
-    trm = get_trm_table().set_index("fecha")["trm_cop_per_usd"].to_dict()
-    dates = pd.to_datetime(out[date_col]).dt.strftime("%Y-%m-%d")
-    rates = dates.map(trm)
+
+    # --- Normaliza TRM table: ambos keys (TRM table) y values (df[date_col])
+    # tienen que ser strings YYYY-MM-DD para que .map() encuentre matches.
+    # Postgres devuelve DATE como dt.date; sin normalizar, la comparacion
+    # str vs dt.date siempre falla -> rates=NaN -> COP=0.
+    trm_df = get_trm_table().copy()
+    trm_df["_fecha_str"] = pd.to_datetime(trm_df["fecha"]).dt.strftime("%Y-%m-%d")
+    trm_df = trm_df.sort_values("_fecha_str")
+    trm_lookup = dict(zip(trm_df["_fecha_str"], trm_df["trm_cop_per_usd"].astype(float)))
+
+    dates_str = pd.to_datetime(out[date_col]).dt.strftime("%Y-%m-%d")
+    rates = dates_str.map(trm_lookup).astype(float)
+
+    if rates.isna().any():
+        # Fallback: usar la TRM mas reciente conocida; si no hay nada, el promedio.
+        last_trm = float(trm_df["trm_cop_per_usd"].iloc[-1]) if len(trm_df) else float("nan")
+        mean_trm = float(trm_df["trm_cop_per_usd"].astype(float).mean()) if len(trm_df) else float("nan")
+        rates = rates.fillna(last_trm).fillna(mean_trm)
+
     out["_trm_banrep"] = rates
     for usd_col, cop_col in zip(usd_cols, cop_cols_sixt):
         out[cop_col] = (out[usd_col].astype(float) * rates).round(0)
