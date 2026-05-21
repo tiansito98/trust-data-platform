@@ -207,9 +207,16 @@ def get_trm_table() -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def get_trm_hoy() -> tuple:
-    """Devuelve (fecha, valor) de la TRM Banrep mas reciente. (None, None) si vacia."""
+    """Devuelve (fecha, valor) de la TRM Banrep VIGENTE HOY.
+
+    NO la mas reciente en la tabla — Banrep publica la TRM de manana en la
+    tarde del dia anterior, asi que tomar MAX(fecha) mostraria la de manana.
+    En cambio, filtramos fecha <= CURRENT_DATE y tomamos el ultimo. Si no
+    hay TRM para hoy aun (raro), cae al ultimo dia disponible en el pasado.
+    """
     df = load_query(
         "SELECT fecha, trm_cop_per_usd FROM dim_trm_diaria "
+        "WHERE fecha <= CURRENT_DATE "
         "ORDER BY fecha DESC LIMIT 1"
     )
     if df.empty:
