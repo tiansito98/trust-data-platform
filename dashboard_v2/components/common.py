@@ -205,18 +205,19 @@ def get_trm_table() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def get_trm_hoy() -> tuple:
-    """Devuelve (fecha, valor) de la TRM Banrep VIGENTE HOY.
+    """Devuelve (fecha, valor) de la TRM Banrep VIGENTE HOY (zona Colombia).
 
     NO la mas reciente en la tabla — Banrep publica la TRM de manana en la
-    tarde del dia anterior, asi que tomar MAX(fecha) mostraria la de manana.
-    En cambio, filtramos fecha <= CURRENT_DATE y tomamos el ultimo. Si no
-    hay TRM para hoy aun (raro), cae al ultimo dia disponible en el pasado.
+    tarde del dia actual, asi que tomar MAX(fecha) mostraria la de manana.
+    Filtramos fecha <= today-en-Colombia. Supabase corre en UTC; sin la
+    conversion explicita, a partir de las 7 PM Colombia ya 'es manana' en
+    UTC y el filtro brincaria de dia.
     """
     df = load_query(
         "SELECT fecha, trm_cop_per_usd FROM dim_trm_diaria "
-        "WHERE fecha <= CURRENT_DATE "
+        "WHERE fecha <= ((NOW() AT TIME ZONE 'America/Bogota')::date) "
         "ORDER BY fecha DESC LIMIT 1"
     )
     if df.empty:
