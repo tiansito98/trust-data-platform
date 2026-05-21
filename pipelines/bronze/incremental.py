@@ -142,16 +142,42 @@ def upsert_to_bronze(engine, target: str, df: pd.DataFrame, pk_cols: list[str]):
                 WHERE {" AND ".join(f't."{c}" = s."{c}"' for c in pk_cols)}
             '''))
 
-            # INSERT (ordenamos columnas por nombre para evitar mismatches)
-            cols = [r[0] for r in conn.execute(text(
+            # INSERT con cast explicito por columna. El problema: pandas a
+            # veces escribe la staging table con type=text cuando una columna
+            # del incremento viene toda NULL/vacia. Postgres no auto-castea
+            # text -> timestamp/date/numeric en INSERT INTO ... SELECT, asi
+            # que casteamos cada columna al tipo destino. Tambien NULLIF a ''
+            # para que '' -> NULL en tipos no-text.
+            target_types = {
+                r[0]: r[1] for r in conn.execute(text(
+                    f"SELECT column_name, data_type "
+                    f"FROM information_schema.columns "
+                    f"WHERE table_schema = 'bronze' AND table_name = '{target}' "
+                    f"ORDER BY ordinal_position"
+                )).fetchall()
+            }
+            stg_cols = [r[0] for r in conn.execute(text(
                 f"SELECT column_name FROM information_schema.columns "
                 f"WHERE table_schema = 'bronze' AND table_name = '{stg}' "
                 f"ORDER BY ordinal_position"
             )).fetchall()]
-            col_list = ", ".join(f'"{c}"' for c in cols)
+
+            def _cast_expr(col: str) -> str:
+                """Cast quoted col -> destination type, handling text->timestamp etc."""
+                dest_type = target_types.get(col)
+                if dest_type is None:
+                    return f'"{col}"'
+                # text/varchar/char: no cast needed
+                if dest_type in ("text", "character varying", "character"):
+                    return f'"{col}"'
+                # Para tipos no-text, convertir '' -> NULL primero y luego castear.
+                return f'NULLIF(NULLIF("{col}"::text, \'\'), \'NaT\')::{dest_type} AS "{col}"'
+
+            col_list = ", ".join(f'"{c}"' for c in stg_cols)
+            select_list = ", ".join(_cast_expr(c) for c in stg_cols)
             conn.execute(text(
                 f'INSERT INTO bronze."{target}" ({col_list}) '
-                f'SELECT {col_list} FROM bronze."{stg}"'
+                f'SELECT {select_list} FROM bronze."{stg}"'
             ))
     finally:
         with engine.begin() as conn:
