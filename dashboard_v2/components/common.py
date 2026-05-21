@@ -226,13 +226,17 @@ def render_trm_today_sidebar() -> None:
     valor_fmt = f"$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     st.sidebar.markdown(
         f"""
-        <div style="background:#fff3e0;padding:10px 12px;border-radius:4px;
-                    border-left:4px solid #ff6900;margin-bottom:14px;">
-            <div style="font-size:0.75rem;color:#666;text-transform:uppercase;
-                        letter-spacing:0.5px;">TRM Hoy (Banrep)</div>
-            <div style="font-size:1.35rem;font-weight:700;color:#000;
-                        line-height:1.2;margin:2px 0;">{valor_fmt}</div>
-            <div style="font-size:0.75rem;color:#888;">
+        <div style="background:#000000;padding:12px 14px;border-radius:6px;
+                    border-left:4px solid #ff6900;margin-bottom:14px;
+                    box-shadow:0 2px 6px rgba(0,0,0,0.15);">
+            <div style="font-size:0.7rem;color:#bbbbbb;text-transform:uppercase;
+                        letter-spacing:0.8px;font-weight:600;">TRM Hoy · Banrep</div>
+            <div style="font-size:1.5rem;font-weight:700;color:#ffffff;
+                        line-height:1.15;margin:4px 0 2px 0;
+                        font-family:'Helvetica Neue', Arial, sans-serif;">
+                {valor_fmt}
+            </div>
+            <div style="font-size:0.72rem;color:#cccccc;">
                 vigente {fecha} &nbsp;·&nbsp; COP / USD
             </div>
         </div>
