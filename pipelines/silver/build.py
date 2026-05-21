@@ -354,7 +354,21 @@ def build_cierre_diario_sede_table(engine):
 
 
 def build_dim_dates(engine, start: date = date(2020, 1, 1), end: date = date(2030, 12, 31)):
-    log(f"\n>> Poblando dim_dates de {start} a {end}")
+    """Idempotente: si dim_dates ya tiene el rango completo, hace skip.
+
+    El calendario es estatico (no depende de bronze), asi que reconstruirlo
+    cada silver.build es desperdicio. Solo lo llena si esta vacia o si el
+    conteo de filas no coincide con el rango esperado (por si el rango
+    cambia en el futuro).
+    """
+    expected = (end - start).days + 1
+    current = _scalar(engine, "SELECT COUNT(*) FROM silver.dim_dates") or 0
+    if current == expected:
+        log(f"\n>> dim_dates ya esta completa ({current:,} dias) — skip")
+        return
+
+    log(f"\n>> Poblando dim_dates de {start} a {end} "
+        f"(tenia {current:,}, esperado {expected:,})")
     _exec(engine, "DELETE FROM silver.dim_dates")
     es_months = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
                  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
@@ -419,11 +433,16 @@ def report_counts(engine):
 
 
 def build_dim_charge_types(engine):
-    log("\n>> Materializando dim_charge_types")
+    """Idempotente: skip si el seed (30 codigos) ya esta cargado.
+
+    Si necesitas actualizar el seed (agregar/cambiar codigos), borra la tabla
+    manualmente o ajusta la lista abajo + drop. La tabla es estatica (seed
+    confirmado), no depende de bronze.
+    """
     started = time.time()
-    _exec(engine, "DROP TABLE IF EXISTS silver.dim_charge_types CASCADE")
+    # Crea tabla si no existe (no la dropea)
     _exec(engine, """
-        CREATE TABLE silver.dim_charge_types (
+        CREATE TABLE IF NOT EXISTS silver.dim_charge_types (
             chra_chco    TEXT PRIMARY KEY,
             descripcion  TEXT NOT NULL,
             categoria    TEXT NOT NULL,
@@ -431,6 +450,11 @@ def build_dim_charge_types(engine):
             notas        TEXT
         )
     """)
+    current = _scalar(engine, "SELECT COUNT(*) FROM silver.dim_charge_types") or 0
+    if current >= 30:
+        log(f"\n>> dim_charge_types ya esta cargada ({current} codigos) — skip")
+        return
+    log("\n>> Materializando dim_charge_types (seed inicial)")
     rows = [
         ("T",  "Time and mileage (tarifa por tiempo + kilometros)",      "TARIFA",       "CONFIRMADO", None),
         ("Y",  "Location fee (recargo por ubicacion, ej. aeropuerto)",   "CONTEXTO",     "CONFIRMADO", None),

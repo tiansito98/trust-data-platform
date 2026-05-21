@@ -152,9 +152,10 @@ CREATE TABLE silver.dim_employees (
 );
 
 
--- dim_dates: schema vacio; pipelines/silver/build.py la puebla.
-DROP TABLE IF EXISTS silver.dim_dates CASCADE;
-CREATE TABLE silver.dim_dates (
+-- dim_dates: calendario estatico 2020-2030. NO se dropea cada rebuild
+-- (es deterministica, no depende de bronze). build_dim_dates() en build.py
+-- detecta si ya esta poblada y hace skip; si no, la llena.
+CREATE TABLE IF NOT EXISTS silver.dim_dates (
     dtid           INTEGER PRIMARY KEY,
     full_date      DATE,
     year           INTEGER,
