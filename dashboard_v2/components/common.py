@@ -205,6 +205,42 @@ def get_trm_table() -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=600)
+def get_trm_hoy() -> tuple:
+    """Devuelve (fecha, valor) de la TRM Banrep mas reciente. (None, None) si vacia."""
+    df = load_query(
+        "SELECT fecha, trm_cop_per_usd FROM dim_trm_diaria "
+        "ORDER BY fecha DESC LIMIT 1"
+    )
+    if df.empty:
+        return (None, None)
+    return (df["fecha"].iloc[0], float(df["trm_cop_per_usd"].iloc[0]))
+
+
+def render_trm_today_sidebar() -> None:
+    """Pinta el bloque TRM Hoy en la sidebar. Llamar al inicio de la sidebar."""
+    fecha, valor = get_trm_hoy()
+    if not fecha or valor is None:
+        return
+    # Formato europeo: $1.234,56
+    valor_fmt = f"$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    st.sidebar.markdown(
+        f"""
+        <div style="background:#fff3e0;padding:10px 12px;border-radius:4px;
+                    border-left:4px solid #ff6900;margin-bottom:14px;">
+            <div style="font-size:0.75rem;color:#666;text-transform:uppercase;
+                        letter-spacing:0.5px;">TRM Hoy (Banrep)</div>
+            <div style="font-size:1.35rem;font-weight:700;color:#000;
+                        line-height:1.2;margin:2px 0;">{valor_fmt}</div>
+            <div style="font-size:0.75rem;color:#888;">
+                vigente {fecha} &nbsp;·&nbsp; COP / USD
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def apply_trm(df: pd.DataFrame, trm_source: str, date_col: str,
               usd_cols: list, cop_cols_sixt: list) -> pd.DataFrame:
     """Devuelve copia de df con columnas COP recalculadas segun trm_source.

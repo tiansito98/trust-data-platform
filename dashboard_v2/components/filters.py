@@ -11,6 +11,7 @@ import streamlit as st
 
 from .common import (
     get_sedes, get_fecha_range, get_acriss_options, get_canal_options,
+    render_trm_today_sidebar,
 )
 
 
@@ -110,6 +111,9 @@ def render_sidebar_filters(default_days: int = 30,
         st.session_state["v2_acriss"] = []
     if "v2_canal" not in st.session_state:
         st.session_state["v2_canal"] = []
+
+    # TRM Hoy banner — visible al tope del sidebar en TODAS las paginas.
+    render_trm_today_sidebar()
 
     with st.sidebar:
         st.markdown("## Filtros")
