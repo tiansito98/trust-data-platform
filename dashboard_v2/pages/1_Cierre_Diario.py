@@ -59,8 +59,8 @@ SELECT numero_contrato, fecha_handover_real, fecha_devolucion_real, dias_renta,
        bruto_usd, descuento_usd, neto_usd, iva_usd, total_con_iva_usd,
        tarifa_cop, adicionales_cop, bruto_cop, descuento_cop,
        neto_cop, iva_cop, total_con_iva_cop,
-       -- Split por bucket de pago (TERCERO vs COUNTER).
-       tipo_agencia_main, tercero_nombre,
+       -- Split por bucket de pago (TERCERO vs COUNTER) + canal operativo.
+       tipo_agencia_main, tercero_nombre, canal_cobro_tarifa,
        forma_pago_main, forma_pago_main_codigo,
        forma_pago_secondary, forma_pago_secondary_codigo,
        bruto_main_usd, bruto_secondary_usd,
@@ -282,8 +282,18 @@ else:
         pagado_t_iva = pagado_t * iva_factor
         pagado_c_iva = pagado_c * iva_factor
 
-        es_wholesaler = (head.get("tipo_agencia_main") == "Wholesaler")
+        canal = head.get("canal_cobro_tarifa")
+        es_wholesaler = (canal == "WHOLESALER")
+        es_sixt_prepago = (canal == "SIXT_PREPAGO")
         tercero_nombre = head.get("tercero_nombre")
+
+        # Etiqueta operativa unica que cubre SIXT_PREPAGO + WHOLESALER + COUNTER.
+        if es_wholesaler:
+            canal_label = f"Wholesaler - {tercero_nombre}" if tercero_nombre else "Wholesaler"
+        elif es_sixt_prepago:
+            canal_label = "Sixt Prepago"
+        else:
+            canal_label = ""  # COUNTER => no row, dejamos vacio (preferencia usuario).
 
         fecha_str = pd.to_datetime(head["fecha_handover_real"]).strftime("%Y-%m-%d")
         titulo = (
@@ -306,14 +316,15 @@ else:
                 "Dias": str(int(head["dias_renta"])) if pd.notna(head["dias_renta"]) else "-",
                 "Asesor": str(int(head["operador_handover_codigo"])) if pd.notna(head["operador_handover_codigo"]) else "-",
             }
-            # Solo agregar las columnas de tercero si el rental tuvo wholesaler.
-            # Para walk-ins quedan vacias (preferencia del usuario: no mostrar '$0').
-            if es_wholesaler and tercero_nombre:
-                header_row["Tercero"] = str(tercero_nombre)
+            # Canal de cobro de la tarifa: WHOLESALER / SIXT_PREPAGO / COUNTER.
+            # Para WHOLESALER y SIXT_PREPAGO mostramos pago al tercero (c/IVA)
+            # y pago en counter (c/IVA). Para COUNTER puro, dejamos vacias esas
+            # 3 celdas (preferencia del usuario: no mostrar '$0' placeholders).
+            header_row["Canal"] = canal_label
+            if es_wholesaler or es_sixt_prepago:
                 header_row["Pago tercero (c/IVA)"] = fmt_money(pagado_t_iva, cur)
                 header_row["Pago counter (c/IVA)"] = fmt_money(pagado_c_iva, cur)
             else:
-                header_row["Tercero"] = ""
                 header_row["Pago tercero (c/IVA)"] = ""
                 header_row["Pago counter (c/IVA)"] = ""
             header_row[f"Total c/IVA"] = fmt_money(total_v, cur)

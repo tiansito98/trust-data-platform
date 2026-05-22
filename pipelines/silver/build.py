@@ -772,6 +772,20 @@ def build_rentals_full(engine):
             r.rntl_agency1_type                               AS tipo_agencia_main,
             r.agnc_age_agency1                                AS tercero_id,
             a1.agnc_subsidiary_name                           AS tercero_nombre,
+            -- Canal operativo de cobro de la tarifa, en orden de prioridad:
+            --   SIXT_PREPAGO  -> Sixt central cobro al cliente (sixt.com.co etc.).
+            --                   El datashare lo marca con rsrv_prepaid_flg = 1.
+            --   WHOLESALER    -> OTA (CarTrawler, Booking, Hopper...) cobro al
+            --                   cliente y luego facturo a Sixt. Datashare lo
+            --                   refleja con rntl_agency1_type = 'Wholesaler'
+            --                   y MAIN bucket pagado con Sixt Corporate Card.
+            --   COUNTER       -> Trust cobra al cliente al firmar.
+            -- Unifica ambos esquemas de pre-pago en una sola etiqueta operativa.
+            CASE
+                WHEN rsv.rsrv_prepaid_flg = 1            THEN 'SIXT_PREPAGO'
+                WHEN r.rntl_agency1_type = 'Wholesaler'  THEN 'WHOLESALER'
+                ELSE 'COUNTER'
+            END                                               AS canal_cobro_tarifa,
             CASE WHEN r.rntl_rental_currency_code = 'USD'
                  THEN ROUND(COALESCE(r.rntl_discount_main_rental, 0)::numeric, 2) END
                                                               AS descuento_main_usd,
@@ -1020,6 +1034,7 @@ def build_rentals_detail(engine):
             rf.forma_pago_main, rf.forma_pago_main_codigo,
             rf.forma_pago_secondary, rf.forma_pago_secondary_codigo,
             rf.tipo_agencia_main, rf.tercero_id, rf.tercero_nombre,
+            rf.canal_cobro_tarifa,
             rf.descuento_main_usd, rf.descuento_secondary_usd,
             rf.descuento_main_cop, rf.descuento_secondary_cop,
 
@@ -1083,6 +1098,7 @@ def build_rentals_resumen(engine):
                 forma_pago_main, forma_pago_main_codigo,
                 forma_pago_secondary, forma_pago_secondary_codigo,
                 tipo_agencia_main, tercero_id, tercero_nombre,
+                canal_cobro_tarifa,
                 descuento_main_usd, descuento_secondary_usd,
                 descuento_main_cop, descuento_secondary_cop,
                 revenue_total_rental_cop, iva_total_rental_cop, descuento_total_rental_cop,
@@ -1122,6 +1138,7 @@ def build_rentals_resumen(engine):
             MAX(tipo_agencia_main) AS tipo_agencia_main,
             MAX(tercero_id) AS tercero_id,
             MAX(tercero_nombre) AS tercero_nombre,
+            MAX(canal_cobro_tarifa) AS canal_cobro_tarifa,
             MAX(descuento_main_usd) AS descuento_main_usd,
             MAX(descuento_secondary_usd) AS descuento_secondary_usd,
             MAX(descuento_main_cop) AS descuento_main_cop,
