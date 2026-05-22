@@ -301,14 +301,14 @@ else:
         nombre_tercero = (partner_nombre if pd.notna(partner_nombre) and partner_nombre
                           else tercero_nombre)
 
-        # Etiqueta operativa unica que cubre SIXT_PREPAGO + WHOLESALER + COUNTER.
+        # Etiqueta operativa del canal. El nombre del tercero va en su propia
+        # columna ("Tercero") para no concatenarlo con el canal.
         if es_wholesaler:
-            canal_label = (f"Wholesaler - {nombre_tercero}"
-                           if nombre_tercero else "Wholesaler")
+            canal_label = "Wholesaler"
         elif es_sixt_prepago:
             canal_label = "Sixt Prepago"
         else:
-            canal_label = ""  # COUNTER => no row, dejamos vacio (preferencia usuario).
+            canal_label = ""  # COUNTER => vacio (preferencia usuario).
 
         fecha_str = pd.to_datetime(head["fecha_handover_real"]).strftime("%Y-%m-%d")
         titulo = (
@@ -332,10 +332,15 @@ else:
                 "Asesor": str(int(head["operador_handover_codigo"])) if pd.notna(head["operador_handover_codigo"]) else "-",
             }
             # Canal de cobro de la tarifa: WHOLESALER / SIXT_PREPAGO / COUNTER.
+            # Tercero = nombre largo del partner (ej. "CarTrawler Colombia"),
+            # mismo dato que en el resumen. Vacio para walk-ins / COUNTER puro.
             # Para WHOLESALER y SIXT_PREPAGO mostramos pago al tercero (c/IVA)
             # y pago en counter (c/IVA). Para COUNTER puro, dejamos vacias esas
             # 3 celdas (preferencia del usuario: no mostrar '$0' placeholders).
             header_row["Canal"] = canal_label
+            header_row["Tercero"] = (nombre_tercero
+                                     if nombre_tercero and (es_wholesaler or es_sixt_prepago)
+                                     else "")
             if es_wholesaler or es_sixt_prepago:
                 header_row["Pago tercero (c/IVA)"] = fmt_money(pagado_t_iva, cur)
                 header_row["Pago counter (c/IVA)"] = fmt_money(pagado_c_iva, cur)
