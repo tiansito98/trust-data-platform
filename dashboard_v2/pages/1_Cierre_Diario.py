@@ -58,7 +58,17 @@ SELECT numero_contrato, fecha_handover_real, fecha_devolucion_real, dias_renta,
        tarifa_usd, adicionales_codigos, adicionales_usd,
        bruto_usd, descuento_usd, neto_usd, iva_usd, total_con_iva_usd,
        tarifa_cop, adicionales_cop, bruto_cop, descuento_cop,
-       neto_cop, iva_cop, total_con_iva_cop
+       neto_cop, iva_cop, total_con_iva_cop,
+       -- Split por bucket de pago (TERCERO vs COUNTER).
+       tipo_agencia_main, tercero_nombre,
+       forma_pago_main, forma_pago_main_codigo,
+       forma_pago_secondary, forma_pago_secondary_codigo,
+       bruto_main_usd, bruto_secondary_usd,
+       descuento_main_usd, descuento_secondary_usd,
+       pagado_tercero_usd, pagado_counter_usd,
+       bruto_main_cop, bruto_secondary_cop,
+       descuento_main_cop, descuento_secondary_cop,
+       pagado_tercero_cop, pagado_counter_cop
 FROM vw_rentals_resumen
 WHERE {where_sql}
 ORDER BY DATE(fecha_handover_real) DESC, numero_contrato
@@ -69,19 +79,31 @@ df_resumen = load_query(resumen_sql, params)
 _num_cols = ["dias_renta", "tarifa_usd", "adicionales_usd", "bruto_usd",
              "descuento_usd", "neto_usd", "iva_usd", "total_con_iva_usd",
              "tarifa_cop", "adicionales_cop", "bruto_cop", "descuento_cop",
-             "neto_cop", "iva_cop", "total_con_iva_cop"]
+             "neto_cop", "iva_cop", "total_con_iva_cop",
+             "bruto_main_usd", "bruto_secondary_usd",
+             "descuento_main_usd", "descuento_secondary_usd",
+             "pagado_tercero_usd", "pagado_counter_usd",
+             "bruto_main_cop", "bruto_secondary_cop",
+             "descuento_main_cop", "descuento_secondary_cop",
+             "pagado_tercero_cop", "pagado_counter_cop"]
 for _c in _num_cols:
     if _c in df_resumen.columns:
         df_resumen[_c] = pd.to_numeric(df_resumen[_c], errors="coerce").fillna(0.0)
 
-# Si COP+Banrep, recalcular columnas _cop a partir de _usd * TRM Banrep.
+# Si COP+Banrep, recalcular columnas _cop a partir de _usd x TRM Banrep.
 if filtros.moneda == "COP":
     df_resumen = apply_trm(
         df_resumen, filtros.trm_source, "fecha_handover_real",
         usd_cols=["tarifa_usd", "adicionales_usd", "bruto_usd",
-                  "descuento_usd", "neto_usd", "iva_usd", "total_con_iva_usd"],
+                  "descuento_usd", "neto_usd", "iva_usd", "total_con_iva_usd",
+                  "bruto_main_usd", "bruto_secondary_usd",
+                  "descuento_main_usd", "descuento_secondary_usd",
+                  "pagado_tercero_usd", "pagado_counter_usd"],
         cop_cols_sixt=["tarifa_cop", "adicionales_cop", "bruto_cop",
-                       "descuento_cop", "neto_cop", "iva_cop", "total_con_iva_cop"],
+                       "descuento_cop", "neto_cop", "iva_cop", "total_con_iva_cop",
+                       "bruto_main_cop", "bruto_secondary_cop",
+                       "descuento_main_cop", "descuento_secondary_cop",
+                       "pagado_tercero_cop", "pagado_counter_cop"],
     )
 
 # ---------- KPIs cabecera ----------
@@ -177,7 +199,9 @@ else:
                AS origen,
            cargo_inty, cargo_codigo, cargo_descripcion, cargo_categoria,
            cantidad,
-           subtotal_con_iva_usd, subtotal_con_iva_cop
+           subtotal_usd, subtotal_cop,
+           subtotal_con_iva_usd, subtotal_con_iva_cop,
+           bucket_pago, forma_pago_cargo, forma_pago_cargo_codigo
     FROM vw_rentals_detail
     WHERE fuente_cargo = 'RENTAL_COUNTER'
       AND rental_currency = 'USD'
@@ -186,15 +210,16 @@ else:
              cargo_inty, cargo_posicion
     """
     df_det = load_query(detalle_sql, tuple(int(c) for c in contratos))
-    for _c in ("subtotal_con_iva_usd", "subtotal_con_iva_cop"):
+    for _c in ("subtotal_usd", "subtotal_cop",
+               "subtotal_con_iva_usd", "subtotal_con_iva_cop"):
         df_det[_c] = pd.to_numeric(df_det[_c], errors="coerce").fillna(0.0)
 
-    # Si COP+Banrep: recalcular el subtotal_con_iva_cop a partir del USD x TRM.
+    # Si COP+Banrep: recalcular columnas COP por linea a partir del USD x TRM.
     if filtros.moneda == "COP":
         df_det = apply_trm(
             df_det, filtros.trm_source, "fecha_handover_real",
-            usd_cols=["subtotal_con_iva_usd"],
-            cop_cols_sixt=["subtotal_con_iva_cop"],
+            usd_cols=["subtotal_usd", "subtotal_con_iva_usd"],
+            cop_cols_sixt=["subtotal_cop", "subtotal_con_iva_cop"],
         )
 
     money_col = f"subtotal_con_iva{suf}"
@@ -223,6 +248,16 @@ else:
         f"cargos en promedio."
     )
 
+    # Sufijos COP/USD para las nuevas columnas por bucket.
+    bruto_main_col = f"bruto_main{suf}"
+    bruto_sec_col = f"bruto_secondary{suf}"
+    desc_main_col = f"descuento_main{suf}"
+    desc_sec_col = f"descuento_secondary{suf}"
+    pagado_t_col = f"pagado_tercero{suf}"
+    pagado_c_col = f"pagado_counter{suf}"
+    sub_col = f"subtotal{suf}"  # sin IVA, por linea
+    sub_iva_col = f"subtotal_con_iva{suf}"  # con IVA, por linea
+
     # Render una factura por contrato (expander).
     for contrato_str in contratos_filtrados:
         contrato_int = int(contrato_str)
@@ -231,13 +266,24 @@ else:
             continue
         head = df_resumen[df_resumen["numero_contrato"] == contrato_int].iloc[0]
 
-        # Los items en df_det ya vienen con IVA aplicado fila a fila desde silver,
-        # asi que los totales del footer tambien se muestran con IVA para que el
-        # cuadre sea: sum(items_con_iva) - descuento_con_iva = total_con_iva.
+        # Totales por bucket. Estos vienen ya calculados de silver.
         iva_factor = 1.19
-        bruto_con_iva = float(head[f"bruto{suf}"]) * iva_factor
-        descuento_con_iva = float(head[f"descuento{suf}"]) * iva_factor
-        total_v = float(head[f"total_con_iva{suf}"])
+        bruto_main = float(head[bruto_main_col]) if pd.notna(head[bruto_main_col]) else 0.0
+        bruto_sec = float(head[bruto_sec_col]) if pd.notna(head[bruto_sec_col]) else 0.0
+        desc_main = float(head[desc_main_col]) if pd.notna(head[desc_main_col]) else 0.0
+        desc_sec = float(head[desc_sec_col]) if pd.notna(head[desc_sec_col]) else 0.0
+        pagado_t = float(head[pagado_t_col]) if pd.notna(head[pagado_t_col]) else 0.0
+        pagado_c = float(head[pagado_c_col]) if pd.notna(head[pagado_c_col]) else 0.0
+        iva_v = float(head[f"iva{suf}"]) if pd.notna(head[f"iva{suf}"]) else 0.0
+        neto_v = float(head[f"neto{suf}"]) if pd.notna(head[f"neto{suf}"]) else 0.0
+        total_v = float(head[f"total_con_iva{suf}"]) if pd.notna(head[f"total_con_iva{suf}"]) else 0.0
+
+        # Pago al tercero / counter CON IVA (para mostrar en el header).
+        pagado_t_iva = pagado_t * iva_factor
+        pagado_c_iva = pagado_c * iva_factor
+
+        es_wholesaler = (head.get("tipo_agencia_main") == "Wholesaler")
+        tercero_nombre = head.get("tercero_nombre")
 
         fecha_str = pd.to_datetime(head["fecha_handover_real"]).strftime("%Y-%m-%d")
         titulo = (
@@ -246,46 +292,89 @@ else:
             f"Total {fmt_money(total_v, cur)}"
         )
 
-        with st.expander(titulo, expanded=(contrato_str == "9523073821")):
+        with st.expander(titulo, expanded=False):
             meta = (
                 f"**Placa:** {head['placa']} &nbsp;|&nbsp; "
                 f"**Dias:** {int(head['dias_renta']) if pd.notna(head['dias_renta']) else '-'} &nbsp;|&nbsp; "
                 f"**Asesor:** {int(head['operador_handover_codigo']) if pd.notna(head['operador_handover_codigo']) else '-'} &nbsp;|&nbsp; "
-                f"**Forma pago:** {head['forma_pago']} &nbsp;|&nbsp; "
                 f"**Prepago:** {head['reserva_prepagada']}"
             )
             st.markdown(meta)
 
-            # Detalle de cargos.
+            # Si es wholesaler, mostrar 3 lineas de tercero. Si no, dejar vacio
+            # (preferencia del usuario: nada de '$0' placeholders).
+            if es_wholesaler and tercero_nombre:
+                tercero_meta = (
+                    f"**Tercero:** {tercero_nombre} &nbsp;|&nbsp; "
+                    f"**Pago al tercero (con IVA):** {fmt_money(pagado_t_iva, cur)} "
+                    f"&nbsp;|&nbsp; "
+                    f"**Pago en counter (con IVA):** {fmt_money(pagado_c_iva, cur)}"
+                )
+                st.markdown(tercero_meta)
+
+            # Detalle de cargos: agregamos Inty, Bucket, Forma de pago.
             det_view = df_lineas[[
-                "origen", "cargo_codigo", "cargo_descripcion",
-                "cargo_categoria", "cantidad", money_col,
+                "cargo_inty", "bucket_pago", "forma_pago_cargo",
+                "cargo_codigo", "cargo_descripcion", "cargo_categoria",
+                "cantidad", sub_iva_col,
             ]].copy()
-            det_view[money_col] = det_view[money_col].apply(lambda v: fmt_money(v, cur))
-            # Coercion a string para concat con footer (que tiene "" en numericos).
+            det_view[sub_iva_col] = det_view[sub_iva_col].apply(lambda v: fmt_money(v, cur))
             det_view["cantidad"] = det_view["cantidad"].astype("Int64").astype(str)
+            # Forma de pago: concatena descripcion + codigo si ambos existen.
+            def _fmt_forma_pago(row):
+                desc = df_lineas.loc[row.name, "forma_pago_cargo"]
+                cod = df_lineas.loc[row.name, "forma_pago_cargo_codigo"]
+                if pd.isna(desc) and pd.isna(cod):
+                    return "-"
+                if pd.notna(desc) and pd.notna(cod):
+                    return f"{desc} ({cod})"
+                return str(desc if pd.notna(desc) else cod)
+            det_view["forma_pago_cargo"] = det_view.apply(_fmt_forma_pago, axis=1)
+
             money_label = f"Subtotal c/IVA ({cur})"
             det_view = det_view.rename(columns={
-                "origen": "Origen",
+                "cargo_inty": "Inty",
+                "bucket_pago": "Bucket",
+                "forma_pago_cargo": "Forma de pago",
                 "cargo_codigo": "Cod",
                 "cargo_descripcion": "Descripcion",
                 "cargo_categoria": "Categoria",
                 "cantidad": "Cant",
-                money_col: money_label,
+                sub_iva_col: money_label,
             })
 
-            # Footer: 3 filas de totales (bruto, descuento, total). Como cada item
-            # ya viene con IVA, no se muestra una linea separada de "IVA 19%".
-            footer = pd.DataFrame([
-                {"Origen": "", "Cod": "", "Descripcion": "--- Subtotal bruto ---",
-                 "Categoria": "", "Cant": "",
-                 money_label: fmt_money(bruto_con_iva, cur)},
-                {"Origen": "", "Cod": "", "Descripcion": "--- Descuento ---",
-                 "Categoria": "", "Cant": "",
-                 money_label: fmt_money(-descuento_con_iva, cur)},
-                {"Origen": "", "Cod": "", "Descripcion": "*** TOTAL CON IVA ***",
-                 "Categoria": "", "Cant": "",
-                 money_label: fmt_money(total_v, cur)},
-            ])
+            # Footer estilo factura split por bucket (sin IVA en items intermedios,
+            # IVA al final). Cada item de arriba esta CON IVA — el footer es la
+            # version sin IVA de los buckets para que la suma cuadre.
+            empty = {"Inty": "", "Bucket": "", "Forma de pago": "",
+                     "Cod": "", "Descripcion": "", "Categoria": "", "Cant": "",
+                     money_label: ""}
+            footer_rows = []
+
+            footer_rows.append({**empty,
+                "Descripcion": "Subtotal MAIN (al tercero)",
+                money_label: fmt_money(bruto_main, cur)})
+            footer_rows.append({**empty,
+                "Descripcion": "Subtotal SECONDARY (al counter)",
+                money_label: fmt_money(bruto_sec, cur)})
+            if desc_main > 0:
+                footer_rows.append({**empty,
+                    "Descripcion": "Descuento MAIN",
+                    money_label: fmt_money(-desc_main, cur)})
+            if desc_sec > 0:
+                footer_rows.append({**empty,
+                    "Descripcion": "Descuento SECONDARY",
+                    money_label: fmt_money(-desc_sec, cur)})
+            footer_rows.append({**empty,
+                "Descripcion": "--- Subtotal NETO ---",
+                money_label: fmt_money(neto_v, cur)})
+            footer_rows.append({**empty,
+                "Descripcion": "IVA 19%",
+                money_label: fmt_money(iva_v, cur)})
+            footer_rows.append({**empty,
+                "Descripcion": "*** TOTAL CON IVA ***",
+                money_label: fmt_money(total_v, cur)})
+
+            footer = pd.DataFrame(footer_rows)
             factura = pd.concat([det_view, footer], ignore_index=True)
             st.dataframe(factura, use_container_width=True, hide_index=True)

@@ -763,6 +763,25 @@ def build_rentals_full(engine):
 
             r.rntl_payment_type                               AS forma_pago,
             r.rntl_payment_type_code                          AS forma_pago_codigo,
+            -- Buckets de pago: MAIN (tercero / OTA via Sixt Corporate Card)
+            -- vs SECONDARY (counter). Permite split por bucket en detail/resumen.
+            r.rntl_payment_type                               AS forma_pago_main,
+            r.rntl_payment_type_code                          AS forma_pago_main_codigo,
+            r.rntl_payment_type_s                             AS forma_pago_secondary,
+            r.rntl_payment_type_s_code                        AS forma_pago_secondary_codigo,
+            r.rntl_agency1_type                               AS tipo_agencia_main,
+            r.agnc_age_agency1                                AS tercero_id,
+            a1.agnc_subsidiary_name                           AS tercero_nombre,
+            CASE WHEN r.rntl_rental_currency_code = 'USD'
+                 THEN ROUND(COALESCE(r.rntl_discount_main_rental, 0)::numeric, 2) END
+                                                              AS descuento_main_usd,
+            CASE WHEN r.rntl_rental_currency_code = 'USD'
+                 THEN ROUND(COALESCE(r.rntl_discount_secondary_rental, 0)::numeric, 2) END
+                                                              AS descuento_secondary_usd,
+            ROUND((COALESCE(r.rntl_discount_main_rental, 0) * r.rntl_exchange_rate_rental)::numeric, 0)
+                                                              AS descuento_main_cop,
+            ROUND((COALESCE(r.rntl_discount_secondary_rental, 0) * r.rntl_exchange_rate_rental)::numeric, 0)
+                                                              AS descuento_secondary_cop,
             rsv.rsrv_prepaid_flg                              AS prepago_flag,
             ROUND(rsv.rsrv_prepaid_value_local::numeric, 0)   AS prepago_cop,
 
@@ -829,6 +848,7 @@ def build_rentals_full(engine):
         LEFT JOIN reserva_extras re      ON re.rsrv_resn = r.rsrv_resn
         LEFT JOIN silver.dim_partners p  ON p.prtn_kdnr = r.cstm_kdnr
                                        AND r.cstm_kdnr > 0
+        LEFT JOIN silver.dim_agencies a1 ON a1.agnc_age = r.agnc_age_agency1
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_rentals_full_sede_fecha ON silver.vw_rentals_full(sede_handover_codigo, fecha_handover_real)")
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_rentals_full_contrato ON silver.vw_rentals_full(numero_contrato)")
@@ -997,6 +1017,32 @@ def build_rentals_detail(engine):
             rf.campaign, rf.canal_partner, rf.canal_principal,
             rf.partner_nombre, rf.partner_subsidiaria, rf.cliente_es_partner_b2b,
             rf.forma_pago, rf.prepago_flag, rf.prepago_cop,
+            rf.forma_pago_main, rf.forma_pago_main_codigo,
+            rf.forma_pago_secondary, rf.forma_pago_secondary_codigo,
+            rf.tipo_agencia_main, rf.tercero_id, rf.tercero_nombre,
+            rf.descuento_main_usd, rf.descuento_secondary_usd,
+            rf.descuento_main_cop, rf.descuento_secondary_cop,
+
+            -- Forma de pago efectiva para ESTE cargo segun su inty.
+            -- inty='M' => bucket MAIN (tercero/Sixt Corporate Card);
+            -- inty='S' => bucket SECONDARY (counter).
+            CASE WHEN u.inty = 'M' THEN rf.forma_pago_main
+                                   ELSE rf.forma_pago_secondary END AS forma_pago_cargo,
+            CASE WHEN u.inty = 'M' THEN rf.forma_pago_main_codigo
+                                   ELSE rf.forma_pago_secondary_codigo END AS forma_pago_cargo_codigo,
+
+            -- Bucket logico para reporting: RESERVA (cargo cobrado al reservar)
+            -- vs TERCERO (cargo MAIN pagado por wholesaler/OTA) vs
+            -- COUNTER (cargo SECONDARY pagado en el counter, incluye 'FE') vs
+            -- MAIN (cargo MAIN pero no es wholesaler, p.ej. cliente directo via tarjeta).
+            CASE
+                WHEN u.fuente_cargo = 'RESERVA_ONLINE' THEN 'RESERVA'
+                WHEN u.inty = 'M' AND rf.tipo_agencia_main = 'Wholesaler' THEN 'TERCERO'
+                WHEN u.inty = 'S' AND rf.forma_pago_secondary_codigo = 'FE' THEN 'COUNTER'
+                WHEN u.inty = 'M' THEN 'MAIN'
+                ELSE 'COUNTER'
+            END                                               AS bucket_pago,
+
             rf.operador_handover_codigo, rf.operador_checkout_codigo,
             rf.estado_reserva, rf.estado_rental,
 
@@ -1032,7 +1078,13 @@ def build_rentals_resumen(engine):
                 campaign, canal_partner, canal_principal, partner_nombre,
                 forma_pago, prepago_flag, operador_handover_codigo,
                 rental_currency, trm_aplicada,
-                cargo_codigo, cargo_categoria, subtotal_cop, subtotal_usd,
+                cargo_codigo, cargo_categoria, cargo_inty,
+                subtotal_cop, subtotal_usd,
+                forma_pago_main, forma_pago_main_codigo,
+                forma_pago_secondary, forma_pago_secondary_codigo,
+                tipo_agencia_main, tercero_id, tercero_nombre,
+                descuento_main_usd, descuento_secondary_usd,
+                descuento_main_cop, descuento_secondary_cop,
                 revenue_total_rental_cop, iva_total_rental_cop, descuento_total_rental_cop,
                 revenue_total_rental_usd, iva_total_rental_usd, descuento_total_rental_usd
             FROM silver.vw_rentals_detail
@@ -1062,6 +1114,19 @@ def build_rentals_resumen(engine):
             MAX(rental_currency) AS rental_currency,
             MAX(trm_aplicada) AS trm_aplicada,
 
+            -- Buckets de pago (per-rental, igual para todas las lineas del contrato)
+            MAX(forma_pago_main) AS forma_pago_main,
+            MAX(forma_pago_main_codigo) AS forma_pago_main_codigo,
+            MAX(forma_pago_secondary) AS forma_pago_secondary,
+            MAX(forma_pago_secondary_codigo) AS forma_pago_secondary_codigo,
+            MAX(tipo_agencia_main) AS tipo_agencia_main,
+            MAX(tercero_id) AS tercero_id,
+            MAX(tercero_nombre) AS tercero_nombre,
+            MAX(descuento_main_usd) AS descuento_main_usd,
+            MAX(descuento_secondary_usd) AS descuento_secondary_usd,
+            MAX(descuento_main_cop) AS descuento_main_cop,
+            MAX(descuento_secondary_cop) AS descuento_secondary_cop,
+
             ROUND(SUM(CASE WHEN cargo_categoria = 'TARIFA' THEN subtotal_cop END)::numeric, 0) AS tarifa_cop,
             ROUND(SUM(CASE WHEN cargo_categoria = 'TARIFA' THEN subtotal_usd END)::numeric, 2) AS tarifa_usd,
             STRING_AGG(
@@ -1079,7 +1144,25 @@ def build_rentals_resumen(engine):
             MAX(iva_total_rental_cop)       AS iva_cop,
             MAX(iva_total_rental_usd)       AS iva_usd,
             ROUND((MAX(revenue_total_rental_cop) + MAX(iva_total_rental_cop))::numeric, 0) AS total_con_iva_cop,
-            ROUND((MAX(revenue_total_rental_usd) + MAX(iva_total_rental_usd))::numeric, 2) AS total_con_iva_usd
+            ROUND((MAX(revenue_total_rental_usd) + MAX(iva_total_rental_usd))::numeric, 2) AS total_con_iva_usd,
+
+            -- Gross subtotals por bucket (sin IVA, sin descuento) — utiles para
+            -- desglose en el dashboard. La factura final es (gross_M + gross_S
+            -- - descuento_main - descuento_secondary) * 1.19.
+            ROUND(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_usd END)::numeric, 2) AS bruto_main_usd,
+            ROUND(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_usd END)::numeric, 2) AS bruto_secondary_usd,
+            ROUND(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_cop END)::numeric, 0) AS bruto_main_cop,
+            ROUND(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_cop END)::numeric, 0) AS bruto_secondary_cop,
+
+            -- Net por bucket = gross - descuento del bucket.
+            ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_usd END), 0)
+                   - COALESCE(MAX(descuento_main_usd), 0))::numeric, 2) AS pagado_tercero_usd,
+            ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_usd END), 0)
+                   - COALESCE(MAX(descuento_secondary_usd), 0))::numeric, 2) AS pagado_counter_usd,
+            ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_cop END), 0)
+                   - COALESCE(MAX(descuento_main_cop), 0))::numeric, 0) AS pagado_tercero_cop,
+            ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_cop END), 0)
+                   - COALESCE(MAX(descuento_secondary_cop), 0))::numeric, 0) AS pagado_counter_cop
         FROM base
         GROUP BY numero_contrato
     """)
