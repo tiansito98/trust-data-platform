@@ -293,46 +293,60 @@ else:
         )
 
         with st.expander(titulo, expanded=False):
-            meta = (
-                f"**Placa:** {head['placa']} &nbsp;|&nbsp; "
-                f"**Dias:** {int(head['dias_renta']) if pd.notna(head['dias_renta']) else '-'} &nbsp;|&nbsp; "
-                f"**Asesor:** {int(head['operador_handover_codigo']) if pd.notna(head['operador_handover_codigo']) else '-'} &nbsp;|&nbsp; "
-                f"**Prepago:** {head['reserva_prepagada']}"
-            )
-            st.markdown(meta)
-
-            # Si es wholesaler, mostrar 3 lineas de tercero. Si no, dejar vacio
-            # (preferencia del usuario: nada de '$0' placeholders).
+            # --- Header del contrato como TABLA (no markdown). Streamlit
+            # interpreta '$' como delimitador LaTeX math, asi que cualquier
+            # render via st.markdown con valores como '$155,03' se rompe. La
+            # tabla es ademas mas legible y consistente con el resto del UI.
+            header_row = {
+                "Contrato": contrato_str,
+                "Vehiculo": str(head["vehiculo"]) if pd.notna(head["vehiculo"]) else "-",
+                "Placa": str(head["placa"]) if pd.notna(head["placa"]) else "-",
+                "Sede": str(head["sede_handover"]) if pd.notna(head["sede_handover"]) else "-",
+                "Handover": fecha_str,
+                "Dias": str(int(head["dias_renta"])) if pd.notna(head["dias_renta"]) else "-",
+                "Asesor": str(int(head["operador_handover_codigo"])) if pd.notna(head["operador_handover_codigo"]) else "-",
+            }
+            # Solo agregar las columnas de tercero si el rental tuvo wholesaler.
+            # Para walk-ins quedan vacias (preferencia del usuario: no mostrar '$0').
             if es_wholesaler and tercero_nombre:
-                tercero_meta = (
-                    f"**Tercero:** {tercero_nombre} &nbsp;|&nbsp; "
-                    f"**Pago al tercero (con IVA):** {fmt_money(pagado_t_iva, cur)} "
-                    f"&nbsp;|&nbsp; "
-                    f"**Pago en counter (con IVA):** {fmt_money(pagado_c_iva, cur)}"
-                )
-                st.markdown(tercero_meta)
+                header_row["Tercero"] = str(tercero_nombre)
+                header_row["Pago tercero (c/IVA)"] = fmt_money(pagado_t_iva, cur)
+                header_row["Pago counter (c/IVA)"] = fmt_money(pagado_c_iva, cur)
+            else:
+                header_row["Tercero"] = ""
+                header_row["Pago tercero (c/IVA)"] = ""
+                header_row["Pago counter (c/IVA)"] = ""
+            header_row[f"Total c/IVA"] = fmt_money(total_v, cur)
+            st.dataframe(pd.DataFrame([header_row]),
+                         use_container_width=True, hide_index=True)
 
-            # Detalle de cargos: agregamos Inty, Bucket, Forma de pago.
+            # --- Lineas de detalle (sin IVA por linea — IVA se muestra una vez al
+            # final). Columnas siguiendo el mockup: Origen | Inty | Bucket |
+            # Forma de pago | Cod | Descripcion | Categoria | Cant | Subtotal.
+            money_label = f"Subtotal ({cur})"
             det_view = df_lineas[[
-                "cargo_inty", "bucket_pago", "forma_pago_cargo",
+                "origen", "cargo_inty", "bucket_pago", "forma_pago_cargo",
+                "forma_pago_cargo_codigo",
                 "cargo_codigo", "cargo_descripcion", "cargo_categoria",
-                "cantidad", sub_iva_col,
+                "cantidad", sub_col,
             ]].copy()
-            det_view[sub_iva_col] = det_view[sub_iva_col].apply(lambda v: fmt_money(v, cur))
+            det_view[sub_col] = det_view[sub_col].apply(lambda v: fmt_money(v, cur))
             det_view["cantidad"] = det_view["cantidad"].astype("Int64").astype(str)
-            # Forma de pago: concatena descripcion + codigo si ambos existen.
+
+            # Forma de pago: "descripcion (CODIGO)" si ambos; fallback a uno solo.
             def _fmt_forma_pago(row):
-                desc = df_lineas.loc[row.name, "forma_pago_cargo"]
-                cod = df_lineas.loc[row.name, "forma_pago_cargo_codigo"]
+                desc = row["forma_pago_cargo"]
+                cod = row["forma_pago_cargo_codigo"]
                 if pd.isna(desc) and pd.isna(cod):
                     return "-"
                 if pd.notna(desc) and pd.notna(cod):
                     return f"{desc} ({cod})"
                 return str(desc if pd.notna(desc) else cod)
             det_view["forma_pago_cargo"] = det_view.apply(_fmt_forma_pago, axis=1)
+            det_view = det_view.drop(columns=["forma_pago_cargo_codigo"])
 
-            money_label = f"Subtotal c/IVA ({cur})"
             det_view = det_view.rename(columns={
+                "origen": "Origen",
                 "cargo_inty": "Inty",
                 "bucket_pago": "Bucket",
                 "forma_pago_cargo": "Forma de pago",
@@ -340,30 +354,32 @@ else:
                 "cargo_descripcion": "Descripcion",
                 "cargo_categoria": "Categoria",
                 "cantidad": "Cant",
-                sub_iva_col: money_label,
+                sub_col: money_label,
             })
 
-            # Footer estilo factura split por bucket (sin IVA en items intermedios,
-            # IVA al final). Cada item de arriba esta CON IVA — el footer es la
-            # version sin IVA de los buckets para que la suma cuadre.
-            empty = {"Inty": "", "Bucket": "", "Forma de pago": "",
+            # --- Footer: split por bucket + neto + IVA + total con IVA.
+            # Bucket column on footer rows shows which bucket the line refers to.
+            empty = {"Origen": "", "Inty": "", "Bucket": "", "Forma de pago": "",
                      "Cod": "", "Descripcion": "", "Categoria": "", "Cant": "",
                      money_label: ""}
             footer_rows = []
-
             footer_rows.append({**empty,
                 "Descripcion": "Subtotal MAIN (al tercero)",
+                "Bucket": "TERCERO",
                 money_label: fmt_money(bruto_main, cur)})
             footer_rows.append({**empty,
                 "Descripcion": "Subtotal SECONDARY (al counter)",
+                "Bucket": "COUNTER",
                 money_label: fmt_money(bruto_sec, cur)})
             if desc_main > 0:
                 footer_rows.append({**empty,
                     "Descripcion": "Descuento MAIN",
+                    "Bucket": "TERCERO",
                     money_label: fmt_money(-desc_main, cur)})
             if desc_sec > 0:
                 footer_rows.append({**empty,
                     "Descripcion": "Descuento SECONDARY",
+                    "Bucket": "COUNTER",
                     money_label: fmt_money(-desc_sec, cur)})
             footer_rows.append({**empty,
                 "Descripcion": "--- Subtotal NETO ---",
