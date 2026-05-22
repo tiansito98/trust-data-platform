@@ -60,7 +60,9 @@ SELECT numero_contrato, fecha_handover_real, fecha_devolucion_real, dias_renta,
        tarifa_cop, adicionales_cop, bruto_cop, descuento_cop,
        neto_cop, iva_cop, total_con_iva_cop,
        -- Split por bucket de pago (TERCERO vs COUNTER) + canal operativo.
-       tipo_agencia_main, tercero_nombre, canal_cobro_tarifa,
+       -- partner_nombre = nombre largo del partner B2B (ej. "CarTrawler Colombia"),
+       -- mas legible que tercero_nombre (agnc_subsidiary_name de dim_agencies).
+       tipo_agencia_main, tercero_nombre, partner_nombre, canal_cobro_tarifa,
        forma_pago_main, forma_pago_main_codigo,
        forma_pago_secondary, forma_pago_secondary_codigo,
        bruto_main_usd, bruto_secondary_usd,
@@ -139,7 +141,8 @@ if modo.startswith("Resumen"):
             "placa", "vehiculo", "categoria_entregada", "acriss_entregado",
             f"tarifa{suf}", "adicionales_codigos", f"adicionales{suf}",
             f"descuento{suf}", f"neto{suf}", f"iva{suf}", f"total_con_iva{suf}",
-            "forma_pago", "reserva_prepagada", "operador_handover_codigo",
+            "forma_pago", "partner_nombre", "reserva_prepagada",
+            "operador_handover_codigo",
         ]
         view = df_resumen[cols_view].copy()
         view["numero_contrato"] = view["numero_contrato"].astype("Int64").astype(str)
@@ -147,6 +150,9 @@ if modo.startswith("Resumen"):
         view["fecha_devolucion_real"] = pd.to_datetime(view["fecha_devolucion_real"]).dt.strftime("%Y-%m-%d")
         view["dias_renta"] = view["dias_renta"].astype("Int64").astype(str)
         view["operador_handover_codigo"] = view["operador_handover_codigo"].astype("Int64").astype(str)
+        # Tercero: nombre largo del partner B2B (ej. "CarTrawler Colombia").
+        # NaN -> string vacio, no "nan".
+        view["partner_nombre"] = view["partner_nombre"].fillna("").astype(str)
 
         money_cols = [f"tarifa{suf}", f"adicionales{suf}", f"descuento{suf}",
                       f"neto{suf}", f"iva{suf}", f"total_con_iva{suf}"]
@@ -171,6 +177,7 @@ if modo.startswith("Resumen"):
             f"iva{suf}": f"IVA ({cur})",
             f"total_con_iva{suf}": f"Total c/IVA ({cur})",
             "forma_pago": "Forma pago",
+            "partner_nombre": "Tercero",
             "reserva_prepagada": "Prepago",
             "operador_handover_codigo": "Asesor",
         })
@@ -285,11 +292,19 @@ else:
         canal = head.get("canal_cobro_tarifa")
         es_wholesaler = (canal == "WHOLESALER")
         es_sixt_prepago = (canal == "SIXT_PREPAGO")
+        # Para el label del wholesaler preferimos partner_nombre (ej.
+        # "CarTrawler Colombia", de dim_partners) sobre tercero_nombre
+        # ("CARTRAWLER", de dim_agencies). Si partner_nombre esta vacio,
+        # caemos a tercero_nombre.
+        partner_nombre = head.get("partner_nombre")
         tercero_nombre = head.get("tercero_nombre")
+        nombre_tercero = (partner_nombre if pd.notna(partner_nombre) and partner_nombre
+                          else tercero_nombre)
 
         # Etiqueta operativa unica que cubre SIXT_PREPAGO + WHOLESALER + COUNTER.
         if es_wholesaler:
-            canal_label = f"Wholesaler - {tercero_nombre}" if tercero_nombre else "Wholesaler"
+            canal_label = (f"Wholesaler - {nombre_tercero}"
+                           if nombre_tercero else "Wholesaler")
         elif es_sixt_prepago:
             canal_label = "Sixt Prepago"
         else:
