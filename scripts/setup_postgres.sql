@@ -53,19 +53,27 @@ CREATE INDEX IF NOT EXISTS idx_ctrl_extraction_table_run
 -- El form de Streamlit escribe aqui (lectura+escritura desde la app).
 CREATE TABLE IF NOT EXISTS operational.invoices (
     invoice_id        BIGSERIAL PRIMARY KEY,
-    rntl_mvnr         BIGINT,                      -- numero_contrato del rental
-    rsrv_resn         BIGINT,                      -- numero de reserva (opcional)
+    rntl_mvnr         BIGINT,                      -- numero del contrato de renta (RA)
+    rsrv_resn         BIGINT,                      -- numero de reserva (opcional, legacy)
     sede_codigo       INTEGER,                     -- brnc_code
     sede_nombre       TEXT,
     fecha_emision     DATE NOT NULL,
-    forma_pago        TEXT,                        -- EFECTIVO / TARJETA / TRANSFERENCIA
-    moneda            TEXT NOT NULL DEFAULT 'COP', -- 'COP' o 'USD'
+    moneda            TEXT NOT NULL DEFAULT 'COP', -- siempre 'COP' por ahora
+    -- Numeros de referencia capturados por el counter
+    numero_factura    TEXT,                        -- consecutivo DIAN
+    numero_recibo     TEXT,                        -- recibo datafono / comprobante
+    -- Montos: el asesor solo digita monto_total y monto_prepagado.
+    -- monto_base y iva los calcula el backend (IVA hardcoded 19 %).
+    -- monto_counter = monto_total - monto_prepagado.
     monto_base        NUMERIC(14,2),
     iva               NUMERIC(14,2),
     monto_total       NUMERIC(14,2) NOT NULL,
-    numero_documento  TEXT,                        -- referencia interna / consecutivo
+    monto_prepagado   NUMERIC(14,2) NOT NULL DEFAULT 0,
+    monto_counter     NUMERIC(14,2),
+    -- Flag derivado: TRUE si monto_prepagado > 0.
+    prepaid           BOOLEAN NOT NULL DEFAULT FALSE,
     observaciones     TEXT,
-    capturado_por     TEXT,                        -- usuario que llenó el form
+    capturado_por     TEXT,                        -- usuario que lleno el form
     capturado_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_invoices_fecha   ON operational.invoices (fecha_emision DESC);
