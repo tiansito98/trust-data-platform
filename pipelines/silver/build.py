@@ -921,22 +921,32 @@ def build_rentals_detail(engine):
                   AND lk.chrs_pos  = c.chrs_pos
                   AND lk.max_konr  = c.chrs_konr
         ),
-        -- Lookup canonical (per resn, inty, chco, pos) del monto reservado.
+        -- Lookup canonical (per resn, inty, chco) del monto reservado.
         -- Para cada cargo de fact_charges_ra (counter), buscamos el cargo
         -- equivalente en fact_charges_rs (reserva) y partimos el monto
         -- ra en (prepagado, counter) = (rs_value, ra_value - rs_value).
         -- Esto es la regla unificada que cubre tanto Wholesalers
         -- (CarTrawler) como Sixt Prepago directo (Priceline / Visa Card).
+        --
+        -- IMPORTANTE: el join NO usa pos. Cuando el counter agrega cargos
+        -- nuevos (OW, RL...) en el medio, los pos de los cargos preexistentes
+        -- se corren. Ej: reserva Y@pos2, counter Y@pos4. Matchear por pos
+        -- pierde la conexion. La clave semantica es (resn, inty, chco).
+        --
+        -- Tambien hacemos SUM por defensa: si la reserva tiene 2 filas con
+        -- el mismo (inty, chco) en posiciones distintas, sumamos sus valores
+        -- antes del join (evita match one-to-many).
         prepay_lookup AS (
-            SELECT c.chrs_resn, c.chrs_inty, c.chrs_chco, c.chrs_pos,
-                   c.chrs_value_rental AS rs_value_rental,
-                   c.chrs_value_local  AS rs_value_cop
+            SELECT c.chrs_resn, c.chrs_inty, c.chrs_chco,
+                   SUM(c.chrs_value_rental) AS rs_value_rental,
+                   SUM(c.chrs_value_local)  AS rs_value_cop
             FROM silver.fact_charges_rs c
             INNER JOIN last_konr_rs lk
                    ON lk.chrs_resn = c.chrs_resn
                   AND lk.chrs_inty = c.chrs_inty
                   AND lk.chrs_pos  = c.chrs_pos
                   AND lk.max_konr  = c.chrs_konr
+            GROUP BY c.chrs_resn, c.chrs_inty, c.chrs_chco
         ),
         cargos_union AS (
             SELECT
@@ -972,12 +982,12 @@ def build_rentals_detail(engine):
                    ON cr.rsrv_resn = r.rsrv_resn
                   AND r.rsrv_resn > 0
                   AND cr.chco = c.chra_chco
-            -- Match a la fila canonica de la reserva (mismo inty + chco + pos)
+            -- Match a la(s) fila(s) canonica(s) de la reserva (mismo inty + chco).
+            -- NO usamos pos: ver nota en prepay_lookup arriba.
             LEFT JOIN prepay_lookup pl
                    ON pl.chrs_resn = r.rsrv_resn
                   AND pl.chrs_inty = c.chra_inty
                   AND pl.chrs_chco = c.chra_chco
-                  AND pl.chrs_pos  = c.chra_pos
                   AND r.rsrv_resn > 0  -- evita match con walk-ins
 
             UNION ALL
