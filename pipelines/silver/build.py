@@ -921,6 +921,23 @@ def build_rentals_detail(engine):
                   AND lk.chrs_pos  = c.chrs_pos
                   AND lk.max_konr  = c.chrs_konr
         ),
+        -- Lookup canonical (per resn, inty, chco, pos) del monto reservado.
+        -- Para cada cargo de fact_charges_ra (counter), buscamos el cargo
+        -- equivalente en fact_charges_rs (reserva) y partimos el monto
+        -- ra en (prepagado, counter) = (rs_value, ra_value - rs_value).
+        -- Esto es la regla unificada que cubre tanto Wholesalers
+        -- (CarTrawler) como Sixt Prepago directo (Priceline / Visa Card).
+        prepay_lookup AS (
+            SELECT c.chrs_resn, c.chrs_inty, c.chrs_chco, c.chrs_pos,
+                   c.chrs_value_rental AS rs_value_rental,
+                   c.chrs_value_local  AS rs_value_cop
+            FROM silver.fact_charges_rs c
+            INNER JOIN last_konr_rs lk
+                   ON lk.chrs_resn = c.chrs_resn
+                  AND lk.chrs_inty = c.chrs_inty
+                  AND lk.chrs_pos  = c.chrs_pos
+                  AND lk.max_konr  = c.chrs_konr
+        ),
         cargos_union AS (
             SELECT
                 'RENTAL_COUNTER' AS fuente_cargo,
@@ -937,7 +954,13 @@ def build_rentals_detail(engine):
                 c.chra_value            AS subtotal_eur,
                 c.chra_value_rental     AS subtotal_rental_curr,
                 c.rntl_rental_currency_code AS rental_currency,
-                c.rntl_exchange_rate_rental AS xr_rental_cop
+                c.rntl_exchange_rate_rental AS xr_rental_cop,
+                -- Split per-cargo: si hay match en la reserva (pl),
+                -- la parte coincidente es prepagado; el delta es counter.
+                COALESCE(pl.rs_value_rental, 0)                     AS prepagado_rental,
+                c.chra_value_rental - COALESCE(pl.rs_value_rental, 0) AS counter_rental,
+                COALESCE(pl.rs_value_cop, 0)                        AS prepagado_cop_raw,
+                c.chra_value_local - COALESCE(pl.rs_value_cop, 0)   AS counter_cop_raw
             FROM silver.fact_charges_ra c
             INNER JOIN last_konr_ra lk
                    ON lk.chra_mvnr = c.chra_mvnr
@@ -949,6 +972,13 @@ def build_rentals_detail(engine):
                    ON cr.rsrv_resn = r.rsrv_resn
                   AND r.rsrv_resn > 0
                   AND cr.chco = c.chra_chco
+            -- Match a la fila canonica de la reserva (mismo inty + chco + pos)
+            LEFT JOIN prepay_lookup pl
+                   ON pl.chrs_resn = r.rsrv_resn
+                  AND pl.chrs_inty = c.chra_inty
+                  AND pl.chrs_chco = c.chra_chco
+                  AND pl.chrs_pos  = c.chra_pos
+                  AND r.rsrv_resn > 0  -- evita match con walk-ins
 
             UNION ALL
 
@@ -966,7 +996,13 @@ def build_rentals_detail(engine):
                 c.chrs_value            AS subtotal_eur,
                 c.chrs_value_rental     AS subtotal_rental_curr,
                 c.rsrv_rental_currency_code AS rental_currency,
-                c.rsrv_exchange_rate_rental AS xr_rental_cop
+                c.rsrv_exchange_rate_rental AS xr_rental_cop,
+                -- RESERVA_ONLINE: el cargo vino de la reserva original,
+                -- 100% prepagado por definicion (counter = 0).
+                c.chrs_value_rental AS prepagado_rental,
+                0::numeric           AS counter_rental,
+                c.chrs_value_local  AS prepagado_cop_raw,
+                0::numeric           AS counter_cop_raw
             FROM silver.fact_charges_rs c
             INNER JOIN last_konr_rs lk
                    ON lk.chrs_resn = c.chrs_resn
@@ -1010,6 +1046,16 @@ def build_rentals_detail(engine):
             CASE WHEN u.rental_currency = 'USD'
                  THEN ROUND(u.subtotal_rental_curr::numeric, 2) END    AS subtotal_usd,
             ROUND(u.xr_rental_cop::numeric, 4)                AS trm_aplicada,
+
+            -- Per-cargo split prepagado vs counter (regla unificada que
+            -- cubre Wholesalers y Sixt Prepago directo). Para cargos sin
+            -- match en la reserva, prepagado = 0 y counter = monto completo.
+            CASE WHEN u.rental_currency = 'USD'
+                 THEN ROUND(u.prepagado_rental::numeric, 2) END        AS prepagado_cargo_usd,
+            CASE WHEN u.rental_currency = 'USD'
+                 THEN ROUND(u.counter_rental::numeric, 2) END          AS counter_cargo_usd,
+            ROUND(u.prepagado_cop_raw::numeric, 0)            AS prepagado_cargo_cop,
+            ROUND(u.counter_cop_raw::numeric, 0)              AS counter_cargo_cop,
 
             ROUND((u.subtotal_cop * (1 + COALESCE(rf.iva_porcentaje, 19) / 100.0))::numeric, 0)
                 AS subtotal_con_iva_cop,
@@ -1101,6 +1147,8 @@ def build_rentals_resumen(engine):
                 canal_cobro_tarifa,
                 descuento_main_usd, descuento_secondary_usd,
                 descuento_main_cop, descuento_secondary_cop,
+                prepagado_cargo_usd, counter_cargo_usd,
+                prepagado_cargo_cop, counter_cargo_cop,
                 revenue_total_rental_cop, iva_total_rental_cop, descuento_total_rental_cop,
                 revenue_total_rental_usd, iva_total_rental_usd, descuento_total_rental_usd
             FROM silver.vw_rentals_detail
@@ -1172,6 +1220,7 @@ def build_rentals_resumen(engine):
             ROUND(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_cop END)::numeric, 0) AS bruto_secondary_cop,
 
             -- Net por bucket = gross - descuento del bucket.
+            -- LEGACY (inty-based, mantiene compat con dashboards viejos):
             ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_usd END), 0)
                    - COALESCE(MAX(descuento_main_usd), 0))::numeric, 2) AS pagado_tercero_usd,
             ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_usd END), 0)
@@ -1179,7 +1228,21 @@ def build_rentals_resumen(engine):
             ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'M' THEN subtotal_cop END), 0)
                    - COALESCE(MAX(descuento_main_cop), 0))::numeric, 0) AS pagado_tercero_cop,
             ROUND((COALESCE(SUM(CASE WHEN cargo_inty = 'S' THEN subtotal_cop END), 0)
-                   - COALESCE(MAX(descuento_secondary_cop), 0))::numeric, 0) AS pagado_counter_cop
+                   - COALESCE(MAX(descuento_secondary_cop), 0))::numeric, 0) AS pagado_counter_cop,
+
+            -- NUEVO (per-charge split): regla unificada que cubre Wholesaler
+            -- Y Sixt Prepago directo. Sumamos el prepagado y counter de cada
+            -- cargo (ya separados en vw_rentals_detail) y restamos los
+            -- descuentos del rental (main aplica al bucket prepagado;
+            -- secondary aplica al bucket counter).
+            ROUND((COALESCE(SUM(prepagado_cargo_usd), 0)
+                   - COALESCE(MAX(descuento_main_usd), 0))::numeric, 2) AS prepagado_usd,
+            ROUND((COALESCE(SUM(counter_cargo_usd), 0)
+                   - COALESCE(MAX(descuento_secondary_usd), 0))::numeric, 2) AS counter_usd,
+            ROUND((COALESCE(SUM(prepagado_cargo_cop), 0)
+                   - COALESCE(MAX(descuento_main_cop), 0))::numeric, 0) AS prepagado_cop,
+            ROUND((COALESCE(SUM(counter_cargo_cop), 0)
+                   - COALESCE(MAX(descuento_secondary_cop), 0))::numeric, 0) AS counter_cop
         FROM base
         GROUP BY numero_contrato
     """)
