@@ -92,37 +92,39 @@ with st.form("invoice_form", clear_on_submit=True):
         help="Numero del recibo del datafono o del comprobante de pago.",
     )
 
-    # --- Fila 3: monto total + monto prepagado ---
+    # --- Fila 3: monto en counter + monto prepagado (ambos CON IVA) ---
     c6, c7 = st.columns(2)
-    monto_total = c6.number_input(
-        "Monto total (COP)",
+    monto_counter = c6.number_input(
+        "Monto en counter (con IVA)",
         min_value=0.0,
         step=1000.0,
         format="%.2f",
-        help=("Valor total cobrado al cliente, con IVA incluido. El sistema "
-              "calcula automaticamente el 19 % de IVA y el monto base sin IVA."),
+        help=("Lo que el counter cobra HOY al cliente, con IVA incluido. "
+              "Es el valor que aparece en el datafono cuando se pasa la tarjeta "
+              "(o que se recibe en efectivo). Si todo fue pre-pagado y el "
+              "cliente no paga nada aqui, deje en 0."),
     )
     monto_prepagado = c7.number_input(
-        "Monto prepagado (COP)",
+        "Monto prepagado (con IVA)",
         min_value=0.0,
         step=1000.0,
         format="%.2f",
         help=("Cuanto del total ya estaba pre-pagado por Sixt o por un tercero "
-              "(CarTrawler, Booking, Hopper, etc.). "
+              "(CarTrawler, Booking, Hopper, etc.), con IVA incluido. "
               "Si el cliente paga TODO aqui en el counter, deje en 0."),
     )
 
-    # --- Auto-mostrar lo que se paga en counter ---
-    monto_counter_preview = max(monto_total - monto_prepagado, 0.0)
-    if monto_total > 0:
+    # --- Auto-mostrar el TOTAL = counter + prepagado ---
+    monto_total_preview = monto_counter + monto_prepagado
+    if monto_total_preview > 0:
         st.markdown(
             f"<div style='background:#fff3e0;padding:8px 14px;"
             f"border-radius:4px;border-left:3px solid #ff6900;"
             f"margin:4px 0 12px 0;color:#333;font-size:0.95rem;'>"
-            f"<strong>Monto pagado en counter:</strong> "
-            f"{fmt_money(monto_counter_preview, 'COP')} "
+            f"<strong>Monto total (con IVA):</strong> "
+            f"{fmt_money(monto_total_preview, 'COP')} "
             f"&nbsp;<span style='color:#888;font-size:0.85rem;'>"
-            f"(monto total &minus; monto prepagado)</span>"
+            f"(monto en counter + monto prepagado)</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -142,20 +144,20 @@ with st.form("invoice_form", clear_on_submit=True):
 # Procesar submit
 # =============================================================================
 if submitted:
+    # Calculo backend: monto_total se DERIVA de counter + prepagado.
+    # IVA se extrae del total (hardcoded 19 %).
+    monto_total = round(monto_counter + monto_prepagado, 2)
+    iva_factor = 1 + IVA_PORCENTAJE / 100.0
+    monto_base = round(monto_total / iva_factor, 2)
+    iva = round(monto_total - monto_base, 2)
+    prepaid = monto_prepagado > 0
+
     # Validaciones
     if monto_total <= 0:
-        st.error("El monto total debe ser mayor a 0.")
-    elif monto_prepagado > monto_total:
-        st.error("El monto prepagado no puede ser mayor al monto total.")
+        st.error("El monto total (counter + prepagado) debe ser mayor a 0.")
     elif not rntl_mvnr.strip().isdigit():
         st.error("El numero de contrato debe ser solo digitos.")
     else:
-        # Calculo backend: el sistema separa el IVA del monto total.
-        iva_factor = 1 + IVA_PORCENTAJE / 100.0
-        monto_base = round(monto_total / iva_factor, 2)
-        iva = round(monto_total - monto_base, 2)
-        monto_counter = round(monto_total - monto_prepagado, 2)
-        prepaid = monto_prepagado > 0
 
         params = {
             "rntl_mvnr": int(rntl_mvnr.strip()),
