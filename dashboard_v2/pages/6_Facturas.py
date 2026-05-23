@@ -23,7 +23,7 @@ import streamlit as st
 from components.auth import require_auth, logout_button
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
-    fmt_money,
+    fmt_money, render_trm_today_sidebar,
 )
 
 # --- Constantes de negocio ---
@@ -33,6 +33,9 @@ IVA_PORCENTAJE = 19.0  # IVA Colombia, hardcoded
 st.set_page_config(page_title="TRUST - Facturas", layout="wide")
 require_auth()
 inject_styles()
+# TRM Hoy en la sidebar (igual que en el resto de paginas). Esta pagina no
+# llama render_sidebar_filters, asi que invocamos el bloque TRM directamente.
+render_trm_today_sidebar()
 logout_button()
 render_header("Facturas / Recibos")
 
@@ -95,23 +98,24 @@ with st.form("invoice_form", clear_on_submit=True):
     # --- Fila 3: monto en counter + monto prepagado (ambos CON IVA) ---
     c6, c7 = st.columns(2)
     monto_counter = c6.number_input(
-        "Monto en counter (con IVA)",
+        "Monto en counter (COP, con IVA)",
         min_value=0.0,
         step=1000.0,
         format="%.2f",
-        help=("Lo que el counter cobra HOY al cliente, con IVA incluido. "
-              "Es el valor que aparece en el datafono cuando se pasa la tarjeta "
-              "(o que se recibe en efectivo). Si todo fue pre-pagado y el "
-              "cliente no paga nada aqui, deje en 0."),
+        help=("Lo que el counter cobra HOY al cliente, en pesos colombianos, "
+              "con IVA incluido. Es el valor que aparece en el datafono cuando "
+              "se pasa la tarjeta (o que se recibe en efectivo). Si todo fue "
+              "pre-pagado y el cliente no paga nada aqui, deje en 0."),
     )
     monto_prepagado = c7.number_input(
-        "Monto prepagado (con IVA)",
+        "Monto prepagado (COP, con IVA)",
         min_value=0.0,
         step=1000.0,
         format="%.2f",
         help=("Cuanto del total ya estaba pre-pagado por Sixt o por un tercero "
-              "(CarTrawler, Booking, Hopper, etc.), con IVA incluido. "
-              "Si el cliente paga TODO aqui en el counter, deje en 0."),
+              "(CarTrawler, Booking, Hopper, etc.), en pesos colombianos y con "
+              "IVA incluido. Si el cliente paga TODO aqui en el counter, "
+              "deje en 0."),
     )
 
     # --- Auto-mostrar el TOTAL = counter + prepagado ---
