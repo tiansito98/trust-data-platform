@@ -31,11 +31,11 @@ def _load_users() -> dict:
     Fallback: config/users.yml local (desarrollo). Cacheado 1 hora."""
     # 1. Streamlit Cloud secrets (TOML nested bajo [users.xxx])
     try:
-        secrets_users = st.secrets.get("users")
-        if secrets_users:
+        if hasattr(st, "secrets") and "users" in st.secrets:
+            secrets_users = st.secrets["users"]
             return {
                 username: {
-                    "password_hash": str(u.get("password_hash", "")),
+                    "password_hash": str(u["password_hash"]),
                     "role": str(u.get("role", "sede")),
                     "branches": list(u.get("branches", [])),
                     "pages": list(u.get("pages", [])),
