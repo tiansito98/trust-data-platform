@@ -10,4 +10,4 @@ users:
     password_hash: "$2b$12$HASH_AQUI"
     role: sede
     branches: ["BOGOTA EL DORADO INTL AIRPORT"]
-    pages: ["1_Cierre_Diario", "6_Facturas"]
+    pages: ["1_Cierre_Diario", "6_Facturas", "7_Disponibilidad_Flota"]

@@ -172,6 +172,27 @@ CREATE TABLE IF NOT EXISTS silver.op_contratos_soportes_faltantes (
 );
 
 
+-- -----------------------------------------------------------------------------
+-- 8. Disponibilidad manual de vehiculos (operational schema)
+-- -----------------------------------------------------------------------------
+-- CRITICAL: this lives in operational, NOT silver. Never dropped during rebuild.
+CREATE TABLE IF NOT EXISTS operational.op_disponibilidad_manual (
+    id              BIGSERIAL PRIMARY KEY,
+    vhcl_int_num    BIGINT NOT NULL,
+    placa           TEXT NOT NULL,
+    fecha           DATE NOT NULL,
+    estado          TEXT NOT NULL,
+    nota            TEXT,
+    asesor_codigo   TEXT,
+    sede_codigo     INTEGER,
+    created_by      TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(vhcl_int_num, fecha)
+);
+CREATE INDEX IF NOT EXISTS idx_op_disp_manual_sede ON operational.op_disponibilidad_manual(sede_codigo, fecha);
+CREATE INDEX IF NOT EXISTS idx_op_disp_manual_vhcl ON operational.op_disponibilidad_manual(vhcl_int_num, fecha);
+
+
 -- Indices op_*
 CREATE INDEX IF NOT EXISTS idx_op_cier_brnc_date ON silver.op_cierre_diario_sede(brnc_code, cier_date);
 CREATE INDEX IF NOT EXISTS idx_op_nove_date      ON silver.op_novedades_vehiculo(nove_date);

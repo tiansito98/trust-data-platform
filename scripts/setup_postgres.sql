@@ -82,7 +82,28 @@ CREATE INDEX IF NOT EXISTS idx_invoices_sede    ON operational.invoices (sede_co
 
 COMMENT ON TABLE operational.invoices IS 'Facturas/recibos capturados por el form del dashboard.';
 
--- 4. Sanidad / verificacion
+-- 4. Tabla operativa: disponibilidad manual de vehiculos
+-- El form de Streamlit (Disponibilidad Flota) escribe aqui.
+CREATE TABLE IF NOT EXISTS operational.op_disponibilidad_manual (
+    id              BIGSERIAL PRIMARY KEY,
+    vhcl_int_num    BIGINT NOT NULL,
+    placa           TEXT NOT NULL,
+    fecha           DATE NOT NULL,
+    estado          TEXT NOT NULL,
+    nota            TEXT,
+    asesor_codigo   TEXT,
+    sede_codigo     INTEGER,
+    created_by      TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(vhcl_int_num, fecha)
+);
+CREATE INDEX IF NOT EXISTS idx_op_disp_manual_sede   ON operational.op_disponibilidad_manual (sede_codigo, fecha);
+CREATE INDEX IF NOT EXISTS idx_op_disp_manual_vhcl   ON operational.op_disponibilidad_manual (vhcl_int_num, fecha);
+
+COMMENT ON TABLE operational.op_disponibilidad_manual IS 'Estados manuales de vehiculos (PYP, taller, transito, etc.) capturados desde el dashboard.';
+
+
+-- 5. Sanidad / verificacion
 -- Al terminar este script deberian existir:
 --   bronze, silver, operational schemas
 --   bronze.ctrl_extraction_log

@@ -1262,6 +1262,110 @@ def build_rentals_resumen(engine):
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
 
+def build_disponibilidad_vehiculo_dia(engine):
+    log("\n>> Construyendo vw_disponibilidad_vehiculo_dia")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.vw_disponibilidad_vehiculo_dia CASCADE")
+    _exec(engine, "DROP VIEW IF EXISTS silver.vw_disponibilidad_vehiculo_dia CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver.vw_disponibilidad_vehiculo_dia AS
+        WITH params AS (
+            SELECT
+                (DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month')::date AS desde,
+                (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '2 months' - INTERVAL '1 day')::date AS hasta
+        ),
+        vehiculos AS (
+            SELECT
+                vc.vhcl_int_num,
+                v.vhcl_plate AS placa,
+                TRIM(COALESCE(vm.vhmd_brand_name,'') || ' ' || COALESCE(vm.vhmd_generic_model,'')) AS vehiculo,
+                vc.vhcl_group AS acriss,
+                vc.brnc_code AS sede_codigo,
+                b.brnc_name AS sede_nombre
+            FROM silver.dim_vehicles_current vc
+            JOIN silver.dim_vehicles v ON v.vhcl_int_num = vc.vhcl_int_num
+            LEFT JOIN silver.dim_vehicle_models vm ON vm.vhmd_cdef = v.vhmd_cdef
+            LEFT JOIN silver.dim_branches b ON b.brnc_code = vc.brnc_code
+            WHERE vc.vhcl_int_num != 99999999
+        ),
+        calendario AS (
+            SELECT full_date AS fecha
+            FROM silver.dim_dates
+            WHERE full_date BETWEEN (SELECT desde FROM params) AND (SELECT hasta FROM params)
+        ),
+        grilla AS (
+            SELECT v.*, c.fecha
+            FROM vehiculos v
+            CROSS JOIN calendario c
+        ),
+        rentals_activos AS (
+            SELECT DISTINCT
+                r.vhcl_int_num,
+                d.full_date AS fecha,
+                r.rntl_mvnr AS numero_contrato,
+                r.oprt_bed AS asesor_codigo,
+                NULLIF(r.rsrv_resn, 0) AS numero_reserva
+            FROM silver.fact_rentals r
+            JOIN silver.dim_dates d
+              ON d.full_date BETWEEN r.rntl_handover_date::date
+                                 AND COALESCE(r.rntl_return_date::date, CURRENT_DATE)
+            WHERE r.vhcl_int_num IS NOT NULL
+              AND r.rntl_handover_date IS NOT NULL
+              AND d.full_date BETWEEN (SELECT desde FROM params) AND (SELECT hasta FROM params)
+        ),
+        reservas_abiertas AS (
+            SELECT DISTINCT
+                rs.vhgr_crs AS acriss,
+                rs.brnc_code_handover AS sede_codigo,
+                d.full_date AS fecha,
+                rs.rsrv_resn AS numero_reserva
+            FROM silver.fact_reservations rs
+            JOIN silver.dim_dates d
+              ON d.full_date BETWEEN rs.rsrv_handover_date::date
+                                 AND COALESCE(rs.rsrv_return_date::date, DATE '9999-12-31')
+            WHERE rs.rsrv_status = 'Open'
+              AND rs.rsrv_handover_date IS NOT NULL
+              AND d.full_date BETWEEN (SELECT desde FROM params) AND (SELECT hasta FROM params)
+        ),
+        manual AS (
+            SELECT vhcl_int_num, fecha, estado, nota, asesor_codigo, created_by
+            FROM operational.op_disponibilidad_manual
+            WHERE fecha BETWEEN (SELECT desde FROM params) AND (SELECT hasta FROM params)
+        )
+        SELECT
+            g.vhcl_int_num, g.placa, g.vehiculo, g.acriss,
+            g.sede_codigo, g.sede_nombre,
+            g.fecha,
+            CASE
+                WHEN m.estado IS NOT NULL           THEN m.estado
+                WHEN ra.numero_contrato IS NOT NULL THEN 'RENTADO'
+                WHEN res.numero_reserva IS NOT NULL THEN 'RESERVADO'
+                ELSE 'DISPONIBLE'
+            END AS estado,
+            CASE
+                WHEN m.estado IS NOT NULL           THEN 'MANUAL'
+                WHEN ra.numero_contrato IS NOT NULL THEN 'AUTO'
+                WHEN res.numero_reserva IS NOT NULL THEN 'AUTO'
+                ELSE 'DEFAULT'
+            END AS origen,
+            ra.numero_contrato,
+            COALESCE(ra.numero_reserva, res.numero_reserva) AS numero_reserva,
+            COALESCE(m.asesor_codigo, ra.asesor_codigo)     AS asesor_codigo,
+            m.nota,
+            m.created_by
+        FROM grilla g
+        LEFT JOIN manual m            ON m.vhcl_int_num = g.vhcl_int_num AND m.fecha = g.fecha
+        LEFT JOIN rentals_activos ra  ON ra.vhcl_int_num = g.vhcl_int_num AND ra.fecha = g.fecha
+        LEFT JOIN reservas_abiertas res ON res.acriss = g.acriss
+                                       AND res.sede_codigo = g.sede_codigo
+                                       AND res.fecha = g.fecha
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_disp_veh_dia_sede_fecha ON silver.vw_disponibilidad_vehiculo_dia(sede_codigo, fecha)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_disp_veh_dia_vhcl_fecha ON silver.vw_disponibilidad_vehiculo_dia(vhcl_int_num, fecha)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.vw_disponibilidad_vehiculo_dia")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
 def build_kpi_anual(engine):
     log("\n>> Construyendo vw_kpi_anual")
     started = time.time()
@@ -1643,7 +1747,10 @@ def main():
     build_rentals_detail(engine)
     build_rentals_resumen(engine)
 
-    # 10. Analiticas anuales
+    # 10. Disponibilidad vehiculo-dia (grilla mensual)
+    build_disponibilidad_vehiculo_dia(engine)
+
+    # 11. Analiticas anuales
     build_kpi_anual(engine)
     build_demanda_anual(engine)
     build_demanda_sede_acriss_anual(engine)
