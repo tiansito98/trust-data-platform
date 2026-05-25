@@ -20,7 +20,7 @@ import datetime as dt
 
 import streamlit as st
 
-from components.auth import require_auth, require_page, logout_button
+from components.auth import require_auth, require_page, logout_button, get_user_branches, is_admin
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
     fmt_money, render_trm_today_sidebar,
@@ -71,11 +71,18 @@ with st.form("invoice_form", clear_on_submit=True):
         value=dt.date.today(),
         help="Fecha en que se emite la factura (normalmente hoy).",
     )
-    sede_nombre = c2.selectbox(
-        "Sede",
-        options=list(sede_map.keys()),
-        help="Sede donde se entrego el vehiculo.",
-    )
+    # Sede: si el usuario es de tipo 'sede', bloquear a su sucursal.
+    user_branches = get_user_branches()
+    if is_admin() or "*" in user_branches:
+        sede_nombre = c2.selectbox(
+            "Sede",
+            options=list(sede_map.keys()),
+            help="Sede donde se entrego el vehiculo.",
+        )
+    else:
+        locked_sede = user_branches[0] if user_branches else ""
+        c2.text_input("Sede (fija)", value=locked_sede, disabled=True)
+        sede_nombre = locked_sede
     rntl_mvnr = c3.text_input(
         "Numero de contrato",
         placeholder="ej. 9523011485",
