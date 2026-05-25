@@ -27,10 +27,11 @@ from components.common import (
     fmt_int, load_query, apply_trm,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
-from components.auth import require_auth, logout_button
+from components.auth import require_auth, require_page, logout_button
 
 st.set_page_config(page_title="TRUST - Cierre Diario", layout="wide")
 require_auth()
+require_page("1_Cierre_Diario")
 inject_styles()
 logout_button()
 render_header("Cierre Diario por Sede")

@@ -1,66 +1,161 @@
 """
-Auth simple para el dashboard v2.
+Auth multi-usuario con roles y restriccion por sede.
 
-Credenciales: hardcodeadas en secrets (DASHBOARD_USER / DASHBOARD_PASS). UN
-solo usuario autorizado. NO Supabase Auth, NO role system, NO cookies — la
-sesion vive solo en st.session_state mientras la tab este abierta.
+Credenciales almacenadas en dashboard_v2/config/users.yml con password
+hasheados (bcrypt). Cada usuario tiene un rol (admin / sede) y una lista
+de sedes visibles.
 
-Cada pagina del dashboard debe llamar require_auth() al inicio. Si el usuario
-no esta logueado, render el form + st.stop().
+Funciones clave que cada pagina debe llamar:
+  require_auth()  -> bloquea si no esta logueado (muestra login form).
+  require_page(page_key) -> bloquea si el usuario no tiene acceso a esa pagina.
+  get_user_branches() -> devuelve la lista de sedes del usuario, o ["*"].
+  is_admin() -> True si el usuario es admin.
+  logout_button() -> boton en sidebar para cerrar sesion.
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
+import bcrypt
 import streamlit as st
+import yaml
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-from scripts.get_secret import get_secret  # noqa: E402
+
+_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+_USERS_FILE = _CONFIG_DIR / "users.yml"
+
+
+@st.cache_data(ttl=3600)
+def _load_users() -> dict:
+    """Carga usuarios. Fuente primaria: st.secrets["users"] (Streamlit Cloud).
+    Fallback: config/users.yml local (desarrollo). Cacheado 1 hora."""
+    # 1. Streamlit Cloud secrets (TOML nested bajo [users.xxx])
+    try:
+        secrets_users = st.secrets.get("users")
+        if secrets_users:
+            return {
+                username: {
+                    "password_hash": str(u.get("password_hash", "")),
+                    "role": str(u.get("role", "sede")),
+                    "branches": list(u.get("branches", [])),
+                    "pages": list(u.get("pages", [])),
+                }
+                for username, u in secrets_users.items()
+            }
+    except Exception:
+        pass
+    # 2. Fallback: YAML local (gitignored, para desarrollo).
+    if _USERS_FILE.exists():
+        with open(_USERS_FILE, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        return cfg.get("users", {})
+    return {}
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def _is_authenticated() -> bool:
     return bool(st.session_state.get("authenticated", False))
 
 
+def get_current_user() -> dict | None:
+    """Devuelve el dict del usuario logueado, o None si no esta logueado."""
+    if not _is_authenticated():
+        return None
+    return st.session_state.get("user_info")
+
+
+def is_admin() -> bool:
+    user = get_current_user()
+    return user is not None and user.get("role") == "admin"
+
+
+def get_user_branches() -> list[str]:
+    """Devuelve la lista de sedes del usuario. ["*"] para admin (= todas)."""
+    user = get_current_user()
+    if user is None:
+        return []
+    return user.get("branches", [])
+
+
+def get_user_pages() -> list[str]:
+    """Devuelve la lista de pages permitidas. ["*"] para admin (= todas)."""
+    user = get_current_user()
+    if user is None:
+        return []
+    return user.get("pages", [])
+
+
 def require_auth() -> None:
-    """
-    Si no esta logueado, render form + st.stop(). Si esta logueado, pasa.
-    Llamar al tope de cada pagina, antes de cualquier query a la DB.
-    """
+    """Si no esta logueado, muestra form de login y hace st.stop()."""
     if _is_authenticated():
         return
 
     st.title("Trust Data Platform")
     st.caption("Acceso restringido. Ingresa tus credenciales.")
 
+    users = _load_users()
+    if not users:
+        st.error("No se encontro el archivo de usuarios (config/users.yml).")
+        st.stop()
+
     with st.form("login_form", clear_on_submit=False):
-        user = st.text_input("Usuario", key="login_user")
-        pwd = st.text_input("Contraseña", type="password", key="login_pwd")
+        username = st.text_input("Usuario", key="login_user")
+        password = st.text_input("Contrasena", type="password", key="login_pwd")
         submitted = st.form_submit_button("Entrar")
 
     if submitted:
-        expected_user = get_secret("DASHBOARD_USER", default="")
-        expected_pwd = get_secret("DASHBOARD_PASS", default="")
-        if not expected_user or not expected_pwd:
-            st.error("Auth no configurado. Setea DASHBOARD_USER y "
-                     "DASHBOARD_PASS en secrets/.env.")
+        user_cfg = users.get(username)
+        if user_cfg is None:
+            st.error("Usuario o contrasena incorrectos.")
             st.stop()
-        if user == expected_user and pwd == expected_pwd:
-            st.session_state["authenticated"] = True
-            st.session_state["dashboard_user"] = user
-            st.rerun()
-        else:
-            st.error("Usuario o contraseña incorrectos.")
+        if not _verify_password(password, user_cfg.get("password_hash", "")):
+            st.error("Usuario o contrasena incorrectos.")
+            st.stop()
+
+        st.session_state["authenticated"] = True
+        st.session_state["dashboard_user"] = username
+        st.session_state["user_info"] = {
+            "username": username,
+            "role": user_cfg.get("role", "sede"),
+            "branches": user_cfg.get("branches", []),
+            "pages": user_cfg.get("pages", []),
+        }
+        st.rerun()
+
     st.stop()
 
 
-def logout_button(location: st.sidebar = None) -> None:
-    """Boton de logout (opcional). Llamarlo desde la sidebar o donde quieras."""
+def require_page(page_key: str) -> None:
+    """Bloquea la pagina si el usuario no tiene acceso.
+
+    page_key debe ser el prefijo del nombre de archivo de la pagina.
+    Ej: "1_Cierre_Diario", "6_Facturas", "2_Ingresos".
+    Para admin (pages=["*"]) siempre pasa.
+    """
+    allowed = get_user_pages()
+    if "*" in allowed:
+        return
+    if page_key not in allowed:
+        st.warning("Acceso restringido. Tu usuario no tiene permiso para "
+                   "ver esta pagina.")
+        st.stop()
+
+
+def logout_button(location=None) -> None:
+    """Boton de logout. Llamar desde sidebar o donde convenga."""
     target = location if location is not None else st.sidebar
+    user = get_current_user()
+    if user:
+        target.caption(f"Usuario: **{user['username']}** ({user['role']})")
     if target.button("Cerrar sesion", key="btn_logout"):
-        for k in ("authenticated", "dashboard_user", "login_user", "login_pwd"):
-            st.session_state.pop(k, None)
+        for k in list(st.session_state.keys()):
+            if k.startswith(("authenticated", "dashboard_user", "user_info",
+                             "login_user", "login_pwd", "v2_")):
+                st.session_state.pop(k, None)
         st.rerun()

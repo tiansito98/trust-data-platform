@@ -20,7 +20,7 @@ import datetime as dt
 
 import streamlit as st
 
-from components.auth import require_auth, logout_button
+from components.auth import require_auth, require_page, logout_button
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
     fmt_money, render_trm_today_sidebar,
@@ -32,6 +32,7 @@ IVA_PORCENTAJE = 19.0  # IVA Colombia, hardcoded
 
 st.set_page_config(page_title="TRUST - Facturas", layout="wide")
 require_auth()
+require_page("6_Facturas")
 inject_styles()
 # TRM Hoy en la sidebar (igual que en el resto de paginas). Esta pagina no
 # llama render_sidebar_filters, asi que invocamos el bloque TRM directamente.

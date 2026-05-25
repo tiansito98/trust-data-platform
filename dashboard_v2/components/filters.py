@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import streamlit as st
 
+from .auth import get_user_branches, is_admin
 from .common import (
     get_sedes, get_fecha_range, get_acriss_options, get_canal_options,
     render_trm_today_sidebar,
@@ -118,13 +119,27 @@ def render_sidebar_filters(default_days: int = 30,
     with st.sidebar:
         st.markdown("## Filtros")
 
-        # Sede multiselect — solo key=, sin default= (anti-pattern).
-        sedes_sel = st.multiselect(
-            "Sedes",
-            options=nombres,
-            key="v2_sedes",
-            help="Vacio = todas las sedes. Tu seleccion se mantiene entre paginas.",
-        )
+        # --- Branch restriction por rol ---
+        user_branches = get_user_branches()
+        user_is_admin = is_admin()
+
+        if user_is_admin or "*" in user_branches:
+            # Admin: multiselect libre con todas las sedes.
+            sedes_sel = st.multiselect(
+                "Sedes",
+                options=nombres,
+                key="v2_sedes",
+                help="Vacio = todas las sedes. Tu seleccion se mantiene entre paginas.",
+            )
+        else:
+            # Sede user: bloqueado a sus sedes. Muestra un selectbox deshabilitado
+            # (visual feedback de que esta fijo) y fuerza la seleccion.
+            st.text_input(
+                "Sede (fija para tu usuario)",
+                value=", ".join(user_branches),
+                disabled=True,
+            )
+            sedes_sel = [b for b in user_branches if b in nombres]
 
         # Fechas. Default ya pre-seedeado a (hoy - 2 .. hoy) arriba; aqui solo
         # se renderiza el widget que persiste via session_state["v2_fechas"].

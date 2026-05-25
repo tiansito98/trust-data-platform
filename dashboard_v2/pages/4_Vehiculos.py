@@ -23,10 +23,11 @@ from components.common import (
     PLOTLY_LAYOUT, SIXT_ORANGE, SIXT_BLACK,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
-from components.auth import require_auth, logout_button
+from components.auth import require_auth, require_page, logout_button
 
 st.set_page_config(page_title="TRUST - Vehiculos", layout="wide")
 require_auth()
+require_page("4_Vehiculos")
 inject_styles()
 logout_button()
 render_header("Vehiculos: ACRISS, upgrades, top modelos")
@@ -168,6 +169,7 @@ SELECT vehiculo, COUNT(*) AS rentals,
 FROM vw_rentals_resumen
 WHERE {where_sql}
   AND vehiculo IS NOT NULL
+  AND TRIM(vehiculo) != ''
 GROUP BY vehiculo
 ORDER BY rentals DESC
 LIMIT 20

@@ -62,3 +62,7 @@ docs/data_dictionary.md
 docs/*_samples.md
 docs/*_samples.yml
 docs/*_dump.md
+
+# Dashboard user credentials (hashed but still sensitive).
+# users.yml.example (template with dummy hashes) IS committed.
+dashboard_v2/config/users.yml
