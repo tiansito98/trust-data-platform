@@ -1302,7 +1302,7 @@ def build_disponibilidad_vehiculo_dia(engine):
                 r.vhcl_int_num,
                 d.full_date AS fecha,
                 r.rntl_mvnr AS numero_contrato,
-                r.oprt_bed AS asesor_codigo,
+                r.oprt_bed::text AS asesor_codigo,
                 NULLIF(r.rsrv_resn, 0) AS numero_reserva
             FROM silver.fact_rentals r
             JOIN silver.dim_dates d
