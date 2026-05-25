@@ -876,79 +876,89 @@ def build_rentals_full(engine):
 
 
 def build_rentals_detail(engine):
-    log("\n>> Construyendo vw_rentals_detail")
+    log("\n>> Construyendo vw_rentals_detail (staged)")
     started = time.time()
+
+    # Stage 1: konr dedup for RA (counter charges)
+    log("   stage 1/5: last_konr_ra")
+    _exec(engine, "DROP TABLE IF EXISTS silver._stg_last_konr_ra CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver._stg_last_konr_ra AS
+        SELECT b.chra_mvnr, b.chra_inty, b.chra_pos, b.max_konr
+        FROM (
+            SELECT chra_mvnr, chra_inty, chra_pos, MAX(chra_konr) AS max_konr
+            FROM silver.fact_charges_ra
+            GROUP BY chra_mvnr, chra_inty, chra_pos
+        ) b
+        JOIN (
+            SELECT chra_mvnr, MAX(chra_konr) AS max_global
+            FROM silver.fact_charges_ra
+            GROUP BY chra_mvnr
+        ) g ON g.chra_mvnr = b.chra_mvnr
+        WHERE b.max_konr = g.max_global
+    """)
+    _exec(engine, "CREATE INDEX idx_stg_lk_ra ON silver._stg_last_konr_ra(chra_mvnr, chra_inty, chra_pos, max_konr)")
+
+    # Stage 2: konr dedup for RS (reservation charges)
+    log("   stage 2/5: last_konr_rs")
+    _exec(engine, "DROP TABLE IF EXISTS silver._stg_last_konr_rs CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver._stg_last_konr_rs AS
+        SELECT b.chrs_resn, b.chrs_inty, b.chrs_pos, b.max_konr
+        FROM (
+            SELECT chrs_resn, chrs_inty, chrs_pos, MAX(chrs_konr) AS max_konr
+            FROM silver.fact_charges_rs
+            GROUP BY chrs_resn, chrs_inty, chrs_pos
+        ) b
+        JOIN (
+            SELECT chrs_resn, MAX(chrs_konr) AS max_global
+            FROM silver.fact_charges_rs
+            GROUP BY chrs_resn
+        ) g ON g.chrs_resn = b.chrs_resn
+        WHERE b.max_konr = g.max_global
+    """)
+    _exec(engine, "CREATE INDEX idx_stg_lk_rs ON silver._stg_last_konr_rs(chrs_resn, chrs_inty, chrs_pos, max_konr)")
+
+    # Stage 3: prepay lookup (canonical reservation amounts per resn+inty+chco)
+    log("   stage 3/5: prepay_lookup")
+    _exec(engine, "DROP TABLE IF EXISTS silver._stg_prepay_lookup CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver._stg_prepay_lookup AS
+        SELECT c.chrs_resn, c.chrs_inty, c.chrs_chco,
+               SUM(c.chrs_value_rental) AS rs_value_rental,
+               SUM(c.chrs_value_local)  AS rs_value_cop
+        FROM silver.fact_charges_rs c
+        INNER JOIN silver._stg_last_konr_rs lk
+               ON lk.chrs_resn = c.chrs_resn
+              AND lk.chrs_inty = c.chrs_inty
+              AND lk.chrs_pos  = c.chrs_pos
+              AND lk.max_konr  = c.chrs_konr
+        GROUP BY c.chrs_resn, c.chrs_inty, c.chrs_chco
+    """)
+    _exec(engine, "CREATE INDEX idx_stg_pl ON silver._stg_prepay_lookup(chrs_resn, chrs_inty, chrs_chco)")
+
+    # Stage 4: codigos_reservados (distinct charge codes per reservation)
+    log("   stage 4/5: codigos_reservados")
+    _exec(engine, "DROP TABLE IF EXISTS silver._stg_codigos_reservados CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver._stg_codigos_reservados AS
+        SELECT DISTINCT c.chrs_resn AS rsrv_resn, c.chrs_chco AS chco
+        FROM silver.fact_charges_rs c
+        INNER JOIN silver._stg_last_konr_rs lk
+               ON lk.chrs_resn = c.chrs_resn
+              AND lk.chrs_inty = c.chrs_inty
+              AND lk.chrs_pos  = c.chrs_pos
+              AND lk.max_konr  = c.chrs_konr
+    """)
+    _exec(engine, "CREATE INDEX idx_stg_cr ON silver._stg_codigos_reservados(rsrv_resn, chco)")
+
+    # Stage 5: final assembly
+    log("   stage 5/5: vw_rentals_detail")
     _exec(engine, "DROP TABLE IF EXISTS silver.vw_rentals_detail CASCADE")
     _exec(engine, "DROP VIEW IF EXISTS silver.vw_rentals_detail CASCADE")
     _exec(engine, """
         CREATE TABLE silver.vw_rentals_detail AS
-        WITH global_konr_ra AS (
-            SELECT chra_mvnr, MAX(chra_konr) AS max_global
-            FROM silver.fact_charges_ra
-            GROUP BY chra_mvnr
-        ),
-        last_konr_ra AS (
-            SELECT b.chra_mvnr, b.chra_inty, b.chra_pos, b.max_konr
-            FROM (
-                SELECT chra_mvnr, chra_inty, chra_pos, MAX(chra_konr) AS max_konr
-                FROM silver.fact_charges_ra
-                GROUP BY chra_mvnr, chra_inty, chra_pos
-            ) b
-            JOIN global_konr_ra g ON g.chra_mvnr = b.chra_mvnr
-            WHERE b.max_konr = g.max_global
-        ),
-        global_konr_rs AS (
-            SELECT chrs_resn, MAX(chrs_konr) AS max_global
-            FROM silver.fact_charges_rs
-            GROUP BY chrs_resn
-        ),
-        last_konr_rs AS (
-            SELECT b.chrs_resn, b.chrs_inty, b.chrs_pos, b.max_konr
-            FROM (
-                SELECT chrs_resn, chrs_inty, chrs_pos, MAX(chrs_konr) AS max_konr
-                FROM silver.fact_charges_rs
-                GROUP BY chrs_resn, chrs_inty, chrs_pos
-            ) b
-            JOIN global_konr_rs g ON g.chrs_resn = b.chrs_resn
-            WHERE b.max_konr = g.max_global
-        ),
-        codigos_reservados AS (
-            SELECT DISTINCT c.chrs_resn AS rsrv_resn, c.chrs_chco AS chco
-            FROM silver.fact_charges_rs c
-            INNER JOIN last_konr_rs lk
-                   ON lk.chrs_resn = c.chrs_resn
-                  AND lk.chrs_inty = c.chrs_inty
-                  AND lk.chrs_pos  = c.chrs_pos
-                  AND lk.max_konr  = c.chrs_konr
-        ),
-        -- Lookup canonical (per resn, inty, chco) del monto reservado.
-        -- Para cada cargo de fact_charges_ra (counter), buscamos el cargo
-        -- equivalente en fact_charges_rs (reserva) y partimos el monto
-        -- ra en (prepagado, counter) = (rs_value, ra_value - rs_value).
-        -- Esto es la regla unificada que cubre tanto Wholesalers
-        -- (CarTrawler) como Sixt Prepago directo (Priceline / Visa Card).
-        --
-        -- IMPORTANTE: el join NO usa pos. Cuando el counter agrega cargos
-        -- nuevos (OW, RL...) en el medio, los pos de los cargos preexistentes
-        -- se corren. Ej: reserva Y@pos2, counter Y@pos4. Matchear por pos
-        -- pierde la conexion. La clave semantica es (resn, inty, chco).
-        --
-        -- Tambien hacemos SUM por defensa: si la reserva tiene 2 filas con
-        -- el mismo (inty, chco) en posiciones distintas, sumamos sus valores
-        -- antes del join (evita match one-to-many).
-        prepay_lookup AS (
-            SELECT c.chrs_resn, c.chrs_inty, c.chrs_chco,
-                   SUM(c.chrs_value_rental) AS rs_value_rental,
-                   SUM(c.chrs_value_local)  AS rs_value_cop
-            FROM silver.fact_charges_rs c
-            INNER JOIN last_konr_rs lk
-                   ON lk.chrs_resn = c.chrs_resn
-                  AND lk.chrs_inty = c.chrs_inty
-                  AND lk.chrs_pos  = c.chrs_pos
-                  AND lk.max_konr  = c.chrs_konr
-            GROUP BY c.chrs_resn, c.chrs_inty, c.chrs_chco
-        ),
-        cargos_union AS (
+        WITH cargos_union AS (
             SELECT
                 'RENTAL_COUNTER' AS fuente_cargo,
                 c.chra_mvnr      AS rntl_mvnr,
@@ -965,30 +975,26 @@ def build_rentals_detail(engine):
                 c.chra_value_rental     AS subtotal_rental_curr,
                 c.rntl_rental_currency_code AS rental_currency,
                 c.rntl_exchange_rate_rental AS xr_rental_cop,
-                -- Split per-cargo: si hay match en la reserva (pl),
-                -- la parte coincidente es prepagado; el delta es counter.
                 COALESCE(pl.rs_value_rental, 0)                     AS prepagado_rental,
                 c.chra_value_rental - COALESCE(pl.rs_value_rental, 0) AS counter_rental,
                 COALESCE(pl.rs_value_cop, 0)                        AS prepagado_cop_raw,
                 c.chra_value_local - COALESCE(pl.rs_value_cop, 0)   AS counter_cop_raw
             FROM silver.fact_charges_ra c
-            INNER JOIN last_konr_ra lk
+            INNER JOIN silver._stg_last_konr_ra lk
                    ON lk.chra_mvnr = c.chra_mvnr
                   AND lk.chra_inty = c.chra_inty
                   AND lk.chra_pos  = c.chra_pos
                   AND lk.max_konr  = c.chra_konr
             LEFT JOIN silver.fact_rentals r ON r.rntl_mvnr = c.chra_mvnr
-            LEFT JOIN codigos_reservados cr
+            LEFT JOIN silver._stg_codigos_reservados cr
                    ON cr.rsrv_resn = r.rsrv_resn
                   AND r.rsrv_resn > 0
                   AND cr.chco = c.chra_chco
-            -- Match a la(s) fila(s) canonica(s) de la reserva (mismo inty + chco).
-            -- NO usamos pos: ver nota en prepay_lookup arriba.
-            LEFT JOIN prepay_lookup pl
+            LEFT JOIN silver._stg_prepay_lookup pl
                    ON pl.chrs_resn = r.rsrv_resn
                   AND pl.chrs_inty = c.chra_inty
                   AND pl.chrs_chco = c.chra_chco
-                  AND r.rsrv_resn > 0  -- evita match con walk-ins
+                  AND r.rsrv_resn > 0
 
             UNION ALL
 
@@ -1007,14 +1013,12 @@ def build_rentals_detail(engine):
                 c.chrs_value_rental     AS subtotal_rental_curr,
                 c.rsrv_rental_currency_code AS rental_currency,
                 c.rsrv_exchange_rate_rental AS xr_rental_cop,
-                -- RESERVA_ONLINE: el cargo vino de la reserva original,
-                -- 100% prepagado por definicion (counter = 0).
                 c.chrs_value_rental AS prepagado_rental,
                 0::numeric           AS counter_rental,
                 c.chrs_value_local  AS prepagado_cop_raw,
                 0::numeric           AS counter_cop_raw
             FROM silver.fact_charges_rs c
-            INNER JOIN last_konr_rs lk
+            INNER JOIN silver._stg_last_konr_rs lk
                    ON lk.chrs_resn = c.chrs_resn
                   AND lk.chrs_inty = c.chrs_inty
                   AND lk.chrs_pos  = c.chrs_pos
@@ -1057,9 +1061,6 @@ def build_rentals_detail(engine):
                  THEN ROUND(u.subtotal_rental_curr::numeric, 2) END    AS subtotal_usd,
             ROUND(u.xr_rental_cop::numeric, 4)                AS trm_aplicada,
 
-            -- Per-cargo split prepagado vs counter (regla unificada que
-            -- cubre Wholesalers y Sixt Prepago directo). Para cargos sin
-            -- match en la reserva, prepagado = 0 y counter = monto completo.
             CASE WHEN u.rental_currency = 'USD'
                  THEN ROUND(u.prepagado_rental::numeric, 2) END        AS prepagado_cargo_usd,
             CASE WHEN u.rental_currency = 'USD'
@@ -1094,18 +1095,11 @@ def build_rentals_detail(engine):
             rf.descuento_main_usd, rf.descuento_secondary_usd,
             rf.descuento_main_cop, rf.descuento_secondary_cop,
 
-            -- Forma de pago efectiva para ESTE cargo segun su inty.
-            -- inty='M' => bucket MAIN (tercero/Sixt Corporate Card);
-            -- inty='S' => bucket SECONDARY (counter).
             CASE WHEN u.inty = 'M' THEN rf.forma_pago_main
                                    ELSE rf.forma_pago_secondary END AS forma_pago_cargo,
             CASE WHEN u.inty = 'M' THEN rf.forma_pago_main_codigo
                                    ELSE rf.forma_pago_secondary_codigo END AS forma_pago_cargo_codigo,
 
-            -- Bucket logico para reporting: RESERVA (cargo cobrado al reservar)
-            -- vs TERCERO (cargo MAIN pagado por wholesaler/OTA) vs
-            -- COUNTER (cargo SECONDARY pagado en el counter, incluye 'FE') vs
-            -- MAIN (cargo MAIN pero no es wholesaler, p.ej. cliente directo via tarjeta).
             CASE
                 WHEN u.fuente_cargo = 'RESERVA_ONLINE' THEN 'RESERVA'
                 WHEN u.inty = 'M' AND rf.tipo_agencia_main = 'Wholesaler' THEN 'TERCERO'
@@ -1129,6 +1123,11 @@ def build_rentals_detail(engine):
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_rentals_detail_contrato ON silver.vw_rentals_detail(numero_contrato)")
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_rentals_detail_sede_fecha ON silver.vw_rentals_detail(sede_handover, fecha_handover_real)")
+
+    # Cleanup staging tables
+    for stg in ('_stg_last_konr_ra', '_stg_last_konr_rs', '_stg_prepay_lookup', '_stg_codigos_reservados'):
+        _exec(engine, f"DROP TABLE IF EXISTS silver.{stg} CASCADE")
+
     n = _scalar(engine, "SELECT COUNT(*) FROM silver.vw_rentals_detail")
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
