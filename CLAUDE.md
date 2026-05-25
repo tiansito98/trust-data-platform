@@ -4,11 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Permissions
 
-- You MAY commit and push to `main` directly (no PR workflow needed — single developer repo).
-- You MAY run `git add`, `git commit`, `git push origin main` when the user asks you to commit or when a task is complete.
-- You MAY run pipeline commands (`python -m pipelines.*`, `python scripts/run_pipeline.py`) when the user asks.
+You have full autonomy to execute commands in this repo. The project settings (`.claude/settings.json`) pre-approve all common tools so you will NOT be prompted for permission. Just do it.
+
+**What you can do freely (no permission prompts):**
+- **Git:** `git add`, `git commit`, `git push origin main`, `git status`, `git diff`, `git log` — commit and push directly to `main`. No PR workflow. Single developer repo.
+- **Python:** `python`, `python -m pipelines.*`, `python scripts/run_pipeline.py`, `pip install`
+- **Streamlit:** `streamlit run dashboard_v2/app.py`
+- **File operations:** Read, Write, Edit, Glob, Grep — all pre-approved
+- **Shell:** `ls`, `cat`, `head`, `tail`, `grep`, `find`, `wc`, `rm`, `mv`, `mkdir`, `echo`
+
+**Conventions:**
 - Always include `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` in commit messages.
 - Never commit `.env`, `users.yml`, `*.pem`, or any file matched by `.gitignore`.
+- When a task is done, commit + push without asking "should I commit?" — just do it.
+- If you need to run `silver.build` or the pipeline, tell the user it'll take ~13 min and run it.
 
 ## Stack
 
