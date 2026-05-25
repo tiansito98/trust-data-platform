@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Permissions
+
+- You MAY commit and push to `main` directly (no PR workflow needed — single developer repo).
+- You MAY run `git add`, `git commit`, `git push origin main` when the user asks you to commit or when a task is complete.
+- You MAY run pipeline commands (`python -m pipelines.*`, `python scripts/run_pipeline.py`) when the user asks.
+- Always include `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` in commit messages.
+- Never commit `.env`, `users.yml`, `*.pem`, or any file matched by `.gitignore`.
+
 ## Stack
 
 **Supabase Postgres** (target DB, free tier) + **Medallion architecture** (Bronze → Silver → Gold) + **Streamlit** (dashboard, hosted on Streamlit Community Cloud). Source: Sixt Redshift Data Exchange (mandant 409) via SSH tunnel + `redshift-connector`. Orchestration: plain Python + psycopg2/SQLAlchemy (no dbt). Repo is public on GitHub.
