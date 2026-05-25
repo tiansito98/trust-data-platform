@@ -1,112 +1,179 @@
-# Trust Data Platform — Guía rápida
+# CLAUDE.md
 
-> Léeme antes de tocar código. Apuntadores a documentación detallada al final.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Stack en una línea
+## Stack
 
-SQLite (no DuckDB) + Medallion (Bronze → Silver → Gold) + Streamlit. Origen: Redshift Sixt (mandant 409) vía SSH tunnel + `redshift-connector`.
+**Supabase Postgres** (target DB, free tier) + **Medallion architecture** (Bronze → Silver → Gold) + **Streamlit** (dashboard, hosted on Streamlit Community Cloud). Source: Sixt Redshift Data Exchange (mandant 409) via SSH tunnel + `redshift-connector`. Orchestration: plain Python + psycopg2/SQLAlchemy (no dbt). Repo is public on GitHub.
 
-## Cómo correr el refresh
-
-```powershell
-# Bronze incremental + TRM Banrep + Silver rebuild en un solo paso:
-.\scripts\refresh.bat
-
-# O manual, paso a paso:
-python -m pipelines.bronze.incremental       # ~2-3 min
-python -m pipelines.bronze.external_trm      # ~1 s — TRM oficial datos.gov.co
-python -m pipelines.silver.build             # ~15 s
-```
-
-`scripts/refresh.bat` está pensado para Task Scheduler cada 6 horas. Cuando migremos a la nube, el equivalente serían tres jobs encadenados. Si llevamos N días sin correr, el incremental de TRM recupera todas las TRMs faltantes en una sola llamada.
-
-## Cómo correr el dashboard
+## How to run
 
 ```powershell
-.\scripts\dashboard.bat
-# o
-streamlit run dashboard/app.py
+# Full pipeline: bronze incremental + TRM + silver rebuild (~16 min total)
+python scripts/run_pipeline.py
+
+# Or step by step:
+python -m pipelines.bronze.incremental       # ~3 min (only new/changed rows)
+python -m pipelines.bronze.external_trm      # ~5 sec (TRM oficial Banrep)
+python -m pipelines.silver.build             # ~13 min (full rebuild of silver)
+
+# Full bronze reset (rare — only if watermarks are corrupt):
+python scripts/run_pipeline.py --full
+
+# Dashboard locally:
+streamlit run dashboard_v2/app.py
 ```
 
-## Layout del repo
+Production dashboard: hosted on Streamlit Community Cloud, auto-deploys from `main` on push. Data lives in Supabase — no local files needed in prod.
+
+## Architecture
 
 ```
-trust_data_platform/
-├── config/
-│   ├── tables.yml          ← qué tabla Redshift bajar y en qué modo
-│   └── .env                ← credenciales SSH/Redshift (NO commitear)
-├── pipelines/
-│   ├── bronze/
-│   │   ├── full_load.py        ← reset completo desde Redshift
-│   │   ├── incremental.py      ← cada 6h, DELETE+INSERT por PK con watermark
-│   │   └── explore_remote.py   ← introspección de datashare (SVV_REDSHIFT_COLUMNS)
-│   ├── silver/
-│   │   ├── ddl/*.sql           ← DDL declarativo para dim_*, fact_*, op_*
-│   │   └── build.py            ← rebuild completo. Toda la lógica de view aquí.
-│   └── gold/                   ← (vacío, futuro)
-├── data/
-│   ├── bronze.db               ← espejo crudo, ~70 MB
-│   └── silver.db               ← modelo gobernado, ~50 MB
-├── dashboard/
-│   ├── app.py                  ← Streamlit entrypoint
-│   ├── pages/                  ← 1 archivo por página
-│   └── components/             ← reusables (filtros, banner sticky)
-├── notebooks/                  ← scripts ad-hoc / exports a Excel
-└── docs/
-    ├── architecture.md         ← decisiones de diseño (LEER)
-    ├── source_of_truth.md      ← queries source-of-truth para el dashboard v2
-    ├── coding_style.md         ← convenciones para escribir nuevas vistas
-    ├── charge_codes.md         ← mapping de codigos de cargo (T, BF, SL, ...)
-    └── runbooks.md             ← troubleshooting
+Sixt Redshift ──SSH tunnel──> pipelines/bronze/ ──> Supabase bronze schema
+                                                         │
+datos.gov.co (TRM) ──HTTP──> pipelines/bronze/           │
+                              external_trm.py ──>        │
+                                                         ▼
+                              pipelines/silver/build.py ──> Supabase silver schema
+                                                                │
+                              dashboard_v2/ (Streamlit) ◄───────┘
+                                    │
+                              operational.invoices (form writes)
 ```
 
-## Vistas source-of-truth (silver)
+### Schemas in Supabase
 
-| Vista | Granularidad | Para qué |
+- **bronze**: raw mirror of Sixt Redshift datashare. Same column names. ~20 tables. `ctrl_extraction_log` tracks watermarks.
+- **silver**: governed model. `dim_*`, `fact_*`, `vw_*` (materialized as TABLEs, not VIEWs). All business logic lives here via `pipelines/silver/build.py`.
+- **operational**: data Trust captures (invoice form). `operational.invoices` written by dashboard Facturas page.
+
+### Secrets resolution
+
+`scripts/get_secret.py` provides `get_secret(key)` that checks (in order):
+1. `st.secrets[key]` (Streamlit Cloud)
+2. `os.environ[key]` (GitHub Actions / system env vars)
+3. `.env` file via python-dotenv (local dev)
+
+### Connection handling (Supabase pooler quirks)
+
+Supabase's Session pooler ignores `-c options` in the libpq connection string. All search_path and statement_timeout settings must be applied via explicit SQL:
+- Dashboard: `SET search_path TO silver, operational, public` runs inline before every `load_query()` call.
+- Silver build: `SET LOCAL statement_timeout = 0` runs inside every `_exec()` transaction.
+- TRM Hoy queries use `(NOW() AT TIME ZONE 'America/Bogota')::date` — Supabase runs UTC, Colombia is UTC-5.
+
+## Key files
+
+| File | Purpose |
+|---|---|
+| `pipelines/_common.py` | All connections (Redshift SSH tunnel + Supabase SQLAlchemy engine). Central `get_engine(schema)`. |
+| `pipelines/silver/build.py` | **All silver business logic.** One function per materialized view. ~1500 lines. `main()` calls them in dependency order. |
+| `pipelines/silver/ddl/*.sql` | DDL for dim/fact tables (01_dim, 02_fact, 03_tramo2 operational, 04_views). Run by `build.py` first. |
+| `dashboard_v2/components/common.py` | Dashboard helpers: `load_query()`, `execute_write()`, `apply_trm()`, `get_trm_hoy()`, formatters. |
+| `dashboard_v2/components/auth.py` | Multi-user auth with role-based page + branch restrictions. Reads from `st.secrets["users"]` (prod) or `config/users.yml` (dev). |
+| `dashboard_v2/components/filters.py` | Sidebar filters (sede, dates, moneda, ACRISS, canal). Branch-locks for `sede` role users. |
+| `dashboard_v2/config/users.yml` | User credentials with bcrypt hashes. **Gitignored.** Template: `users.yml.example`. |
+| `scripts/setup_postgres.sql` | One-time Supabase bootstrap (schemas, `ctrl_extraction_log`, `operational.invoices`). |
+| `scripts/run_pipeline.py` | Top-level orchestrator. Handles SSH key materialization from env vars for GitHub Actions. |
+| `.github/workflows/refresh.yml` | Cron 3x daily (06/12/18 COT). Self-hosted runner. Not yet activated. |
+
+## Silver views (source-of-truth)
+
+| View | Granularity | Purpose |
 |---|---|---|
-| `vw_rentals_full` | 1 fila / rental | Vista 360 del rental — todo en una fila. Base para el resto. |
-| `vw_rentals_detail` | 1 fila / cargo | Detalle por cargo con contexto del rental. Para mostrar items por contrato. |
-| `vw_rentals_resumen` | 1 fila / rental | Resumen comercial: tarifa + adicionales concatenados + neto + IVA + total. |
-| `dim_trm_diaria` | 1 fila / día calendario | TRM oficial Banrep (vía datos.gov.co). Para calcular revenue COP real. |
-| `vw_kpi_anual` | 1 fila / año | KPIs anuales: flota, ocupación, RPD, ingresos. Dashboard v3. |
-| `vw_demanda_anual` | 1 fila / año | % served + cancel rate desagregado por causa. Dashboard v3. |
-| `vw_utilizacion_sede_categoria_mes` | 1 fila / mes × sede × ACRISS | Utilización mensual por categoría. Dashboard v3. |
-| `vw_flota_segmento_anual` | 1 fila / año × sede × ACRISS | Evolución del mix de flota. Dashboard v3. |
-| `vw_cierre_diario_sede` | 1 fila / sede × día | KPIs operativos diarios. |
-| `vw_charges_ra_enriched` | 1 fila / cargo | Cargos del counter con decode de codigo + 3 monedas. |
-| `vw_charges_rs_enriched` | 1 fila / cargo | Cargos de la reserva online. |
+| `vw_rentals_full` | 1 row / rental | 360-degree rental view. 80+ columns. Base for everything. |
+| `vw_rentals_detail` | 1 row / charge | Per-charge with rental context. Includes `prepagado_cargo_usd` / `counter_cargo_usd` per-charge split and `bucket_pago` / `canal_cobro_tarifa`. |
+| `vw_rentals_resumen` | 1 row / rental | Commercial summary: tarifa + adicionales + totals. Includes `prepagado_usd` / `counter_usd` (net after discounts). |
+| `dim_trm_diaria` | 1 row / calendar day | Official Banrep TRM COP/USD. Expanded from bronze `external_trm_diaria`. |
+| `vw_cierre_diario_sede` | 1 row / branch × day | Daily operational KPIs (handovers, returns, revenue, occupancy). |
+| `vw_kpi_anual` | 1 row / year | Annual KPIs. Dashboard v3. |
+| `vw_demanda_anual` | 1 row / year | Demand: served % + cancel rate by cause. Dashboard v3. |
+| `vw_utilizacion_sede_categoria_mes` | 1 row / month × branch × ACRISS | Monthly utilization. Dashboard v3. |
+| `vw_flota_segmento_anual` | 1 row / year × branch × ACRISS | Fleet mix evolution. Dashboard v3. |
+| `vw_charges_ra_enriched` | 1 row / charge (VIEW) | Counter charges with code decode + 3 currencies. |
+| `vw_charges_rs_enriched` | 1 row / charge (VIEW) | Reservation charges with code decode. |
 
-Estas vistas son **tablas materializadas** (prefijo `vw_` por convención histórica). Se reconstruyen cada `silver/build.py`.
+Static seeds (skip rebuild if already populated):
+- `dim_dates` — calendar 2020-2030, skips if row count matches expected.
+- `dim_charge_types` — 30 charge code mappings, skips if already ≥ 30.
 
-## Reglas de oro
+## Authentication & authorization
 
-1. **No DuckDB.** El stack es SQLite. Lo confirmó el usuario el 2026-05-04.
-2. **Bronze es espejo crudo.** Mismos nombres de columna que Redshift. Cero lógica de negocio.
-3. **Toda la lógica vive en `pipelines/silver/build.py`.** Una función por vista, todas se llaman desde `main()`.
-4. **No mockear DBs en tests** (lección aprendida). Usar `silver.db` real.
-5. **No emojis en código ni dashboard.** El usuario lo pidió explícitamente.
-6. **Pesos colombianos:** formato europeo (`$1.502.654,05` — punto miles, coma decimal). Y "mil millones" NO "billones".
-7. **Convención `vw_*`:** todas las vistas se materializan como `CREATE TABLE`. Patrón `try DROP TABLE / DROP VIEW IF EXISTS` antes de crear (porque puede existir como cualquiera de los dos tipos en rebuilds intermedios).
-8. **Idempotencia:** cualquier pipeline corre dos veces sin romper nada.
+Multi-user system with two roles:
+- **admin**: sees all pages, all branches. User: `trust_admin`.
+- **sede**: sees only Cierre Diario + Facturas. Locked to their branch. Branch selector disabled.
 
-## Modelo Sixt — claves importantes
+Credentials stored as bcrypt hashes in `dashboard_v2/config/users.yml` (local dev, gitignored) and `st.secrets["users"]` (Streamlit Cloud). Auth module: `dashboard_v2/components/auth.py`.
 
-- `mndt_code = 409` → mandant Colombia. Se filtra siempre.
-- `rntl_mvnr` → numero de contrato (PK de `fact_rentals`)
-- `rsrv_resn` → numero de reserva (PK de `fact_reservations`)
-- `chra_konr` → version del cargo. **Posicion vigente = `(inty, pos)` cuyo `MAX(konr)` iguala al `MAX(konr)` global del contrato.** Cuando Sixt corrige un contrato inserta una "wave" nueva de filas con konr+1 y **omite** las posiciones que dejaron de aplicar; tomar solo `MAX(konr)` por pos sin chequear el global deja huerfanas a esas posiciones obsoletas (ej. contrato 9522967577 tenia Y pos 4 konr 0 que quedo obsoleta cuando T/AD/Y3 se corrigieron a konr 1). La regla esta implementada en `vw_charges_ra_enriched` y `vw_rentals_detail`. Histórico: hasta 2026-05-13 usabamos `konr = 0` (ocultaba 261 cargos); 2026-05-13 paso a `MAX(konr) por pos` (corrigio caso OT pero dejaba huerfanas); misma fecha refinado a la regla actual (MAX_pos = MAX_global, cuadra 99.97%).
-- ACRISS → 4-letter category code (ej. `IDAR` = Intermediate Door Auto Refrigerated). Decodificado en `dim_vehicle_groups_decoded`.
-- Bug datashare: la columna se llama `rntl_distount_local` (con typo, NO `discount`).
+Every page calls `require_auth()` + `require_page("X_PageName")` at the top.
 
-## Pendientes conocidos
+## Prepay/counter charge split (critical business logic)
 
-Ver `~/.claude/projects/c--Users-Sebastian-Desktop-trust-data-platform/memory/` para memoria de Claude.
+For each `fact_charges_ra` row (counter contract), LEFT JOIN to `fact_charges_rs` (reservation) by `(rsrv_resn, inty, chco)` — **NOT by pos** (positions shift when counter inserts charges in the middle). The rs value = prepagado, the delta (ra - rs) = counter.
 
-Más detalle en:
-- [ARCHITECTURE.md](ARCHITECTURE.md) — decisiones de diseño, flujo end-to-end, estrategia de refresh
-- [docs/dashboard_v2_plan.md](docs/dashboard_v2_plan.md) — **plan del dashboard v2 con los 5 objetivos y queries**
-- [docs/dashboard_v3_plan.md](docs/dashboard_v3_plan.md) — **dashboard v3 (visión histórica, puerto 8503)**
-- [docs/source_of_truth.md](docs/source_of_truth.md) — queries finales para el dashboard v2
-- [docs/coding_style.md](docs/coding_style.md) — cómo escribir una vista nueva
-- [docs/charge_codes.md](docs/charge_codes.md) — diccionario de codigos `T`, `BF`, `SL`, etc.
-- [docs/runbooks.md](docs/runbooks.md) — troubleshooting SSH/Redshift
+This unified rule covers:
+- **Wholesalers** (CarTrawler): M-inty charges match rs → prepagado; S-inty charges have no rs → counter.
+- **Sixt Prepago direct** (Priceline): ALL charges are M-inty, but rs only has a subset → per-charge split, with MIXTO labels for partial matches.
+
+Implemented in `build_rentals_detail` (CTE `prepay_lookup`). Aggregated in `build_rentals_resumen` as `prepagado_usd` / `counter_usd` (net of discounts: `SUM(prepagado_cargo) - descuento_main`).
+
+## Konr rule (charge versioning)
+
+Sixt corrects contracts by inserting a new "wave" of charges with `konr+1` and **omitting** positions that no longer apply. The valid position set is: `(inty, pos)` whose `MAX(konr)` equals the `MAX(konr)` global of the contract. Implemented in `vw_charges_ra_enriched`, `vw_charges_rs_enriched`, `vw_rentals_detail`, and `vw_rentals_full`.
+
+## Hard rules
+
+1. **No DuckDB.** Stack is Supabase Postgres (was SQLite locally, migrated 2026-05-19).
+2. **Bronze is raw mirror.** Same column names as Redshift. Zero business logic.
+3. **All business logic lives in `pipelines/silver/build.py`.** Never write SQL transforms in the dashboard.
+4. **No emojis in code or dashboard.**
+5. **Pesos colombianos:** European format (`$1.502.654,05` — dot thousands, comma decimal). "mil millones" NOT "billones".
+6. **COP conversion: always Banrep TRM** from `dim_trm_diaria`. The Sixt internal TRM is NOT used.
+7. **Convención `vw_*`:** all views materialized as `CREATE TABLE`. Pattern: `DROP TABLE IF EXISTS ... CASCADE; DROP VIEW IF EXISTS ... CASCADE;` before creating.
+8. **Idempotence:** any pipeline runs twice without breaking anything.
+9. **Dummy vehicle filter:** `vehiculo_int_num = 99999999` is a Sixt administrative placeholder. Filter it out from vehicle analytics with `TRIM(vehiculo) != ''`.
+
+## Sixt data model — key columns
+
+- `mndt_code = 409` → mandant Colombia. Always filtered.
+- `rntl_mvnr` → contract number (PK of `fact_rentals`).
+- `rsrv_resn` → reservation number (PK of `fact_reservations`). `rsrv_resn = 0` → walk-in (no online reservation).
+- `chra_inty` → charge type: `'M'` = main (tercero/prepaid bucket), `'S'` = secondary (counter bucket).
+- `chra_konr` → charge correction version. See "Konr rule" above.
+- `rntl_agency1_type` → `'Wholesaler'` for OTA-booked rentals.
+- `rsrv_prepaid_flg` → only `1` when Sixt central charged the client directly (sixt.com.co). Wholesaler prepayments show as `0`.
+- `canal_cobro_tarifa` → derived: `SIXT_PREPAGO` / `WHOLESALER` / `COUNTER`. Covers both prepay scenarios.
+- ACRISS → 4-letter category code. Decoded in `dim_vehicle_groups_decoded`.
+- Bug: column is `rntl_distount_local` (typo in datashare, NOT `discount`).
+
+## Dashboard pages
+
+| Page | File | Access | Description |
+|---|---|---|---|
+| Landing | `app.py` | all | Summary KPIs (rentals, revenue, ticket, mix adicionales) |
+| Cierre Diario | `1_Cierre_Diario.py` | all | Q2 resumen (1 row/contract) + Q1 detalle (per-charge factura with prepago/counter split, MIXTO labels, header table with Canal/Tercero) |
+| Ingresos | `2_Ingresos.py` | admin | Tarifa vs adicionales by sede. RPD KPI. COP via Banrep per-row recalc. |
+| Vehiculos | `4_Vehiculos.py` | admin | ACRISS distribution, upgrades/downgrades, top models (dummy vehicles filtered) |
+| Disponibilidad | `5_Disponibilidad.py` | admin | Fleet snapshot (on-rent / ready-to-rent by sede and category) |
+| Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices`). Fields: sede (locked for sede users), fecha, contrato, factura, recibo, monto counter + prepagado (IVA 19% extracted by backend). Sede-role users have their branch locked. |
+
+## Useful commands for one-off debugging
+
+```python
+# Run a single silver builder function
+python -c "from pipelines.silver.build import build_rentals_resumen; from pipelines._common import get_engine; build_rentals_resumen(get_engine('silver,bronze'))"
+
+# Check silver column exists
+# In Supabase SQL Editor:
+SELECT column_name FROM information_schema.columns WHERE table_schema='silver' AND table_name='vw_rentals_resumen' AND column_name = 'prepagado_usd';
+
+# Validate a specific contract
+SELECT numero_contrato, prepagado_usd, counter_usd, ROUND((prepagado_usd + counter_usd) * 1.19, 2) AS total_con_iva FROM silver.vw_rentals_resumen WHERE numero_contrato = 9523011485;
+```
+
+## Reference docs
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — design decisions, end-to-end flow
+- [docs/source_of_truth.md](docs/source_of_truth.md) — queries for dashboard v2
+- [docs/coding_style.md](docs/coding_style.md) — how to write a new silver view
+- [docs/charge_codes.md](docs/charge_codes.md) — dictionary of T, BF, SL, etc.
+- [docs/runbooks.md](docs/runbooks.md) — SSH/Redshift troubleshooting
