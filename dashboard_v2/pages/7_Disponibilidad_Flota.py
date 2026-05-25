@@ -60,12 +60,15 @@ MANUAL_ESTADOS = ["PYP", "PYP_EXENTO", "TALLER", "TRANSITO", "LAVADO", "BLOQUEAD
 # Sede selector
 # =============================================================================
 
-sedes = load_query(
-    "SELECT DISTINCT sede_codigo, sede_nombre "
-    "FROM vw_disponibilidad_vehiculo_dia "
-    "WHERE sede_nombre IS NOT NULL "
-    "ORDER BY sede_nombre"
-)
+try:
+    sedes = load_query(
+        "SELECT DISTINCT sede_codigo, sede_nombre "
+        "FROM vw_disponibilidad_vehiculo_dia "
+        "WHERE sede_nombre IS NOT NULL "
+        "ORDER BY sede_nombre"
+    )
+except Exception:
+    sedes = pd.DataFrame()
 
 if sedes.empty:
     st.warning("No hay datos de disponibilidad. Ejecute el pipeline silver primero.")
