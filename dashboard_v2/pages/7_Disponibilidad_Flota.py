@@ -43,17 +43,22 @@ render_header("Disponibilidad de Flota")
 
 ESTADO_CONFIG = {
     "DISPONIBLE":  {"color": "#e8f5e9", "text_color": "#333", "label": ""},
-    "RENTADO":     {"color": "#ffcdd2", "text_color": "#333", "label": ""},
-    "RESERVADO":   {"color": "#fff3e0", "text_color": "#333", "label": "RSV"},
+    "RENTADO":     {"color": "#c8e6c9", "text_color": "#333", "label": ""},
+    "RESERVADO":   {"color": "#bbdefb", "text_color": "#333", "label": "RSV"},
     "PYP":         {"color": "#fff9c4", "text_color": "#333", "label": "PYP"},
-    "PYP_EXENTO":  {"color": "#c8e6c9", "text_color": "#333", "label": "EX"},
-    "TALLER":      {"color": "#bbdefb", "text_color": "#333", "label": "TALL"},
+    "PYP_EXENTO":  {"color": "#dcedc8", "text_color": "#333", "label": "EX"},
+    "TALLER":      {"color": "#ffcdd2", "text_color": "#333", "label": "TALL"},
     "TRANSITO":    {"color": "#e0e0e0", "text_color": "#333", "label": "TRAN"},
     "LAVADO":      {"color": "#b2ebf2", "text_color": "#333", "label": "LAV"},
     "BLOQUEADO":   {"color": "#424242", "text_color": "#fff", "label": "BLOQ"},
 }
 
 MANUAL_ESTADOS = ["PYP", "PYP_EXENTO", "TALLER", "TRANSITO", "LAVADO", "BLOQUEADO"]
+
+ACRISS_ORDER = ["EDMR", "SDMR", "CDMR", "IDAH", "SDAR", "CFAR", "IFAR", "SFAR", "RFAR"]
+
+PEREIRA_EXCLUDE_ACRISS = {"IDAR", "SDAR"}
+PEREIRA_SEDE = "PEREIRA AIRPORT MATECANA INTL"
 
 
 # =============================================================================
@@ -139,6 +144,18 @@ if df.empty:
     st.info("No hay vehiculos para esta sede y mes.")
     st.stop()
 
+# Pereira: filter out IDAR and SDAR
+if sede_nombre == PEREIRA_SEDE:
+    df = df[~df["acriss"].isin(PEREIRA_EXCLUDE_ACRISS)]
+    if df.empty:
+        st.info("No hay vehiculos para esta sede y mes.")
+        st.stop()
+
+# ACRISS sort order
+acriss_rank = {code: i for i, code in enumerate(ACRISS_ORDER)}
+df["_acriss_rank"] = df["acriss"].map(acriss_rank).fillna(len(ACRISS_ORDER))
+df = df.sort_values(["_acriss_rank", "vehiculo", "placa", "fecha"])
+
 
 # =============================================================================
 # Color legend
@@ -164,7 +181,15 @@ st.markdown(
 # =============================================================================
 
 df["dia"] = pd.to_datetime(df["fecha"]).dt.day
-df["vehiculo_label"] = df["vehiculo"] + " | " + df["placa"] + " | " + df["acriss"]
+df["vehiculo_label"] = df["acriss"] + " | " + df["vehiculo"] + " | " + df["placa"]
+
+# Preserve ACRISS sort order for the pivot index
+vehicle_order = (
+    df[["vehiculo_label", "_acriss_rank", "vehiculo", "placa"]]
+    .drop_duplicates("vehiculo_label")
+    .sort_values(["_acriss_rank", "vehiculo", "placa"])
+    ["vehiculo_label"].tolist()
+)
 
 
 def _cell_text(row):
@@ -192,8 +217,8 @@ pivot_texto = df.pivot_table(
     index="vehiculo_label", columns="dia", values="cell_text", aggfunc="first"
 )
 
-pivot_estado = pivot_estado.reindex(columns=range(1, last_day + 1))
-pivot_texto = pivot_texto.reindex(columns=range(1, last_day + 1)).fillna("")
+pivot_estado = pivot_estado.reindex(index=vehicle_order, columns=range(1, last_day + 1))
+pivot_texto = pivot_texto.reindex(index=vehicle_order, columns=range(1, last_day + 1)).fillna("")
 
 
 def _apply_colors(col):
@@ -221,7 +246,7 @@ styled = styled.set_table_styles([
                                               ("white-space", "nowrap")]},
 ])
 
-section(f"Grilla - {sede_nombre} - {selected_label}")
+section(f"Cuadro de disponibilidad - {sede_nombre} - {selected_label}")
 st.dataframe(styled, use_container_width=True, height=600)
 st.caption(f"{pivot_estado.shape[0]} vehiculos x {last_day} dias")
 
@@ -240,13 +265,18 @@ vehiculos_sede = load_query("""
     ORDER BY vehiculo, placa
 """, {"sede": sede_codigo})
 
+if sede_nombre == PEREIRA_SEDE:
+    vehiculos_sede = vehiculos_sede[~vehiculos_sede["acriss"].isin(PEREIRA_EXCLUDE_ACRISS)]
+
 if vehiculos_sede.empty:
     st.info("No hay vehiculos disponibles para esta sede.")
 else:
+    vehiculos_sede["_rank"] = vehiculos_sede["acriss"].map(acriss_rank).fillna(len(ACRISS_ORDER))
+    vehiculos_sede = vehiculos_sede.sort_values(["_rank", "vehiculo", "placa"])
     vehiculos_sede["label"] = (
-        vehiculos_sede["vehiculo"] + " | "
-        + vehiculos_sede["placa"] + " | "
-        + vehiculos_sede["acriss"]
+        vehiculos_sede["acriss"] + " | "
+        + vehiculos_sede["vehiculo"] + " | "
+        + vehiculos_sede["placa"]
     )
     veh_map = dict(zip(
         vehiculos_sede["label"],

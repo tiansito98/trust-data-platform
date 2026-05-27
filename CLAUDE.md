@@ -106,6 +106,7 @@ Supabase's Session pooler ignores `-c options` in the libpq connection string. A
 | `vw_demanda_anual` | 1 row / year | Demand: served % + cancel rate by cause. Dashboard v3. |
 | `vw_utilizacion_sede_categoria_mes` | 1 row / month × branch × ACRISS | Monthly utilization. Dashboard v3. |
 | `vw_flota_segmento_anual` | 1 row / year × branch × ACRISS | Fleet mix evolution. Dashboard v3. |
+| `vw_disponibilidad_vehiculo_dia` | 1 row / vehicle × day | Vehicle availability grid. Current month +/- 1 month. Manual > rental > reservation > default. |
 | `vw_charges_ra_enriched` | 1 row / charge (VIEW) | Counter charges with code decode + 3 currencies. |
 | `vw_charges_rs_enriched` | 1 row / charge (VIEW) | Reservation charges with code decode. |
 
@@ -172,6 +173,31 @@ Sixt corrects contracts by inserting a new "wave" of charges with `konr+1` and *
 | Vehiculos | `4_Vehiculos.py` | admin | ACRISS distribution, upgrades/downgrades, top models (dummy vehicles filtered) |
 | Disponibilidad | `5_Disponibilidad.py` | admin | Fleet snapshot (on-rent / ready-to-rent by sede and category) |
 | Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices`). Fields: sede (locked for sede users), fecha, contrato, factura, recibo, monto counter + prepagado (IVA 19% extracted by backend). Sede-role users have their branch locked. |
+| Disponibilidad Flota | `7_Disponibilidad_Flota.py` | all | Monthly vehicle availability grid (vehicle x day). Combines auto data (rentals/reservations from Sixt) with manual entries (taller, PYP, transito, etc.). Staff can register/delete manual states. Writes to `operational.op_disponibilidad_manual`. |
+
+## Disponibilidad Flota (operational.op_disponibilidad_manual)
+
+### Color convention (manager-defined)
+- **Green** (#c8e6c9): Rentado — vehicle generating revenue (good)
+- **Blue** (#bbdefb): Reservado — future reservation
+- **Red** (#ffcdd2): Taller — in maintenance (bad, out of service)
+- **Light green** (#e8f5e9): Disponible — ready to rent
+- **Yellow** (#fff9c4): PYP — pico y placa restriction
+- **Gray** (#e0e0e0): Transito — between branches
+- **Cyan** (#b2ebf2): Lavado — being washed
+- **Dark** (#424242): Bloqueado — docs/fines/legal
+
+### ACRISS display order
+Fixed order matching real operations: EDMR, SDMR, CDMR, IDAH, SDAR, CFAR, IFAR, SFAR, RFAR. Note: SDMR and CDMR are the same category (CDMR is used in Pereira).
+
+### Per-sede exceptions
+- **Pereira** (`PEREIRA AIRPORT MATECANA INTL`): IDAR and SDAR are filtered out from both the grid and the vehicle selector.
+
+### Schema (operational.op_disponibilidad_manual)
+Key columns: `id` (PK), `vhcl_int_num`, `placa`, `fecha` (date), `estado`, `nota`, `asesor_codigo`, `sede_codigo`, `created_by`, `created_at`. Unique constraint on `(vhcl_int_num, fecha)` — UPSERT on conflict.
+
+### Silver view: vw_disponibilidad_vehiculo_dia
+Materialized by `build_disponibilidad_vehiculo_dia()`. 1 row per (vehicle x day), covering current month +/- 1 month. Priority: manual > rental > reservation > default (disponible). Reservations join loosely by ACRISS + sede (not specific vehicle) since open reservations don't have a vehicle assigned.
 
 ## Facturas workflow (operational.invoices)
 
