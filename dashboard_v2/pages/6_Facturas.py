@@ -340,8 +340,9 @@ else:
             cols[0].write(f"**#{inv_id}**")
             cols[1].write(f"Contrato: {contrato}")
             cols[2].markdown(
-                f"Factura: **{fmt_money(row['factura_cop'], 'COP')}** | "
-                f"Sistema: **{fmt_money(row['sistema_cop'], 'COP')}**"
+                f"<b>Factura:</b> {fmt_money(row['factura_cop'], 'COP')} &nbsp;|&nbsp; "
+                f"<b>Sistema:</b> {fmt_money(row['sistema_cop'], 'COP')}",
+                unsafe_allow_html=True,
             )
             color = "#d32f2f" if abs(dif) > 5000 else "#f57c00"
             cols[3].markdown(
