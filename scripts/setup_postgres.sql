@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS operational.invoices (
     monto_counter     NUMERIC(14,2),
     -- Flag derivado: TRUE si monto_prepagado > 0.
     prepaid           BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Workflow: factura abierta (draft) → finalizada (cerrada, vehiculo devuelto).
+    -- Solo facturas finalizadas se validan contra el total de silver.
+    finalizada        BOOLEAN NOT NULL DEFAULT FALSE,
+    finalizada_at     TIMESTAMPTZ,
+    finalizada_por    TEXT,
     observaciones     TEXT,
     capturado_por     TEXT,                        -- usuario que lleno el form
     capturado_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()

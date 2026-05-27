@@ -1,16 +1,15 @@
 """
-Facturas - captura de facturas / recibos al cierre de cada contrato.
+Facturas - captura, edicion, finalizacion y validacion de facturas.
 
-Form simple para que el asesor del counter registre:
-  - Numero de contrato + factura + recibo
-  - Monto total cobrado al cliente (IVA incluido — el sistema separa el 19 %)
-  - Cuanto del total venia pre-pagado (por Sixt o un tercero como CarTrawler)
-  - Lo que queda pagado en counter se calcula solo
+Workflow:
+  1. Asesor crea factura (draft, finalizada=FALSE).
+  2. Mientras el rental esta abierto, puede editar montos / recibos.
+  3. Cuando el vehiculo se devuelve, marca "Finalizar".
+  4. El sistema valida: monto_total factura vs total_con_iva_cop de silver
+     (calculado via charges * TRM Banrep). Si hay diferencia > $500 COP,
+     muestra alarma y permite "Reabrir" para corregir.
 
-Si el monto pre-pagado es > 0, la factura queda marcada como prepaid=True.
-Si no, prepaid=False.
-
-Escribe a operational.invoices.
+Per-sede: usuarios sede solo ven facturas de su sucursal.
 """
 import sys
 from pathlib import Path
@@ -18,162 +17,173 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import datetime as dt
 
+import pandas as pd
 import streamlit as st
 
-from components.auth import require_auth, require_page, logout_button, get_user_branches, is_admin
+from components.auth import (
+    require_auth, require_page, logout_button,
+    get_user_branches, is_admin, get_current_user,
+)
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
     fmt_money, render_trm_today_sidebar,
 )
 
-# --- Constantes de negocio ---
-IVA_PORCENTAJE = 19.0  # IVA Colombia, hardcoded
+IVA_PORCENTAJE = 19.0
+VALIDATION_TOLERANCE_COP = 500  # diferencia maxima aceptable
 
 
 st.set_page_config(page_title="TRUST - Facturas", layout="wide")
 require_auth()
 require_page("6_Facturas")
 inject_styles()
-# TRM Hoy en la sidebar (igual que en el resto de paginas). Esta pagina no
-# llama render_sidebar_filters, asi que invocamos el bloque TRM directamente.
 render_trm_today_sidebar()
 logout_button()
 render_header("Facturas / Recibos")
 
-st.caption(
-    "Captura de facturas y recibos al cierre del contrato. "
-    "El sistema calcula automaticamente el IVA (19 %) a partir del monto total."
-)
-
 
 # =============================================================================
-# Cargar opciones de sedes
+# Sede filtering
 # =============================================================================
+user_branches = get_user_branches()
+user_is_admin = is_admin()
+current_user = get_current_user()
+username = current_user["username"] if current_user else "unknown"
+
+# Build sede WHERE clause for all queries
+if user_is_admin or "*" in user_branches:
+    sede_where = ""
+    sede_params = {}
+else:
+    sede_where = "AND i.sede_nombre = :user_sede"
+    sede_params = {"user_sede": user_branches[0]}
+
+# Load sedes for the form dropdown
 sedes = load_query(
     "SELECT DISTINCT sede_handover_codigo AS codigo, sede_handover AS nombre "
-    "FROM vw_rentals_resumen "
-    "WHERE sede_handover IS NOT NULL "
+    "FROM vw_rentals_resumen WHERE sede_handover IS NOT NULL "
     "ORDER BY sede_handover"
 )
 sede_map = dict(zip(sedes["nombre"], sedes["codigo"].astype(int)))
 
 
 # =============================================================================
-# Form: Nueva factura
+# Session state for edit mode
 # =============================================================================
-section("Nueva factura")
+if "_editing_id" not in st.session_state:
+    st.session_state["_editing_id"] = None
+if "_editing_data" not in st.session_state:
+    st.session_state["_editing_data"] = {}
 
-with st.form("invoice_form", clear_on_submit=True):
-    # --- Fila 1: identificacion del contrato / fecha / sede ---
+editing = st.session_state["_editing_id"] is not None
+editing_data = st.session_state["_editing_data"]
+
+
+# =============================================================================
+# 1. FORM: Nueva factura / Editar factura
+# =============================================================================
+if editing:
+    section(f"Editar factura #{st.session_state['_editing_id']}")
+    st.caption("Editando factura existente. Modifica los campos y haz clic en 'Guardar cambios'.")
+    if st.button("Cancelar edicion"):
+        st.session_state["_editing_id"] = None
+        st.session_state["_editing_data"] = {}
+        st.rerun()
+else:
+    section("Nueva factura")
+
+with st.form("invoice_form", clear_on_submit=not editing):
     c1, c2, c3 = st.columns(3)
     fecha_emision = c1.date_input(
         "Fecha emision",
-        value=dt.date.today(),
+        value=(editing_data.get("fecha_emision") or dt.date.today()),
         help="Fecha en que se emite la factura (normalmente hoy).",
     )
-    # Sede: si el usuario es de tipo 'sede', bloquear a su sucursal.
-    user_branches = get_user_branches()
-    if is_admin() or "*" in user_branches:
-        sede_nombre = c2.selectbox(
-            "Sede",
-            options=list(sede_map.keys()),
-            help="Sede donde se entrego el vehiculo.",
-        )
+    # Sede: locked for sede users
+    if user_is_admin or "*" in user_branches:
+        sede_options = list(sede_map.keys())
+        default_idx = 0
+        if editing and editing_data.get("sede_nombre") in sede_options:
+            default_idx = sede_options.index(editing_data["sede_nombre"])
+        sede_nombre = c2.selectbox("Sede", options=sede_options, index=default_idx,
+                                    help="Sede donde se entrego el vehiculo.")
     else:
         locked_sede = user_branches[0] if user_branches else ""
         c2.text_input("Sede (fija)", value=locked_sede, disabled=True)
         sede_nombre = locked_sede
+
     rntl_mvnr = c3.text_input(
         "Numero de contrato",
+        value=str(int(editing_data["rntl_mvnr"])) if editing and editing_data.get("rntl_mvnr") else "",
         placeholder="ej. 9523011485",
-        help=("Numero del contrato de renta tal como aparece en el contrato "
-              "firmado por el cliente."),
+        help="Numero del contrato de renta tal como aparece en el contrato firmado.",
     )
 
-    # --- Fila 2: numero de factura y numero de recibo ---
     c4, c5 = st.columns(2)
     numero_factura = c4.text_input(
         "Numero de factura",
+        value=editing_data.get("numero_factura", "") or "",
         placeholder="ej. FAC-12345",
         help="Numero consecutivo de la factura DIAN.",
     )
     numero_recibo = c5.text_input(
         "Numero de recibo",
+        value=editing_data.get("numero_recibo", "") or "",
         placeholder="ej. 00045678",
         help="Numero del recibo del datafono o del comprobante de pago.",
     )
 
-    # --- Fila 3: monto en counter + monto prepagado (ambos CON IVA) ---
     c6, c7 = st.columns(2)
     monto_counter = c6.number_input(
         "Monto en counter (COP, con IVA)",
-        min_value=0.0,
-        step=1000.0,
-        format="%.2f",
-        help=("Lo que el counter cobra HOY al cliente, en pesos colombianos, "
-              "con IVA incluido. Es el valor que aparece en el datafono cuando "
-              "se pasa la tarjeta (o que se recibe en efectivo). Si todo fue "
-              "pre-pagado y el cliente no paga nada aqui, deje en 0."),
+        min_value=0.0, step=1000.0, format="%.2f",
+        value=float(editing_data.get("monto_counter", 0) or 0),
+        help="Lo que el counter cobra HOY al cliente, en pesos colombianos, con IVA incluido.",
     )
     monto_prepagado = c7.number_input(
         "Monto prepagado (COP, con IVA)",
-        min_value=0.0,
-        step=1000.0,
-        format="%.2f",
-        help=("Cuanto del total ya estaba pre-pagado por Sixt o por un tercero "
-              "(CarTrawler, Booking, Hopper, etc.), en pesos colombianos y con "
-              "IVA incluido. Si el cliente paga TODO aqui en el counter, "
-              "deje en 0."),
+        min_value=0.0, step=1000.0, format="%.2f",
+        value=float(editing_data.get("monto_prepagado", 0) or 0),
+        help="Cuanto del total ya estaba pre-pagado por Sixt o un tercero. Deje 0 si el cliente paga todo en counter.",
     )
 
-    # --- Auto-mostrar el TOTAL = counter + prepagado ---
     monto_total_preview = monto_counter + monto_prepagado
     if monto_total_preview > 0:
         st.markdown(
-            f"<div style='background:#fff3e0;padding:8px 14px;"
-            f"border-radius:4px;border-left:3px solid #ff6900;"
-            f"margin:4px 0 12px 0;color:#333;font-size:0.95rem;'>"
+            f"<div style='background:#fff3e0;padding:8px 14px;border-radius:4px;"
+            f"border-left:3px solid #ff6900;margin:4px 0 12px 0;color:#333;"
+            f"font-size:0.95rem;'>"
             f"<strong>Monto total (con IVA):</strong> "
             f"{fmt_money(monto_total_preview, 'COP')} "
-            f"&nbsp;<span style='color:#888;font-size:0.85rem;'>"
-            f"(monto en counter + monto prepagado)</span>"
-            f"</div>",
+            f"<span style='color:#888;font-size:0.85rem;'>"
+            f"(counter + prepagado)</span></div>",
             unsafe_allow_html=True,
         )
 
-    # --- Observaciones opcionales ---
     observaciones = st.text_area(
-        "Observaciones",
-        height=80,
-        placeholder="Notas adicionales (opcional)",
+        "Observaciones", height=80, placeholder="Notas adicionales (opcional)",
+        value=editing_data.get("observaciones", "") or "",
         help="Notas adicionales (opcional).",
     )
 
-    submitted = st.form_submit_button("Guardar factura")
+    btn_label = "Guardar cambios" if editing else "Guardar factura"
+    submitted = st.form_submit_button(btn_label)
 
-
-# =============================================================================
-# Procesar submit
-# =============================================================================
 if submitted:
-    # Calculo backend: monto_total se DERIVA de counter + prepagado.
-    # IVA se extrae del total (hardcoded 19 %).
     monto_total = round(monto_counter + monto_prepagado, 2)
     iva_factor = 1 + IVA_PORCENTAJE / 100.0
     monto_base = round(monto_total / iva_factor, 2)
     iva = round(monto_total - monto_base, 2)
     prepaid = monto_prepagado > 0
 
-    # Validaciones
     if monto_total <= 0:
         st.error("El monto total (counter + prepagado) debe ser mayor a 0.")
     elif not rntl_mvnr.strip().isdigit():
         st.error("El numero de contrato debe ser solo digitos.")
     else:
-
         params = {
             "rntl_mvnr": int(rntl_mvnr.strip()),
-            "sede_codigo": int(sede_map[sede_nombre]),
+            "sede_codigo": int(sede_map.get(sede_nombre, 0)),
             "sede_nombre": sede_nombre,
             "fecha_emision": fecha_emision,
             "moneda": "COP",
@@ -186,54 +196,206 @@ if submitted:
             "monto_counter": monto_counter,
             "prepaid": prepaid,
             "observaciones": observaciones.strip() or None,
-            "capturado_por": st.session_state.get("dashboard_user", "unknown"),
+            "capturado_por": username,
         }
         try:
-            execute_write(
-                """
-                INSERT INTO operational.invoices
-                  (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
-                   numero_factura, numero_recibo,
-                   monto_base, iva, monto_total,
-                   monto_prepagado, monto_counter, prepaid,
-                   observaciones, capturado_por)
-                VALUES
-                  (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
-                   :numero_factura, :numero_recibo,
-                   :monto_base, :iva, :monto_total,
-                   :monto_prepagado, :monto_counter, :prepaid,
-                   :observaciones, :capturado_por)
-                """,
-                params,
-            )
-            tag = "prepagada" if prepaid else "no prepagada"
-            st.success(
-                f"Factura guardada — {sede_nombre} — "
-                f"contrato {rntl_mvnr} — {fmt_money(monto_total, 'COP')} ({tag})."
-            )
+            if editing:
+                params["invoice_id"] = st.session_state["_editing_id"]
+                execute_write("""
+                    UPDATE operational.invoices SET
+                        rntl_mvnr = :rntl_mvnr, sede_codigo = :sede_codigo,
+                        sede_nombre = :sede_nombre, fecha_emision = :fecha_emision,
+                        moneda = :moneda, numero_factura = :numero_factura,
+                        numero_recibo = :numero_recibo, monto_base = :monto_base,
+                        iva = :iva, monto_total = :monto_total,
+                        monto_prepagado = :monto_prepagado, monto_counter = :monto_counter,
+                        prepaid = :prepaid, observaciones = :observaciones,
+                        capturado_por = :capturado_por
+                    WHERE invoice_id = :invoice_id
+                """, params)
+                st.success(f"Factura #{params['invoice_id']} actualizada.")
+                st.session_state["_editing_id"] = None
+                st.session_state["_editing_data"] = {}
+            else:
+                execute_write("""
+                    INSERT INTO operational.invoices
+                      (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
+                       numero_factura, numero_recibo, monto_base, iva, monto_total,
+                       monto_prepagado, monto_counter, prepaid, observaciones, capturado_por)
+                    VALUES
+                      (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
+                       :numero_factura, :numero_recibo, :monto_base, :iva, :monto_total,
+                       :monto_prepagado, :monto_counter, :prepaid, :observaciones, :capturado_por)
+                """, params)
+                tag = "prepagada" if prepaid else "no prepagada"
+                st.success(f"Factura guardada — {sede_nombre} — contrato {rntl_mvnr} — "
+                           f"{fmt_money(monto_total, 'COP')} ({tag}).")
             load_query.clear()
         except Exception as e:
             st.error(f"Error guardando: {e}")
 
 
-# =============================================================================
-# Ultimas 25 facturas capturadas
-# =============================================================================
 st.markdown("---")
-section("Ultimas facturas capturadas")
-df = load_query(
-    """
-    SELECT invoice_id, fecha_emision, sede_nombre, rntl_mvnr,
-           numero_factura, numero_recibo,
-           monto_total, monto_prepagado, monto_counter, prepaid,
-           capturado_por, capturado_at
-    FROM operational.invoices
-    ORDER BY invoice_id DESC
-    LIMIT 25
-    """
-)
-if df.empty:
-    st.info("Aun no hay facturas capturadas.")
+
+
+# =============================================================================
+# 2. FACTURAS ABIERTAS (no finalizadas) — editable
+# =============================================================================
+section("Facturas abiertas (pendientes de finalizar)")
+
+open_sql = f"""
+    SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
+           i.numero_factura, i.numero_recibo,
+           i.monto_total, i.monto_prepagado, i.monto_counter,
+           i.observaciones, i.capturado_por, i.capturado_at
+    FROM operational.invoices i
+    WHERE i.finalizada = FALSE {sede_where}
+    ORDER BY i.capturado_at DESC
+"""
+df_open = load_query(open_sql, sede_params if sede_params else {})
+
+if df_open.empty:
+    st.info("No hay facturas abiertas para tu sede.")
 else:
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"Mostrando ultimas {len(df)} facturas.")
+    st.caption(f"{len(df_open)} facturas abiertas. Selecciona una para editar o finalizar.")
+
+    for _, row in df_open.iterrows():
+        inv_id = int(row["invoice_id"])
+        contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
+        total = fmt_money(float(row["monto_total"]) if pd.notna(row["monto_total"]) else 0, "COP")
+        sede = row["sede_nombre"] or "-"
+        fecha = row["fecha_emision"]
+
+        cols = st.columns([1, 2, 2, 2, 2, 1, 1])
+        cols[0].write(f"**#{inv_id}**")
+        cols[1].write(f"{contrato}")
+        cols[2].write(f"{sede}")
+        cols[3].write(f"{total}")
+        cols[4].write(f"{fecha}")
+
+        if cols[5].button("Editar", key=f"edit_{inv_id}"):
+            st.session_state["_editing_id"] = inv_id
+            st.session_state["_editing_data"] = row.to_dict()
+            st.rerun()
+
+        if cols[6].button("Finalizar", key=f"fin_{inv_id}"):
+            execute_write("""
+                UPDATE operational.invoices
+                SET finalizada = TRUE, finalizada_at = NOW(), finalizada_por = :user
+                WHERE invoice_id = :id
+            """, {"id": inv_id, "user": username})
+            st.success(f"Factura #{inv_id} finalizada.")
+            load_query.clear()
+            st.rerun()
+
+
+st.markdown("---")
+
+
+# =============================================================================
+# 3. VALIDACION: facturas finalizadas vs silver (alarma si hay diferencia)
+# =============================================================================
+section("Validacion de facturas finalizadas")
+st.caption(
+    f"Compara el monto total registrado en la factura contra el total calculado "
+    f"por el sistema (charges * TRM Banrep). Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}."
+)
+
+val_sql = f"""
+    SELECT i.invoice_id, i.rntl_mvnr, i.sede_nombre, i.fecha_emision,
+           i.monto_total AS factura_cop,
+           ROUND(COALESCE(r.total_con_iva_usd, 0)
+                 * COALESCE(t.trm_cop_per_usd, 0), 0) AS sistema_cop,
+           i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
+                 * COALESCE(t.trm_cop_per_usd, 0), 0) AS diferencia,
+           r.total_con_iva_usd AS total_usd,
+           t.trm_cop_per_usd AS trm_usada
+    FROM operational.invoices i
+    LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
+    LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
+    WHERE i.finalizada = TRUE {sede_where}
+    ORDER BY ABS(i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
+                 * COALESCE(t.trm_cop_per_usd, 0), 0)) DESC
+"""
+df_val = load_query(val_sql, sede_params if sede_params else {})
+
+if df_val.empty:
+    st.info("No hay facturas finalizadas para validar.")
+else:
+    for col in ("factura_cop", "sistema_cop", "diferencia", "total_usd", "trm_usada"):
+        df_val[col] = pd.to_numeric(df_val[col], errors="coerce").fillna(0)
+
+    # Split into mismatches vs matches
+    df_mismatch = df_val[df_val["diferencia"].abs() > VALIDATION_TOLERANCE_COP].copy()
+    df_ok = df_val[df_val["diferencia"].abs() <= VALIDATION_TOLERANCE_COP].copy()
+
+    if not df_mismatch.empty:
+        st.error(f"{len(df_mismatch)} facturas con diferencia mayor a {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}:")
+        for _, row in df_mismatch.iterrows():
+            inv_id = int(row["invoice_id"])
+            contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
+            dif = float(row["diferencia"])
+
+            cols = st.columns([1, 2, 2, 2, 2, 1])
+            cols[0].write(f"**#{inv_id}**")
+            cols[1].write(f"Contrato: {contrato}")
+            cols[2].markdown(
+                f"Factura: **{fmt_money(row['factura_cop'], 'COP')}** | "
+                f"Sistema: **{fmt_money(row['sistema_cop'], 'COP')}**"
+            )
+            color = "#d32f2f" if abs(dif) > 5000 else "#f57c00"
+            cols[3].markdown(
+                f"<span style='color:{color};font-weight:bold;'>"
+                f"Diferencia: {fmt_money(dif, 'COP')}</span>",
+                unsafe_allow_html=True,
+            )
+            cols[4].write(f"TRM: {row['trm_usada']:,.2f}")
+
+            if cols[5].button("Reabrir", key=f"reopen_{inv_id}"):
+                execute_write("""
+                    UPDATE operational.invoices
+                    SET finalizada = FALSE, finalizada_at = NULL, finalizada_por = NULL
+                    WHERE invoice_id = :id
+                """, {"id": inv_id})
+                st.warning(f"Factura #{inv_id} reabierta para correccion.")
+                load_query.clear()
+                st.rerun()
+
+    if not df_ok.empty:
+        st.success(f"{len(df_ok)} facturas finalizadas cuadran con el sistema.")
+        view = df_ok[["invoice_id", "rntl_mvnr", "sede_nombre", "fecha_emision",
+                       "factura_cop", "sistema_cop", "diferencia"]].copy()
+        view["factura_cop"] = view["factura_cop"].apply(lambda v: fmt_money(v, "COP"))
+        view["sistema_cop"] = view["sistema_cop"].apply(lambda v: fmt_money(v, "COP"))
+        view["diferencia"] = view["diferencia"].apply(lambda v: fmt_money(v, "COP"))
+        view = view.rename(columns={
+            "invoice_id": "ID", "rntl_mvnr": "Contrato", "sede_nombre": "Sede",
+            "fecha_emision": "Fecha", "factura_cop": "Factura (COP)",
+            "sistema_cop": "Sistema (COP)", "diferencia": "Diferencia",
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+
+st.markdown("---")
+
+
+# =============================================================================
+# 4. FACTURAS FINALIZADAS (historial)
+# =============================================================================
+section("Historial de facturas finalizadas")
+fin_sql = f"""
+    SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
+           i.numero_factura, i.numero_recibo,
+           i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
+           i.finalizada_por, i.finalizada_at
+    FROM operational.invoices i
+    WHERE i.finalizada = TRUE {sede_where}
+    ORDER BY i.finalizada_at DESC
+    LIMIT 50
+"""
+df_fin = load_query(fin_sql, sede_params if sede_params else {})
+if df_fin.empty:
+    st.info("No hay facturas finalizadas.")
+else:
+    st.dataframe(df_fin, use_container_width=True, hide_index=True)
+    st.caption(f"Mostrando ultimas {len(df_fin)} facturas finalizadas.")
