@@ -298,24 +298,30 @@ st.markdown("---")
 section("Validacion de facturas finalizadas")
 st.caption(
     f"Compara el monto total registrado en la factura contra el total calculado "
-    f"por el sistema (charges * TRM Banrep). Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}."
+    f"por el sistema (charges x TRM Banrep). Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}. "
+    f"Facturas cuyo contrato aun no esta en silver (pendiente de refresh) se muestran aparte."
 )
 
 val_sql = f"""
     SELECT i.invoice_id, i.rntl_mvnr, i.sede_nombre, i.fecha_emision,
            i.monto_total AS factura_cop,
-           ROUND(COALESCE(r.total_con_iva_usd, 0)
-                 * COALESCE(t.trm_cop_per_usd, 0), 0) AS sistema_cop,
-           i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
-                 * COALESCE(t.trm_cop_per_usd, 0), 0) AS diferencia,
            r.total_con_iva_usd AS total_usd,
-           t.trm_cop_per_usd AS trm_usada
+           t.trm_cop_per_usd AS trm_usada,
+           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END AS sistema_cop,
+           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN i.monto_total - ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END AS diferencia,
+           CASE WHEN r.numero_contrato IS NULL THEN TRUE ELSE FALSE END AS pendiente_silver
     FROM operational.invoices i
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     WHERE i.finalizada = TRUE {sede_where}
-    ORDER BY ABS(i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
-                 * COALESCE(t.trm_cop_per_usd, 0), 0)) DESC
+    ORDER BY
+        CASE WHEN r.numero_contrato IS NULL THEN 0 ELSE 1 END,
+        ABS(COALESCE(i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
+                     * COALESCE(t.trm_cop_per_usd, 0), 0), 0)) DESC
 """
 df_val = load_query(val_sql, sede_params if sede_params else {})
 
@@ -323,11 +329,34 @@ if df_val.empty:
     st.info("No hay facturas finalizadas para validar.")
 else:
     for col in ("factura_cop", "sistema_cop", "diferencia", "total_usd", "trm_usada"):
-        df_val[col] = pd.to_numeric(df_val[col], errors="coerce").fillna(0)
+        df_val[col] = pd.to_numeric(df_val[col], errors="coerce")
 
-    # Split into mismatches vs matches
-    df_mismatch = df_val[df_val["diferencia"].abs() > VALIDATION_TOLERANCE_COP].copy()
-    df_ok = df_val[df_val["diferencia"].abs() <= VALIDATION_TOLERANCE_COP].copy()
+    # Split into 3 groups:
+    # 1. Pending silver (contract not in system yet — pipeline hasn't run)
+    # 2. Mismatch (contract in silver, difference > tolerance)
+    # 3. OK (contract in silver, difference <= tolerance)
+    df_pending = df_val[df_val["pendiente_silver"] == True].copy()
+    df_validated = df_val[df_val["pendiente_silver"] == False].copy()
+    df_validated["diferencia"] = df_validated["diferencia"].fillna(0)
+    df_validated["sistema_cop"] = df_validated["sistema_cop"].fillna(0)
+    df_mismatch = df_validated[df_validated["diferencia"].abs() > VALIDATION_TOLERANCE_COP].copy()
+    df_ok = df_validated[df_validated["diferencia"].abs() <= VALIDATION_TOLERANCE_COP].copy()
+
+    # --- Pending: contract not in silver yet ---
+    if not df_pending.empty:
+        st.warning(
+            f"{len(df_pending)} facturas finalizadas cuyo contrato aun no esta en silver. "
+            f"Se validaran automaticamente despues del proximo refresh del pipeline."
+        )
+        pending_view = df_pending[["invoice_id", "rntl_mvnr", "sede_nombre",
+                                    "fecha_emision", "factura_cop"]].copy()
+        pending_view["factura_cop"] = pending_view["factura_cop"].apply(
+            lambda v: fmt_money(v, "COP") if pd.notna(v) else "-")
+        pending_view = pending_view.rename(columns={
+            "invoice_id": "ID", "rntl_mvnr": "Contrato", "sede_nombre": "Sede",
+            "fecha_emision": "Fecha", "factura_cop": "Factura (COP)",
+        })
+        st.dataframe(pending_view, use_container_width=True, hide_index=True)
 
     if not df_mismatch.empty:
         st.error(f"{len(df_mismatch)} facturas con diferencia mayor a {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}:")
