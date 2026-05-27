@@ -173,6 +173,33 @@ Sixt corrects contracts by inserting a new "wave" of charges with `konr+1` and *
 | Disponibilidad | `5_Disponibilidad.py` | admin | Fleet snapshot (on-rent / ready-to-rent by sede and category) |
 | Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices`). Fields: sede (locked for sede users), fecha, contrato, factura, recibo, monto counter + prepagado (IVA 19% extracted by backend). Sede-role users have their branch locked. |
 
+## Facturas workflow (operational.invoices)
+
+Facturas have a lifecycle: **abierta (draft) → finalizada (cerrada)**. Each factura belongs to a sede and is only visible/editable by users of that sede (admin sees all).
+
+### Create → Edit → Finalize → Validate flow
+
+1. **Asesor creates factura** (draft): types contrato, monto counter + prepagado, numero factura/recibo. Backend computes `monto_total = counter + prepagado`, `monto_base = total / 1.19`, `iva = total - base`, `prepaid = prepagado > 0`. Status: `finalizada = FALSE`.
+
+2. **Asesor edits** (while rental is open): clicks "Editar" on an open factura → form pre-fills → edits montos/recibos → "Guardar cambios" (UPDATE). Can edit as many times as needed.
+
+3. **Vehicle returned → asesor finalizes**: clicks "Finalizar" → sets `finalizada = TRUE`, `finalizada_at = NOW()`, `finalizada_por = username`.
+
+4. **Validation runs automatically**: for every finalized factura, the page compares `monto_total` (what asesor typed) vs `total_con_iva_usd * TRM_Banrep(handover_date)` (what silver computed from Sixt charges). Tolerance: $500 COP for rounding.
+   - **Green**: amounts match within tolerance → all good.
+   - **Red alarm**: difference > $500 COP → shows discrepancy + "Reabrir" button.
+   - **Yellow (pendiente)**: contract not yet in silver (pipeline hasn't pulled it from Redshift yet) → no false alarm, just informational. Validation kicks in automatically after the next pipeline refresh.
+
+5. **Reabrir**: if mismatch detected, asesor clicks "Reabrir" → reverts to draft (`finalizada = FALSE`) → asesor edits → re-finalizes → validation re-runs.
+
+### Per-sede isolation
+
+All factura queries filter by `sede_nombre = :user_sede` for sede-role users. A sede user **cannot** see, edit, finalize, or reopen another sede's facturas. The filtering is at the SQL level, not just UI-level.
+
+### Schema (operational.invoices)
+
+Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (datafono), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado`, `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
+
 ## Useful commands for one-off debugging
 
 ```python
