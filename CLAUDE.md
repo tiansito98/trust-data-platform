@@ -226,6 +226,32 @@ All factura queries filter by `sede_nombre = :user_sede` for sede-role users. A 
 
 Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (datafono), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado`, `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
 
+## COBRA report reconciliation (manager's monthly batchfile)
+
+COBRA produces a monthly Excel with 4 buckets per sede. Silver's per-charge totals reconcile to COBRA within ~0.1% when bucketed correctly.
+
+### Bucket mapping (silver `cargo_codigo` → COBRA column)
+
+| COBRA column | Silver codes | Notes |
+|---|---|---|
+| **VENTAS** | `T` | Tarifa core |
+| **COBERTURAS** | `BF` + `LD` + `SL` | Full cover + LDW + liability |
+| **ADICIONALES** | everything else except `Y` (`OT`, `OW`, `DC`, `FI`, `AD`, `AE`, `CL`, `OH`, `CS`, `RL`, `DL`, `BC`, `PP`, `BS`, `VA`, `RU`, etc.) | All other counter charges |
+| **TAX** | `Y` (location/airport surcharge) | **NOT Colombian IVA**. Despite the column name, this is the airport concession fee. Real IVA is computed separately. |
+
+### Contract-set difference (by design, not a bug)
+
+COBRA and silver use different date fields for "month X" filtering:
+
+- **COBRA**: contracts CLOSED/RETURNED in month X, with long-term leases pro-rated monthly (~1/12 of annual value per month).
+- **Silver `vw_rentals_resumen`**: contracts where `fecha_handover_real::date BETWEEN ...`, with each rental's FULL value attributed to its handover month.
+
+Validated March 2026: 288 contracts overlap (~80%), 71 silver-only (March handover → April return), 68 COBRA-only (handed over earlier, returned/billed in March). Silver $119,137.64 vs COBRA $119,271 = **99.89% agreement**.
+
+### Konr rule (validated, do not weaken)
+
+Sixt does **full restatement** on konr corrections: every konr+1 wave republishes ALL valid positions. The silver rule (`MAX(konr) per (mvnr, inty, pos) == MAX(konr) global per mvnr`) is correct and loses zero revenue. Verified March 2026: 0 rows flagged as "dropped — partial-restatement candidate", $0 dropped.
+
 ## Useful commands for one-off debugging
 
 ```python
