@@ -514,9 +514,11 @@ with reminder_slot:
             unsafe_allow_html=True,
         )
 
-        head = st.columns([2, 2, 2, 3, 2, 2, 2])
+        col_widths = [2, 3, 2, 2, 3, 2, 2, 2]
+        head = st.columns(col_widths)
         for col, label in zip(
-            head, ["Contrato", "Handover", "Placa", "Vehiculo", "Asesor", "Total", ""]
+            head, ["Contrato", "Sede", "Handover", "Placa", "Vehiculo",
+                   "Asesor", "Total", ""]
         ):
             col.markdown(f"<span style='font-size:0.78rem;color:#888;"
                          f"text-transform:uppercase;'>{label}</span>",
@@ -524,14 +526,15 @@ with reminder_slot:
 
         for _, row in df_rem.iterrows():
             contrato = int(row["numero_contrato"])
-            cols = st.columns([2, 2, 2, 3, 2, 2, 2])
+            cols = st.columns(col_widths)
             cols[0].write(f"{contrato}")
-            cols[1].write(f"{row['fecha_handover']}")
-            cols[2].write(f"{row['placa'] or '-'}")
-            cols[3].write(f"{row['vehiculo'] or '-'}")
-            cols[4].write(f"{int(row['asesor']) if pd.notna(row['asesor']) else '-'}")
-            cols[5].write(fmt_money(row["total_con_iva_usd"], "USD"))
-            if cols[6].button("Crear factura", key=f"rem_create_{contrato}"):
+            cols[1].write(f"{row['sede_handover'] or '-'}")
+            cols[2].write(f"{row['fecha_handover']}")
+            cols[3].write(f"{row['placa'] or '-'}")
+            cols[4].write(f"{row['vehiculo'] or '-'}")
+            cols[5].write(f"{int(row['asesor']) if pd.notna(row['asesor']) else '-'}")
+            cols[6].write(fmt_money(row["total_con_iva_usd"], "USD"))
+            if cols[7].button("Crear factura", key=f"rem_create_{contrato}"):
                 st.session_state["_prefill_contrato"] = str(contrato)
                 st.session_state["_editing_id"] = None
                 st.session_state["_editing_data"] = {}
