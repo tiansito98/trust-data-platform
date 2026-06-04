@@ -277,7 +277,9 @@ open_sql = f"""
     FROM operational.invoices i
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     WHERE i.finalizada = FALSE {sede_where}
-    ORDER BY i.capturado_at DESC
+    -- Ordenadas por fecha de entrega (handover), mas reciente primero. Las
+    -- "pendiente" (contrato aun no en silver -> sin entrega) van al final.
+    ORDER BY r.fecha_handover_real DESC NULLS LAST, i.capturado_at DESC
 """
 df_open = load_query(open_sql, sede_params if sede_params else {})
 
