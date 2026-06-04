@@ -488,6 +488,11 @@ with reminder_slot:
         FROM silver.vw_rentals_resumen r
         LEFT JOIN operational.invoices i ON i.rntl_mvnr = r.numero_contrato
         WHERE r.fecha_handover_real::date >= :fecha_inicio
+          -- Solo rentas YA entregadas: el handover debe haber ocurrido. Sin
+          -- este tope, contratos a futuro (reservas/placeholders sin vehiculo
+          -- asignado, asesor 7777777) aparecerian como "pendientes". No se
+          -- puede facturar una renta que aun no empieza. Zona Colombia (UTC-5).
+          AND r.fecha_handover_real::date <= ((NOW() AT TIME ZONE 'America/Bogota')::date)
           AND i.invoice_id IS NULL
           {rem_where}
         ORDER BY r.fecha_handover_real DESC
@@ -509,8 +514,9 @@ with reminder_slot:
             f"border-left:4px solid #ff6900;margin:4px 0 4px 0;color:#333;'>"
             f"<span style='font-size:1.05rem;font-weight:700;color:#e55a00;'>"
             f"Pendientes de crear factura ({n_pend})</span><br>"
-            f"<span style='font-size:0.88rem;color:#666;'>Contratos con handover "
-            f"desde {FECHA_INICIO_RECORDATORIO} sin factura creada.</span></div>",
+            f"<span style='font-size:0.88rem;color:#666;'>Contratos entregados "
+            f"desde {FECHA_INICIO_RECORDATORIO} (handover ya ocurrido) sin "
+            f"factura creada.</span></div>",
             unsafe_allow_html=True,
         )
 
