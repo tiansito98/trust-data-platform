@@ -31,6 +31,7 @@ from components.common import (
 
 IVA_PORCENTAJE = 19.0
 VALIDATION_TOLERANCE_COP = 500  # diferencia maxima aceptable
+FECHA_INICIO_RECORDATORIO = "2026-06-01"  # handover >= esta fecha sin factura = pendiente
 
 
 st.set_page_config(page_title="TRUST - Facturas", layout="wide")
@@ -65,6 +66,13 @@ sedes = load_query(
     "ORDER BY sede_handover"
 )
 sede_map = dict(zip(sedes["nombre"], sedes["codigo"].astype(int)))
+
+
+# Placeholder para el recordatorio de facturas pendientes. Se declara aqui
+# (queda arriba del formulario) pero se RENDERIZA al final del script (ver
+# "Seccion 0") para que refleje cualquier factura creada en este mismo run,
+# despues de que load_query.clear() haya invalidado la cache.
+reminder_slot = st.container()
 
 
 # =============================================================================
@@ -112,9 +120,17 @@ with st.form("invoice_form", clear_on_submit=not editing):
         c2.text_input("Sede (fija)", value=locked_sede, disabled=True)
         sede_nombre = locked_sede
 
+    # Prefill: al editar, el contrato de la factura; si no, un contrato que el
+    # asesor eligio desde el recordatorio de pendientes (Seccion 0). Como el
+    # widget no tiene key, cambiar `value` lo re-inicializa (asi funciona el
+    # prefill de edicion), por eso el prefill del recordatorio tambien aplica.
+    if editing and editing_data.get("rntl_mvnr"):
+        _default_contrato = str(int(editing_data["rntl_mvnr"]))
+    else:
+        _default_contrato = str(st.session_state.get("_prefill_contrato", "") or "")
     rntl_mvnr = c3.text_input(
         "Numero de contrato",
-        value=str(int(editing_data["rntl_mvnr"])) if editing and editing_data.get("rntl_mvnr") else "",
+        value=_default_contrato,
         placeholder="ej. 9523011485",
         help="Numero del contrato de renta tal como aparece en el contrato firmado.",
     )
@@ -230,6 +246,9 @@ if submitted:
                 tag = "prepagada" if prepaid else "no prepagada"
                 st.success(f"Factura guardada — {sede_nombre} — contrato {rntl_mvnr} — "
                            f"{fmt_money(monto_total, 'COP')} ({tag}).")
+                # Limpia el prefill del recordatorio para que el campo no
+                # reaparezca con el contrato ya facturado en el proximo render.
+                st.session_state.pop("_prefill_contrato", None)
             load_query.clear()
         except Exception as e:
             st.error(f"Error guardando: {e}")
@@ -429,3 +448,93 @@ if df_fin.empty:
 else:
     st.dataframe(df_fin, use_container_width=True, hide_index=True)
     st.caption(f"Mostrando ultimas {len(df_fin)} facturas finalizadas.")
+
+
+# =============================================================================
+# 0. RECORDATORIO: contratos con handover reciente sin factura creada
+# =============================================================================
+# Renderizado al final (dentro de reminder_slot, que esta arriba del form) para
+# que refleje los inserts hechos en este mismo run tras load_query.clear().
+# El filtro por sede es server-side: un usuario sede NUNCA recibe contratos de
+# otra sucursal, ni manipulando la URL, porque el WHERE va en el SQL.
+with reminder_slot:
+    if user_is_admin or "*" in user_branches:
+        sede_opts = ["Todas las sedes"] + list(sede_map.keys())
+        sede_sel = st.selectbox(
+            "Sede (pendientes)", options=sede_opts, index=0, key="_rem_sede",
+            help="Filtra los contratos pendientes de facturar por sede.",
+        )
+        if sede_sel == "Todas las sedes":
+            rem_where = ""
+            rem_params = {"fecha_inicio": FECHA_INICIO_RECORDATORIO}
+        else:
+            rem_where = "AND r.sede_handover = :sede_sel"
+            rem_params = {"fecha_inicio": FECHA_INICIO_RECORDATORIO,
+                          "sede_sel": sede_sel}
+    else:
+        rem_where = "AND r.sede_handover = :user_sede"
+        rem_params = {"fecha_inicio": FECHA_INICIO_RECORDATORIO,
+                      "user_sede": user_branches[0] if user_branches else ""}
+
+    rem_sql = f"""
+        SELECT r.numero_contrato,
+               r.fecha_handover_real::date AS fecha_handover,
+               r.fecha_devolucion_real::date AS fecha_devolucion,
+               r.placa,
+               r.vehiculo,
+               r.sede_handover,
+               r.operador_handover_codigo AS asesor,
+               r.total_con_iva_usd
+        FROM silver.vw_rentals_resumen r
+        LEFT JOIN operational.invoices i ON i.rntl_mvnr = r.numero_contrato
+        WHERE r.fecha_handover_real::date >= :fecha_inicio
+          AND i.invoice_id IS NULL
+          {rem_where}
+        ORDER BY r.fecha_handover_real DESC
+    """
+    df_rem = load_query(rem_sql, rem_params)
+    n_pend = len(df_rem)
+
+    if n_pend == 0:
+        st.markdown(
+            "<div style='background:#e8f5e9;padding:10px 14px;border-radius:4px;"
+            "border-left:3px solid #43a047;margin:4px 0 12px 0;color:#2e7d32;"
+            "font-size:0.95rem;'>Estas al dia con las facturas. No hay contratos "
+            f"pendientes con handover desde {FECHA_INICIO_RECORDATORIO}.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"<div style='background:#fff3e0;padding:10px 16px;border-radius:4px;"
+            f"border-left:4px solid #ff6900;margin:4px 0 4px 0;color:#333;'>"
+            f"<span style='font-size:1.05rem;font-weight:700;color:#e55a00;'>"
+            f"Pendientes de crear factura ({n_pend})</span><br>"
+            f"<span style='font-size:0.88rem;color:#666;'>Contratos con handover "
+            f"desde {FECHA_INICIO_RECORDATORIO} sin factura creada.</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        head = st.columns([2, 2, 2, 3, 2, 2, 2])
+        for col, label in zip(
+            head, ["Contrato", "Handover", "Placa", "Vehiculo", "Asesor", "Total", ""]
+        ):
+            col.markdown(f"<span style='font-size:0.78rem;color:#888;"
+                         f"text-transform:uppercase;'>{label}</span>",
+                         unsafe_allow_html=True)
+
+        for _, row in df_rem.iterrows():
+            contrato = int(row["numero_contrato"])
+            cols = st.columns([2, 2, 2, 3, 2, 2, 2])
+            cols[0].write(f"{contrato}")
+            cols[1].write(f"{row['fecha_handover']}")
+            cols[2].write(f"{row['placa'] or '-'}")
+            cols[3].write(f"{row['vehiculo'] or '-'}")
+            cols[4].write(f"{int(row['asesor']) if pd.notna(row['asesor']) else '-'}")
+            cols[5].write(fmt_money(row["total_con_iva_usd"], "USD"))
+            if cols[6].button("Crear factura", key=f"rem_create_{contrato}"):
+                st.session_state["_prefill_contrato"] = str(contrato)
+                st.session_state["_editing_id"] = None
+                st.session_state["_editing_data"] = {}
+                st.rerun()
+
+    st.markdown("---")
