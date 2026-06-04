@@ -262,12 +262,20 @@ st.markdown("---")
 # =============================================================================
 section("Facturas abiertas (pendientes de finalizar)")
 
+# LEFT JOIN a silver para mostrar fecha de entrega (handover) y devolucion.
+# Las facturas casi siempre se crean ANTES de que el contrato llegue a silver
+# (desfase de Redshift), asi que el join puede no encontrar fila: en ese caso
+# entrega/devolucion quedan NULL y se muestran como "pendiente". 1:1 porque
+# vw_rentals_resumen es 1 fila por contrato.
 open_sql = f"""
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter,
-           i.observaciones, i.capturado_por, i.capturado_at
+           i.observaciones, i.capturado_por, i.capturado_at,
+           r.fecha_handover_real::date   AS fecha_entrega,
+           r.fecha_devolucion_real::date AS fecha_devolucion
     FROM operational.invoices i
+    LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     WHERE i.finalizada = FALSE {sede_where}
     ORDER BY i.capturado_at DESC
 """
@@ -278,26 +286,36 @@ if df_open.empty:
 else:
     st.caption(f"{len(df_open)} facturas abiertas. Selecciona una para editar o finalizar.")
 
+    open_w = [0.7, 1.6, 2.2, 1.4, 1.4, 1.6, 1.0, 1.1]
+    head = st.columns(open_w)
+    for col, label in zip(head, ["Factura", "Contrato", "Sede", "Entrega",
+                                 "Devolucion", "Total", "", ""]):
+        col.markdown(f"<span style='font-size:0.78rem;color:#888;"
+                     f"text-transform:uppercase;'>{label}</span>",
+                     unsafe_allow_html=True)
+
     for _, row in df_open.iterrows():
         inv_id = int(row["invoice_id"])
         contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
         total = fmt_money(float(row["monto_total"]) if pd.notna(row["monto_total"]) else 0, "COP")
         sede = row["sede_nombre"] or "-"
-        fecha = row["fecha_emision"]
+        entrega = row["fecha_entrega"] if pd.notna(row["fecha_entrega"]) else "pendiente"
+        devol = row["fecha_devolucion"] if pd.notna(row["fecha_devolucion"]) else "pendiente"
 
-        cols = st.columns([1, 2, 2, 2, 2, 1, 1])
+        cols = st.columns(open_w)
         cols[0].write(f"**#{inv_id}**")
         cols[1].write(f"{contrato}")
         cols[2].write(f"{sede}")
-        cols[3].write(f"{total}")
-        cols[4].write(f"{fecha}")
+        cols[3].write(f"{entrega}")
+        cols[4].write(f"{devol}")
+        cols[5].write(f"{total}")
 
-        if cols[5].button("Editar", key=f"edit_{inv_id}"):
+        if cols[6].button("Editar", key=f"edit_{inv_id}"):
             st.session_state["_editing_id"] = inv_id
             st.session_state["_editing_data"] = row.to_dict()
             st.rerun()
 
-        if cols[6].button("Finalizar", key=f"fin_{inv_id}"):
+        if cols[7].button("Finalizar", key=f"fin_{inv_id}"):
             execute_write("""
                 UPDATE operational.invoices
                 SET finalizada = TRUE, finalizada_at = NOW(), finalizada_por = :user
@@ -384,18 +402,25 @@ else:
             contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
             dif = float(row["diferencia"])
 
+            # El signo $ activa el modo LaTeX de Streamlit (dos $ = math mode),
+            # lo que rompe el HTML intermedio. Lo escapamos como &#36; para que
+            # se muestre literal sin disparar KaTeX.
+            factura_html = fmt_money(row["factura_cop"], "COP").replace("$", "&#36;")
+            sistema_html = fmt_money(row["sistema_cop"], "COP").replace("$", "&#36;")
+            dif_html = fmt_money(dif, "COP").replace("$", "&#36;")
+
             cols = st.columns([1, 2, 2, 2, 2, 1])
             cols[0].write(f"**#{inv_id}**")
             cols[1].write(f"Contrato: {contrato}")
             cols[2].markdown(
-                f"<b>Factura:</b> {fmt_money(row['factura_cop'], 'COP')} &nbsp;|&nbsp; "
-                f"<b>Sistema:</b> {fmt_money(row['sistema_cop'], 'COP')}",
+                f"<b>Factura:</b> {factura_html} &nbsp;|&nbsp; "
+                f"<b>Sistema:</b> {sistema_html}",
                 unsafe_allow_html=True,
             )
             color = "#d32f2f" if abs(dif) > 5000 else "#f57c00"
             cols[3].markdown(
                 f"<span style='color:{color};font-weight:bold;'>"
-                f"Diferencia: {fmt_money(dif, 'COP')}</span>",
+                f"Diferencia: {dif_html}</span>",
                 unsafe_allow_html=True,
             )
             cols[4].write(f"TRM: {row['trm_usada']:,.2f}")
@@ -515,7 +540,7 @@ with reminder_slot:
             f"<span style='font-size:1.05rem;font-weight:700;color:#e55a00;'>"
             f"Pendientes de crear factura ({n_pend})</span><br>"
             f"<span style='font-size:0.88rem;color:#666;'>Contratos entregados "
-            f"desde {FECHA_INICIO_RECORDATORIO} (handover ya ocurrido) sin "
+            f"desde {FECHA_INICIO_RECORDATORIO} (entrega ya realizada) sin "
             f"factura creada.</span></div>",
             unsafe_allow_html=True,
         )
@@ -523,7 +548,7 @@ with reminder_slot:
         col_widths = [2, 3, 2, 2, 3, 2, 2, 2]
         head = st.columns(col_widths)
         for col, label in zip(
-            head, ["Contrato", "Sede", "Handover", "Placa", "Vehiculo",
+            head, ["Contrato", "Sede", "Entrega", "Placa", "Vehiculo",
                    "Asesor", "Total", ""]
         ):
             col.markdown(f"<span style='font-size:0.78rem;color:#888;"
