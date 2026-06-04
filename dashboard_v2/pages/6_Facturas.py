@@ -509,9 +509,11 @@ with reminder_slot:
                r.vehiculo,
                r.sede_handover,
                r.operador_handover_codigo AS asesor,
-               r.total_con_iva_usd
+               -- Total en COP via TRM Banrep del dia de la entrega (regla #6).
+               ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0) AS total_cop
         FROM silver.vw_rentals_resumen r
         LEFT JOIN operational.invoices i ON i.rntl_mvnr = r.numero_contrato
+        LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
         WHERE r.fecha_handover_real::date >= :fecha_inicio
           -- Solo rentas YA entregadas: el handover debe haber ocurrido. Sin
           -- este tope, contratos a futuro (reservas/placeholders sin vehiculo
@@ -564,7 +566,7 @@ with reminder_slot:
             cols[3].write(f"{row['placa'] or '-'}")
             cols[4].write(f"{row['vehiculo'] or '-'}")
             cols[5].write(f"{int(row['asesor']) if pd.notna(row['asesor']) else '-'}")
-            cols[6].write(fmt_money(row["total_con_iva_usd"], "USD"))
+            cols[6].write(fmt_money(row["total_cop"], "COP"))
             if cols[7].button("Crear factura", key=f"rem_create_{contrato}"):
                 st.session_state["_prefill_contrato"] = str(contrato)
                 st.session_state["_editing_id"] = None
