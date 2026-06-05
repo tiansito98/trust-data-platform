@@ -522,6 +522,11 @@ with reminder_slot:
           -- asignado, asesor 7777777) aparecerian como "pendientes". No se
           -- puede facturar una renta que aun no empieza. Zona Colombia (UTC-5).
           AND r.fecha_handover_real::date <= ((NOW() AT TIME ZONE 'America/Bogota')::date)
+          -- Excluir registros administrativos con vehiculo dummy 99999999
+          -- (regla #9): status-match de competidores y similares. Llegan con
+          -- placa/vehiculo vacios, operador 7777777 y revenue 0; no son rentas
+          -- reales y no se facturan. El placeholder real tiene placa vacia.
+          AND COALESCE(TRIM(r.placa), '') <> ''
           AND i.invoice_id IS NULL
           {rem_where}
         ORDER BY r.fecha_handover_real DESC
