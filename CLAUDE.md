@@ -21,7 +21,16 @@ You have full autonomy to execute commands in this repo. The project settings (`
 
 ## Stack
 
-**Supabase Postgres** (target DB, free tier) + **Medallion architecture** (Bronze → Silver → Gold) + **Streamlit** (dashboard, hosted on Streamlit Community Cloud). Source: Sixt Redshift Data Exchange (mandant 409) via SSH tunnel + `redshift-connector`. Orchestration: plain Python + psycopg2/SQLAlchemy (no dbt). Repo is public on GitHub.
+**Supabase Postgres** (Pro plan, Micro compute) + **Medallion architecture** (Bronze → Silver → Gold) + **Streamlit** (dashboard, hosted on Streamlit Community Cloud). Source: Sixt Redshift Data Exchange (mandant 409) via SSH tunnel + `redshift-connector`. Orchestration: plain Python + psycopg2/SQLAlchemy (no dbt). Repo is public on GitHub.
+
+### Connection pooler routing (CRITICAL)
+
+Supabase exposes two poolers — use the right one for the workload or you'll cause `ECHECKOUTTIMEOUT` errors:
+
+- **Pipeline / silver builds → Session pooler (port `5432`)** — long-running transactions, persistent settings (`statement_timeout`, `search_path`)
+- **Streamlit dashboard → Transaction pooler (port `6543`)** — many short queries, connections returned to pool after each transaction
+
+Both Streamlit secrets and `.env` should use port `6543` for the dashboard, `5432` for the pipeline. If you ever see `ECHECKOUTTIMEOUT after 15000ms in Session mode` on the dashboard, the secret is pointing at port 5432 (wrong pooler).
 
 ## How to run
 
@@ -137,6 +146,84 @@ Implemented in `build_rentals_detail` (CTE `prepay_lookup`). Aggregated in `buil
 ## Konr rule (charge versioning)
 
 Sixt corrects contracts by inserting a new "wave" of charges with `konr+1` and **omitting** positions that no longer apply. The valid position set is: `(inty, pos)` whose `MAX(konr)` equals the `MAX(konr)` global of the contract. Implemented in `vw_charges_ra_enriched`, `vw_charges_rs_enriched`, `vw_rentals_detail`, and `vw_rentals_full`.
+
+## Operating safely — Supabase IO budget awareness
+
+**On Pro plan with Micro compute**, the database has a finite daily IO budget:
+
+| Metric | Value |
+|---|---|
+| Baseline IO bandwidth | 87 Mbps (always available) |
+| Burst IO bandwidth | 2,085 Mbps (24x baseline) |
+| Daily burst budget | **30 minutes total per day** |
+| Reset | Rolling 24-hour window (mostly refilled by next morning) |
+
+When the burst budget is exhausted, the DB falls back to baseline 87 Mbps. The dashboard still works (~98% cache hit rate means tiny disk reads), but heavy operations slow dramatically.
+
+### What burns the budget (in order)
+
+1. **Silver build** (DROP+CREATE 30+ tables) — ~5-10 min of burst per run = ~15-30% of daily budget
+2. **Bronze incremental** with large changes — ~2-5 min of burst per run = ~7-15%
+3. **Ad-hoc heavy queries** (multi-CTE scans, no LIMIT, large GROUP BY) — varies, can be massive
+4. **Failed pipeline + retry combo** — doubles IO consumption for same data
+5. **Dashboard usage** — negligible (mostly cached)
+
+### Pipeline safety rules
+
+- **Run pipelines on a schedule** (06:00 + 20:00 COT recommended for 2/day, or 06/13/20 for 3/day)
+- **Avoid manual runs during business hours** (08:00-18:00 COT) unless necessary
+- **If pipeline runs > 20 minutes, kill it and restart** — Supabase pooler/network blips can leave it stuck; the watermark system makes restarts cheap
+- **Never retry a failed pipeline immediately** — investigate first, otherwise you double the IO cost
+- **Don't combine pipeline + heavy ad-hoc analysis on the same day** — that's how budget gets depleted
+
+### Ad-hoc query safety rules
+
+When the user asks for diagnostic/exploration queries, default to lightweight patterns:
+
+- Always include `LIMIT` while iterating (e.g., `LIMIT 100`)
+- Always add date filters when scanning fact tables: `WHERE fecha BETWEEN '2026-03-01' AND '2026-03-31'`
+- Run `EXPLAIN ANALYZE` first if a query looks expensive
+- If the user will re-run a query weekly/monthly, **save it as a silver view** instead of running it ad-hoc
+- After a heavy debugging session (>5 multi-CTE queries), pause before running more — IO budget is shared
+- A "few lines of SQL" can do massive work — text length ≠ execution cost
+
+### How to check IO health
+
+**Supabase UI (authoritative):**
+- Project Settings → Compute and Disk → see "Disk IO consumed per day" chart
+- Bars at <50% = healthy, >75% = use ad-hoc queries sparingly, 100% = budget depleted (baseline only until reset)
+
+**Postgres SQL:**
+```sql
+-- Cache hit ratio (>95% = excellent, low disk IO)
+SELECT ROUND(100.0 * sum(heap_blks_hit) /
+       NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS cache_hit_pct
+FROM pg_statio_user_tables WHERE schemaname = 'silver';
+
+-- Currently running heavy queries
+SELECT pid, now() - query_start AS duration, LEFT(query, 100)
+FROM pg_stat_activity WHERE state != 'idle' AND now() - query_start > interval '5 seconds';
+
+-- Top historic disk-readers (since last stats reset)
+SELECT LEFT(query, 100), calls, shared_blks_read
+FROM pg_stat_statements WHERE shared_blks_read > 0
+ORDER BY shared_blks_read DESC LIMIT 10;
+```
+
+### When IO budget is depleted
+
+1. Dashboard still works fine (cache hit rate ~98%)
+2. **Do not run more pipelines** until budget refills
+3. **Do not run heavy ad-hoc queries** — they'll queue and crawl
+4. Light queries (single-row lookups, indexed filters, TRM update) are safe
+5. Budget refills overnight — fully reset by next morning typically
+
+### Incident reference: 2026-06-05
+
+- Failed 11-hour pipeline run + successful retry + silver rebuild + COBRA debugging queries combined = 100% budget depletion
+- Cascade: project marked "unhealthy" → Supabase restarted instance → statement timeouts → dashboard timed out
+- Resolution: upgraded to Pro + Micro compute, switched dashboard to Transaction pooler (6543), ran ANALYZE on silver tables
+- Lesson: **the pipeline alone can deplete daily budget on Micro tier when it fails and retries**. Add a 20-minute timeout watchdog.
 
 ## Hard rules
 
