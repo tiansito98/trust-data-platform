@@ -332,6 +332,59 @@ st.markdown("---")
 
 
 # =============================================================================
+# 2b. FACTURAS VENCIDAS (no finalizadas pero el vehiculo ya fue devuelto)
+# =============================================================================
+# Alerta para los asesores: el contrato ya cerro (fecha_devolucion_real en pasado)
+# pero la factura sigue abierta. Probablemente se les olvido finalizarla.
+section("Facturas vencidas (vehiculo devuelto sin finalizar)")
+
+vencidas_sql = f"""
+    SELECT i.invoice_id, i.rntl_mvnr, i.sede_nombre, i.fecha_emision,
+           i.numero_factura, i.numero_recibo, i.monto_total,
+           r.fecha_handover_real::date AS fecha_entrega,
+           r.fecha_devolucion_real::date AS fecha_devolucion,
+           (CURRENT_DATE - r.fecha_devolucion_real::date) AS dias_vencida,
+           i.capturado_por
+    FROM operational.invoices i
+    INNER JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
+    WHERE i.finalizada = FALSE
+      AND r.fecha_devolucion_real IS NOT NULL
+      AND r.fecha_devolucion_real::date < CURRENT_DATE
+      {sede_where}
+    ORDER BY r.fecha_devolucion_real::date ASC
+"""
+df_vencidas = load_query(vencidas_sql, sede_params if sede_params else {})
+
+if df_vencidas.empty:
+    st.success("No hay facturas vencidas. Todas las facturas abiertas corresponden a contratos aun activos.")
+else:
+    st.error(
+        f"{len(df_vencidas)} factura(s) abierta(s) cuyo vehiculo ya fue devuelto. "
+        f"Por favor finalicelas (boton 'Finalizar' en la seccion de facturas abiertas)."
+    )
+    vencidas_view = df_vencidas.copy()
+    vencidas_view["monto_total"] = vencidas_view["monto_total"].apply(
+        lambda v: fmt_money(v, "COP") if pd.notna(v) else "-")
+    vencidas_view = vencidas_view.rename(columns={
+        "invoice_id": "ID",
+        "rntl_mvnr": "Contrato",
+        "sede_nombre": "Sede",
+        "fecha_emision": "Fecha emision",
+        "numero_factura": "Numero factura",
+        "numero_recibo": "Numero recibo",
+        "monto_total": "Monto (COP)",
+        "fecha_entrega": "Entrega",
+        "fecha_devolucion": "Devolucion",
+        "dias_vencida": "Dias vencida",
+        "capturado_por": "Capturado por",
+    })
+    st.dataframe(vencidas_view, use_container_width=True, hide_index=True)
+
+
+st.markdown("---")
+
+
+# =============================================================================
 # 3. VALIDACION: facturas finalizadas vs silver (alarma si hay diferencia)
 # =============================================================================
 section("Validacion de facturas finalizadas")
@@ -475,6 +528,64 @@ if df_fin.empty:
 else:
     st.dataframe(df_fin, use_container_width=True, hide_index=True)
     st.caption(f"Mostrando ultimas {len(df_fin)} facturas finalizadas.")
+
+    # -----------------------------------------------------------------
+    # ADMIN ONLY: Reabrir cualquier factura finalizada por ID
+    # -----------------------------------------------------------------
+    # Antes hacian este proceso por SQL directo en Supabase. Ahora desde UI.
+    if user_is_admin:
+        st.markdown("##### Reabrir factura (admin)")
+        st.caption(
+            "Si finalizaron una factura por error, ingresa el ID aqui y se reabre "
+            "para que el asesor pueda corregirla y volver a finalizarla."
+        )
+        admin_cols = st.columns([2, 2, 1])
+        reopen_id_str = admin_cols[0].text_input(
+            "ID de factura a reabrir",
+            key="_admin_reopen_id",
+            placeholder="ej. 91",
+        )
+        admin_confirm = admin_cols[1].checkbox(
+            "Confirmo que quiero reabrirla",
+            key="_admin_reopen_confirm",
+        )
+        if admin_cols[2].button("Reabrir", key="_admin_reopen_btn", type="primary"):
+            try:
+                reopen_id = int(reopen_id_str.strip())
+            except (ValueError, AttributeError):
+                st.error("Ingresa un ID valido (numero entero).")
+            else:
+                if not admin_confirm:
+                    st.error("Marca la casilla de confirmacion antes de reabrir.")
+                else:
+                    # Verificar que existe y esta finalizada
+                    check = load_query(
+                        "SELECT invoice_id, rntl_mvnr, sede_nombre, finalizada "
+                        "FROM operational.invoices WHERE invoice_id = :id",
+                        {"id": reopen_id},
+                    )
+                    if check.empty:
+                        st.error(f"No existe factura con ID {reopen_id}.")
+                    elif not bool(check.iloc[0]["finalizada"]):
+                        st.warning(
+                            f"La factura #{reopen_id} ya esta abierta. "
+                            f"No requiere accion."
+                        )
+                    else:
+                        execute_write("""
+                            UPDATE operational.invoices
+                            SET finalizada = FALSE,
+                                finalizada_at = NULL,
+                                finalizada_por = NULL
+                            WHERE invoice_id = :id
+                        """, {"id": reopen_id})
+                        row = check.iloc[0]
+                        st.success(
+                            f"Factura #{reopen_id} reabierta "
+                            f"(contrato {int(row['rntl_mvnr'])}, sede {row['sede_nombre']})."
+                        )
+                        load_query.clear()
+                        st.rerun()
 
 
 # =============================================================================
