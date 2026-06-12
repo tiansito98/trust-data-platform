@@ -1,0 +1,72 @@
+name: refresh-trm
+
+# TRM-only refresh: corre diario y solo actualiza la TRM de Banrep.
+#
+# NO requiere SSH a Sixt (que esta IP-whitelisted al laptop del dev),
+# asi que puede correr en runners de GitHub publicos sin self-hosted.
+#
+# Solo necesita:
+#   - HTTP publico a datos.gov.co (API de Banrep)
+#   - Conexion a Supabase Postgres (publico, sin whitelisting)
+#
+# Banrep tipicamente publica la TRM del dia siguiente alrededor de las
+# 6-7 PM Colombia (UTC-5). Corremos a las 23:00 UTC = 6:00 PM COT.
+#
+# Pasos:
+#   1. pipelines.bronze.external_trm  -> updates bronze.external_trm_diaria
+#   2. build_dim_trm_diaria()         -> rebuilds silver.dim_trm_diaria
+#      (necesario porque el dashboard lee de silver, no bronze)
+
+on:
+  schedule:
+    - cron: '0 23 * * *'   # 18:00 COT diario - Banrep ya publico la TRM de mañana
+  workflow_dispatch:        # manual trigger desde la pestana Actions
+
+concurrency:
+  group: trust-refresh-trm
+  cancel-in-progress: false
+
+jobs:
+  refresh-trm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-pipeline.txt
+
+      - name: Refresh bronze.external_trm_diaria
+        run: |
+          python -m pipelines.bronze.external_trm
+
+      - name: Rebuild silver.dim_trm_diaria
+        run: |
+          python -c "from pipelines.silver.build import build_dim_trm_diaria; from pipelines._common import get_engine; build_dim_trm_diaria(get_engine('silver,bronze'))"
+
+      - name: Verify latest TRM in silver
+        run: |
+          python -c "
+          from pipelines._common import get_engine
+          from sqlalchemy import text
+          engine = get_engine('silver')
+          with engine.connect() as conn:
+              conn.execute(text('SET search_path TO silver, public'))
+              rows = conn.execute(text('SELECT fecha, trm_cop_per_usd, dia_publicacion FROM dim_trm_diaria ORDER BY fecha DESC LIMIT 3')).fetchall()
+              for r in rows:
+                  pub = 'publicado' if r[2] == 1 else 'heredado'
+                  print(f'{r[0]}  TRM: {r[1]:,.2f}  ({pub})')
+          "
