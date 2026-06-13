@@ -444,12 +444,34 @@ st.markdown("---")
 # 4. FACTURAS FINALIZADAS (historial)
 # =============================================================================
 section("Historial de facturas finalizadas")
+st.caption(
+    "Vista retrospectiva. Muestra que se cobro, que decia el contrato segun "
+    "silver, la diferencia, la TRM oficial Banrep del dia de entrega y la "
+    "TRM efectivamente usada (deducida del monto cobrado)."
+)
+# JOIN a silver + dim_trm_diaria para validar contra TRM oficial.
+# TRM usada se deduce: si monto_cop = usd * trm, entonces trm_usada = monto_cop / usd.
+# Esto permite ver si el asesor uso una TRM distinta (vieja, redondeada, etc.).
 fin_sql = f"""
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
-           i.finalizada_por, i.finalizada_at
+           i.finalizada_por, i.finalizada_at,
+           r.fecha_handover_real::date AS fecha_entrega,
+           r.total_con_iva_usd         AS total_usd,
+           t.trm_cop_per_usd           AS trm_oficial,
+           CASE WHEN r.total_con_iva_usd IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END           AS sistema_cop,
+           CASE WHEN r.total_con_iva_usd IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN i.monto_total - ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END           AS diferencia,
+           CASE WHEN r.total_con_iva_usd IS NOT NULL AND r.total_con_iva_usd > 0
+                THEN ROUND((i.monto_total / r.total_con_iva_usd)::numeric, 2)
+                ELSE NULL END           AS trm_usada_calculada
     FROM operational.invoices i
+    LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
+    LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     WHERE i.finalizada = TRUE {sede_where}
     ORDER BY i.finalizada_at DESC
     LIMIT 50
@@ -458,8 +480,58 @@ df_fin = load_query(fin_sql, sede_params if sede_params else {})
 if df_fin.empty:
     st.info("No hay facturas finalizadas.")
 else:
-    st.dataframe(df_fin, use_container_width=True, hide_index=True)
-    st.caption(f"Mostrando ultimas {len(df_fin)} facturas finalizadas.")
+    # Diferencia entre TRM usada y TRM oficial (cuanto se desvio el asesor)
+    df_fin["diff_trm"] = df_fin["trm_usada_calculada"] - df_fin["trm_oficial"]
+
+    # Vista formateada
+    view = df_fin[[
+        "invoice_id", "fecha_emision", "sede_nombre", "rntl_mvnr",
+        "numero_factura", "numero_recibo",
+        "fecha_entrega",
+        "monto_total", "sistema_cop", "diferencia",
+        "trm_oficial", "trm_usada_calculada", "diff_trm",
+        "finalizada_por", "finalizada_at",
+    ]].copy()
+
+    # Formato de moneda COP
+    for col in ("monto_total", "sistema_cop", "diferencia"):
+        view[col] = view[col].apply(
+            lambda v: fmt_money(v, "COP") if pd.notna(v) else "-"
+        )
+    # TRM con 2 decimales
+    for col in ("trm_oficial", "trm_usada_calculada", "diff_trm"):
+        view[col] = view[col].apply(
+            lambda v: f"{v:,.2f}" if pd.notna(v) else "-"
+        )
+    # finalizada_at: solo fecha+hora bonita
+    view["finalizada_at"] = pd.to_datetime(
+        view["finalizada_at"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M")
+
+    view = view.rename(columns={
+        "invoice_id": "ID",
+        "fecha_emision": "Fecha emision",
+        "sede_nombre": "Sede",
+        "rntl_mvnr": "Contrato",
+        "numero_factura": "Num factura",
+        "numero_recibo": "Num recibo",
+        "fecha_entrega": "Entrega",
+        "monto_total": "Total cobrado (COP)",
+        "sistema_cop": "Sistema (COP)",
+        "diferencia": "Diferencia (COP)",
+        "trm_oficial": "TRM oficial",
+        "trm_usada_calculada": "TRM usada",
+        "diff_trm": "Δ TRM",
+        "finalizada_por": "Finalizada por",
+        "finalizada_at": "Finalizada en",
+    })
+
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.caption(
+        f"Mostrando ultimas {len(view)} facturas finalizadas. "
+        f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
+        f"negativo = uso una mas baja."
+    )
 
     # -----------------------------------------------------------------
     # ADMIN ONLY: Reabrir cualquier factura finalizada por ID
