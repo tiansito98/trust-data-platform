@@ -258,27 +258,42 @@ st.markdown("---")
 
 
 # =============================================================================
-# 2. FACTURAS ABIERTAS (no finalizadas) — editable
+# 2. FACTURAS ABIERTAS — vista unificada con TRM, sistema esperado y cuadre inline
 # =============================================================================
+# Una sola tabla con TODO lo que el asesor necesita ver antes de finalizar:
+#   - Datos basicos (contrato, sede, entrega, devolucion, total)
+#   - TRM Banrep del dia de entrega
+#   - Monto esperado por sistema (charges silver x TRM)
+#   - Diferencia + estado (cuadra / sobre tolerancia / pendiente silver / vencida)
+# Vencidas (vehiculo devuelto sin finalizar) salen marcadas con icono y color.
 section("Facturas abiertas (pendientes de finalizar)")
+st.caption(
+    f"Cada factura muestra TRM Banrep del dia de entrega, monto calculado por el "
+    f"sistema y diferencia. Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}. "
+    f"Si el vehiculo ya fue devuelto pero la factura sigue abierta, sale marcada como 'Vencida'."
+)
 
-# LEFT JOIN a silver para mostrar fecha de entrega (handover) y devolucion.
-# Las facturas casi siempre se crean ANTES de que el contrato llegue a silver
-# (desfase de Redshift), asi que el join puede no encontrar fila: en ese caso
-# entrega/devolucion quedan NULL y se muestran como "pendiente". 1:1 porque
-# vw_rentals_resumen es 1 fila por contrato.
 open_sql = f"""
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter,
            i.observaciones, i.capturado_por, i.capturado_at,
            r.fecha_handover_real::date   AS fecha_entrega,
-           r.fecha_devolucion_real::date AS fecha_devolucion
+           r.fecha_devolucion_real::date AS fecha_devolucion,
+           r.total_con_iva_usd           AS total_usd,
+           t.trm_cop_per_usd             AS trm,
+           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END             AS sistema_cop,
+           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
+                THEN i.monto_total - ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
+                ELSE NULL END             AS diferencia,
+           CASE WHEN r.numero_contrato IS NULL THEN TRUE ELSE FALSE END
+                                          AS pendiente_silver
     FROM operational.invoices i
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
+    LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     WHERE i.finalizada = FALSE {sede_where}
-    -- Ordenadas por fecha de entrega (handover), mas reciente primero. Las
-    -- "pendiente" (contrato aun no en silver -> sin entrega) van al final.
     ORDER BY r.fecha_handover_real DESC NULLS LAST, i.capturado_at DESC
 """
 df_open = load_query(open_sql, sede_params if sede_params else {})
@@ -286,9 +301,34 @@ df_open = load_query(open_sql, sede_params if sede_params else {})
 if df_open.empty:
     st.info("No hay facturas abiertas para tu sede.")
 else:
-    st.caption(f"{len(df_open)} facturas abiertas. Selecciona una para editar o finalizar.")
+    # Convertir columnas numericas
+    for col in ("monto_total", "total_usd", "trm", "sistema_cop", "diferencia"):
+        df_open[col] = pd.to_numeric(df_open[col], errors="coerce")
 
-    open_w = [0.7, 1.6, 2.2, 1.4, 1.4, 1.6, 1.0, 1.1]
+    # Determinar vencidas (vehiculo devuelto pero factura abierta)
+    today = dt.date.today()
+    df_open["es_vencida"] = df_open["fecha_devolucion"].apply(
+        lambda v: pd.notna(v) and v < today
+    )
+
+    # Summary line
+    n_vencidas = int(df_open["es_vencida"].sum())
+    n_pendientes = int(df_open["pendiente_silver"].sum())
+    diff_abs = df_open["diferencia"].abs()
+    n_sobre_tol = int(((diff_abs > VALIDATION_TOLERANCE_COP) &
+                       ~df_open["pendiente_silver"]).sum())
+
+    summary_parts = [f"{len(df_open)} factura(s) abierta(s)"]
+    if n_vencidas > 0:
+        summary_parts.append(f"{n_vencidas} vencida(s)")
+    if n_sobre_tol > 0:
+        summary_parts.append(f"{n_sobre_tol} sobre tolerancia")
+    if n_pendientes > 0:
+        summary_parts.append(f"{n_pendientes} pendiente(s) silver")
+    st.caption(" · ".join(summary_parts))
+
+    # Header de columnas: ID | Contrato | Sede | Entrega | Devol | Total | Editar | Finalizar
+    open_w = [0.7, 1.6, 2.2, 1.3, 1.3, 1.6, 1.0, 1.1]
     head = st.columns(open_w)
     for col, label in zip(head, ["Factura", "Contrato", "Sede", "Entrega",
                                  "Devolucion", "Total", "", ""]):
@@ -299,18 +339,29 @@ else:
     for _, row in df_open.iterrows():
         inv_id = int(row["invoice_id"])
         contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
-        total = fmt_money(float(row["monto_total"]) if pd.notna(row["monto_total"]) else 0, "COP")
+        total = fmt_money(float(row["monto_total"])
+                          if pd.notna(row["monto_total"]) else 0, "COP")
         sede = row["sede_nombre"] or "-"
-        entrega = row["fecha_entrega"] if pd.notna(row["fecha_entrega"]) else "pendiente"
-        devol = row["fecha_devolucion"] if pd.notna(row["fecha_devolucion"]) else "pendiente"
+        entrega = str(row["fecha_entrega"]) if pd.notna(row["fecha_entrega"]) else "pendiente"
+        devol_raw = row["fecha_devolucion"]
+        devol_display = str(devol_raw) if pd.notna(devol_raw) else "pendiente"
+        es_vencida = bool(row["es_vencida"])
 
+        # --- Fila principal ---
         cols = st.columns(open_w)
         cols[0].write(f"**#{inv_id}**")
         cols[1].write(f"{contrato}")
         cols[2].write(f"{sede}")
         cols[3].write(f"{entrega}")
-        cols[4].write(f"{devol}")
-        cols[5].write(f"{total}")
+        if es_vencida:
+            cols[4].markdown(
+                f"<span style='color:#d32f2f;font-weight:bold;'>"
+                f"{devol_display}</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            cols[4].write(devol_display)
+        cols[5].write(total)
 
         if cols[6].button("Editar", key=f"edit_{inv_id}"):
             st.session_state["_editing_id"] = inv_id
@@ -327,182 +378,63 @@ else:
             load_query.clear()
             st.rerun()
 
+        # --- Sub-linea con TRM + sistema esperado + diferencia + estado ---
+        # El signo $ activa LaTeX en Streamlit; escapamos a &#36; para que
+        # se muestre literal.
+        sub_parts = []
 
-st.markdown("---")
+        if row["pendiente_silver"]:
+            sub_parts.append(
+                "<span style='color:#999;'>Contrato aun no esta en silver "
+                "- se validara despues del proximo refresh del pipeline.</span>"
+            )
+        elif pd.notna(row["diferencia"]):
+            trm_val = float(row["trm"]) if pd.notna(row["trm"]) else 0
+            sis_val = float(row["sistema_cop"]) if pd.notna(row["sistema_cop"]) else 0
+            dif_val = float(row["diferencia"])
+            dif_abs = abs(dif_val)
 
+            sistema_html = fmt_money(sis_val, "COP").replace("$", "&#36;")
+            dif_html = fmt_money(dif_val, "COP").replace("$", "&#36;")
 
-# =============================================================================
-# 2b. FACTURAS VENCIDAS (no finalizadas pero el vehiculo ya fue devuelto)
-# =============================================================================
-# Alerta para los asesores: el contrato ya cerro (fecha_devolucion_real en pasado)
-# pero la factura sigue abierta. Probablemente se les olvido finalizarla.
-section("Facturas vencidas (vehiculo devuelto sin finalizar)")
+            sub_parts.append(f"TRM Banrep: {trm_val:,.2f}")
+            sub_parts.append(f"Sistema: {sistema_html}")
+            sub_parts.append(f"Diferencia: {dif_html}")
 
-vencidas_sql = f"""
-    SELECT i.invoice_id, i.rntl_mvnr, i.sede_nombre, i.fecha_emision,
-           i.numero_factura, i.numero_recibo, i.monto_total,
-           r.fecha_handover_real::date AS fecha_entrega,
-           r.fecha_devolucion_real::date AS fecha_devolucion,
-           (CURRENT_DATE - r.fecha_devolucion_real::date) AS dias_vencida,
-           i.capturado_por
-    FROM operational.invoices i
-    INNER JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
-    WHERE i.finalizada = FALSE
-      AND r.fecha_devolucion_real IS NOT NULL
-      AND r.fecha_devolucion_real::date < CURRENT_DATE
-      {sede_where}
-    ORDER BY r.fecha_devolucion_real::date ASC
-"""
-df_vencidas = load_query(vencidas_sql, sede_params if sede_params else {})
+            if dif_abs <= VALIDATION_TOLERANCE_COP:
+                sub_parts.append(
+                    "<span style='color:#2e7d32;font-weight:bold;'>Cuadra</span>"
+                )
+            else:
+                color = "#d32f2f" if dif_abs > 5000 else "#f57c00"
+                sub_parts.append(
+                    f"<span style='color:{color};font-weight:bold;'>"
+                    f"Sobre tolerancia</span>"
+                )
+        else:
+            # No hay info para validar (probablemente sin TRM por feriado/etc)
+            sub_parts.append(
+                "<span style='color:#999;'>Sin datos suficientes para validar</span>"
+            )
 
-if df_vencidas.empty:
-    st.success("No hay facturas vencidas. Todas las facturas abiertas corresponden a contratos aun activos.")
-else:
-    st.error(
-        f"{len(df_vencidas)} factura(s) abierta(s) cuyo vehiculo ya fue devuelto. "
-        f"Por favor finalicelas (boton 'Finalizar' en la seccion de facturas abiertas)."
-    )
-    vencidas_view = df_vencidas.copy()
-    vencidas_view["monto_total"] = vencidas_view["monto_total"].apply(
-        lambda v: fmt_money(v, "COP") if pd.notna(v) else "-")
-    vencidas_view = vencidas_view.rename(columns={
-        "invoice_id": "ID",
-        "rntl_mvnr": "Contrato",
-        "sede_nombre": "Sede",
-        "fecha_emision": "Fecha emision",
-        "numero_factura": "Numero factura",
-        "numero_recibo": "Numero recibo",
-        "monto_total": "Monto (COP)",
-        "fecha_entrega": "Entrega",
-        "fecha_devolucion": "Devolucion",
-        "dias_vencida": "Dias vencida",
-        "capturado_por": "Capturado por",
-    })
-    st.dataframe(vencidas_view, use_container_width=True, hide_index=True)
+        if es_vencida:
+            sub_parts.append(
+                "<span style='color:#d32f2f;font-weight:bold;'>Vencida</span>"
+            )
 
-
-st.markdown("---")
-
-
-# =============================================================================
-# 3. VALIDACION: facturas finalizadas vs silver (alarma si hay diferencia)
-# =============================================================================
-section("Validacion de facturas finalizadas")
-st.caption(
-    f"Compara el monto total registrado en la factura contra el total calculado "
-    f"por el sistema (charges x TRM Banrep). Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}. "
-    f"Facturas cuyo contrato aun no esta en silver (pendiente de refresh) se muestran aparte."
-)
-
-val_sql = f"""
-    SELECT i.invoice_id, i.rntl_mvnr, i.sede_nombre, i.fecha_emision,
-           i.monto_total AS factura_cop,
-           r.total_con_iva_usd AS total_usd,
-           t.trm_cop_per_usd AS trm_usada,
-           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
-                THEN ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
-                ELSE NULL END AS sistema_cop,
-           CASE WHEN r.numero_contrato IS NOT NULL AND t.trm_cop_per_usd IS NOT NULL
-                THEN i.monto_total - ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
-                ELSE NULL END AS diferencia,
-           CASE WHEN r.numero_contrato IS NULL THEN TRUE ELSE FALSE END AS pendiente_silver
-    FROM operational.invoices i
-    LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
-    LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
-    WHERE i.finalizada = TRUE {sede_where}
-    ORDER BY
-        CASE WHEN r.numero_contrato IS NULL THEN 0 ELSE 1 END,
-        ABS(COALESCE(i.monto_total - ROUND(COALESCE(r.total_con_iva_usd, 0)
-                     * COALESCE(t.trm_cop_per_usd, 0), 0), 0)) DESC
-"""
-df_val = load_query(val_sql, sede_params if sede_params else {})
-
-if df_val.empty:
-    st.info("No hay facturas finalizadas para validar.")
-else:
-    for col in ("factura_cop", "sistema_cop", "diferencia", "total_usd", "trm_usada"):
-        df_val[col] = pd.to_numeric(df_val[col], errors="coerce")
-
-    # Split into 3 groups:
-    # 1. Pending silver (contract not in system yet — pipeline hasn't run)
-    # 2. Mismatch (contract in silver, difference > tolerance)
-    # 3. OK (contract in silver, difference <= tolerance)
-    df_pending = df_val[df_val["pendiente_silver"] == True].copy()
-    df_validated = df_val[df_val["pendiente_silver"] == False].copy()
-    df_validated["diferencia"] = df_validated["diferencia"].fillna(0)
-    df_validated["sistema_cop"] = df_validated["sistema_cop"].fillna(0)
-    df_mismatch = df_validated[df_validated["diferencia"].abs() > VALIDATION_TOLERANCE_COP].copy()
-    df_ok = df_validated[df_validated["diferencia"].abs() <= VALIDATION_TOLERANCE_COP].copy()
-
-    # --- Pending: contract not in silver yet ---
-    if not df_pending.empty:
-        st.warning(
-            f"{len(df_pending)} facturas finalizadas cuyo contrato aun no esta en silver. "
-            f"Se validaran automaticamente despues del proximo refresh del pipeline."
+        st.markdown(
+            f"<div style='font-size:0.82rem;color:#666;margin-left:0.5rem;"
+            f"margin-top:-0.5rem;margin-bottom:0.4rem;'>"
+            f"{' · '.join(sub_parts)}"
+            f"</div>",
+            unsafe_allow_html=True,
         )
-        pending_view = df_pending[["invoice_id", "rntl_mvnr", "sede_nombre",
-                                    "fecha_emision", "factura_cop"]].copy()
-        pending_view["factura_cop"] = pending_view["factura_cop"].apply(
-            lambda v: fmt_money(v, "COP") if pd.notna(v) else "-")
-        pending_view = pending_view.rename(columns={
-            "invoice_id": "ID", "rntl_mvnr": "Contrato", "sede_nombre": "Sede",
-            "fecha_emision": "Fecha", "factura_cop": "Factura (COP)",
-        })
-        st.dataframe(pending_view, use_container_width=True, hide_index=True)
 
-    if not df_mismatch.empty:
-        st.error(f"{len(df_mismatch)} facturas con diferencia mayor a {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}:")
-        for _, row in df_mismatch.iterrows():
-            inv_id = int(row["invoice_id"])
-            contrato = int(row["rntl_mvnr"]) if pd.notna(row["rntl_mvnr"]) else "-"
-            dif = float(row["diferencia"])
-
-            # El signo $ activa el modo LaTeX de Streamlit (dos $ = math mode),
-            # lo que rompe el HTML intermedio. Lo escapamos como &#36; para que
-            # se muestre literal sin disparar KaTeX.
-            factura_html = fmt_money(row["factura_cop"], "COP").replace("$", "&#36;")
-            sistema_html = fmt_money(row["sistema_cop"], "COP").replace("$", "&#36;")
-            dif_html = fmt_money(dif, "COP").replace("$", "&#36;")
-
-            cols = st.columns([1, 2, 2, 2, 2, 1])
-            cols[0].write(f"**#{inv_id}**")
-            cols[1].write(f"Contrato: {contrato}")
-            cols[2].markdown(
-                f"<b>Factura:</b> {factura_html} &nbsp;|&nbsp; "
-                f"<b>Sistema:</b> {sistema_html}",
-                unsafe_allow_html=True,
-            )
-            color = "#d32f2f" if abs(dif) > 5000 else "#f57c00"
-            cols[3].markdown(
-                f"<span style='color:{color};font-weight:bold;'>"
-                f"Diferencia: {dif_html}</span>",
-                unsafe_allow_html=True,
-            )
-            cols[4].write(f"TRM: {row['trm_usada']:,.2f}")
-
-            if cols[5].button("Reabrir", key=f"reopen_{inv_id}"):
-                execute_write("""
-                    UPDATE operational.invoices
-                    SET finalizada = FALSE, finalizada_at = NULL, finalizada_por = NULL
-                    WHERE invoice_id = :id
-                """, {"id": inv_id})
-                st.warning(f"Factura #{inv_id} reabierta para correccion.")
-                load_query.clear()
-                st.rerun()
-
-    if not df_ok.empty:
-        st.success(f"{len(df_ok)} facturas finalizadas cuadran con el sistema.")
-        view = df_ok[["invoice_id", "rntl_mvnr", "sede_nombre", "fecha_emision",
-                       "factura_cop", "sistema_cop", "diferencia"]].copy()
-        view["factura_cop"] = view["factura_cop"].apply(lambda v: fmt_money(v, "COP"))
-        view["sistema_cop"] = view["sistema_cop"].apply(lambda v: fmt_money(v, "COP"))
-        view["diferencia"] = view["diferencia"].apply(lambda v: fmt_money(v, "COP"))
-        view = view.rename(columns={
-            "invoice_id": "ID", "rntl_mvnr": "Contrato", "sede_nombre": "Sede",
-            "fecha_emision": "Fecha", "factura_cop": "Factura (COP)",
-            "sistema_cop": "Sistema (COP)", "diferencia": "Diferencia",
-        })
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        # Separador entre facturas
+        st.markdown(
+            "<hr style='margin:0.3rem 0;border:none;border-top:1px solid #eee;'>",
+            unsafe_allow_html=True,
+        )
 
 
 st.markdown("---")
