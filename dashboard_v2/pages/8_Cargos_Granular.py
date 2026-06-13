@@ -90,12 +90,21 @@ if (hasta - desde).days > 90:
 # =============================================================================
 # Query: cargar todos los cargos del periodo
 # =============================================================================
-sede_clause = ""
+sede_clause_detail = ""
+sede_clause_resumen = ""
 params = {"desde": desde, "hasta": hasta}
 if sedes_sel:
-    sede_clause = "AND sede_handover = ANY(:sedes)"
+    sede_clause_detail = "AND sede_handover = ANY(:sedes)"
+    sede_clause_resumen = "AND sede_handover = ANY(:sedes)"
     params["sedes"] = list(sedes_sel)
 
+# Query 1: cargos individuales desde vw_rentals_detail
+# Filtros MATCH EXACTO con Cierre Diario:
+#   - fecha_handover_real::date BETWEEN
+#   - fuente_cargo = 'RENTAL_COUNTER'
+#   - rental_currency = 'USD'
+# NO filtramos por TRIM(placa)!='' porque Cierre Diario no lo hace
+# (incluye contratos shadow de status-match, que aportan $0 pero existen).
 charges_sql = f"""
     SELECT
         numero_contrato,
@@ -123,8 +132,7 @@ charges_sql = f"""
     WHERE fecha_handover_real::date BETWEEN :desde AND :hasta
       AND fuente_cargo = 'RENTAL_COUNTER'
       AND rental_currency = 'USD'
-      AND TRIM(COALESCE(placa, '')) != ''
-      {sede_clause}
+      {sede_clause_detail}
 """
 df = load_query(charges_sql, params)
 
@@ -138,27 +146,49 @@ num_cols = ["subtotal_usd", "subtotal_cop", "prepagado_usd",
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+# Query 2: totales (bruto, descuento, neto) desde vw_rentals_resumen
+# Estos son los MISMOS numeros que muestra Cierre Diario en sus KPIs.
+# Necesitamos descuento_usd/cop porque en detail solo tenemos subtotal (bruto).
+totales_sql = f"""
+    SELECT
+        COUNT(*)                                AS contratos,
+        COALESCE(SUM(bruto_usd), 0)             AS bruto_usd,
+        COALESCE(SUM(descuento_usd), 0)         AS descuento_usd,
+        COALESCE(SUM(neto_usd), 0)              AS neto_usd,
+        COALESCE(SUM(iva_usd), 0)               AS iva_usd,
+        COALESCE(SUM(total_con_iva_usd), 0)     AS total_con_iva_usd,
+        COALESCE(SUM(bruto_cop), 0)             AS bruto_cop,
+        COALESCE(SUM(descuento_cop), 0)         AS descuento_cop,
+        COALESCE(SUM(neto_cop), 0)              AS neto_cop,
+        COALESCE(SUM(iva_cop), 0)               AS iva_cop,
+        COALESCE(SUM(total_con_iva_cop), 0)     AS total_con_iva_cop
+    FROM vw_rentals_resumen
+    WHERE fecha_handover_real::date BETWEEN :desde AND :hasta
+      AND rental_currency = 'USD'
+      {sede_clause_resumen}
+"""
+df_tot = load_query(totales_sql, params)
+totales = df_tot.iloc[0]
+
 
 # =============================================================================
-# KPIs ejecutivos
+# KPIs ejecutivos (vienen de vw_rentals_resumen — mismos que Cierre Diario)
 # =============================================================================
 section("Resumen")
 
-total_contratos = df["numero_contrato"].nunique()
+contratos_resumen = int(totales["contratos"])
 total_cargos = len(df)
-total_neto_usd = df["subtotal_usd"].sum()
-total_neto_cop = df["subtotal_cop"].sum()
 
 k1, k2, k3, k4 = st.columns(4)
-kpi(k1, "Contratos", f"{total_contratos:,}")
+kpi(k1, "Contratos", f"{contratos_resumen:,}")
 kpi(k2, "Cargos individuales", f"{total_cargos:,}")
-kpi(k3, "Total neto USD", fmt_money(total_neto_usd, "USD"))
-kpi(k4, "Total neto COP", fmt_money(total_neto_cop, "COP"))
+kpi(k3, "Neto USD (=Cierre Diario)", fmt_money(float(totales["neto_usd"]), "USD"))
+kpi(k4, "Neto COP (=Cierre Diario)", fmt_money(float(totales["neto_cop"]), "COP"))
 
 st.caption(
     f"Periodo: {desde} → {hasta} ({(hasta - desde).days + 1} dias). "
-    f"Total neto NO incluye IVA (es la base imponible suma de cargos counter). "
-    f"Debe coincidir con la suma de Cierre Diario para el mismo periodo."
+    f"Contratos y Neto vienen de vw_rentals_resumen (mismo source que Cierre "
+    f"Diario). Neto = Bruto - Descuento, antes de IVA."
 )
 
 
@@ -189,9 +219,9 @@ bucket_summary = (
     .reset_index()
 )
 
-# Fila TOTAL al final
-total_row = pd.DataFrame([{
-    "bucket_cobra": "TOTAL",
+# Filas finales: SUBTOTAL BRUTO (cargos) + DESCUENTO + TOTAL NETO (=Cierre Diario)
+subtotal_row = pd.DataFrame([{
+    "bucket_cobra": "SUBTOTAL BRUTO (cargos)",
     "counter_usd": bucket_summary["counter_usd"].sum(),
     "prepagado_usd": bucket_summary["prepagado_usd"].sum(),
     "total_usd": bucket_summary["total_usd"].sum(),
@@ -199,7 +229,31 @@ total_row = pd.DataFrame([{
     "prepagado_cop": bucket_summary["prepagado_cop"].sum(),
     "total_cop": bucket_summary["total_cop"].sum(),
 }])
-bucket_summary = pd.concat([bucket_summary, total_row], ignore_index=True)
+
+descuento_row = pd.DataFrame([{
+    "bucket_cobra": "(-) DESCUENTO",
+    "counter_usd": 0.0,
+    "prepagado_usd": 0.0,
+    "total_usd": -float(totales["descuento_usd"]),
+    "counter_cop": 0.0,
+    "prepagado_cop": 0.0,
+    "total_cop": -float(totales["descuento_cop"]),
+}])
+
+neto_row = pd.DataFrame([{
+    "bucket_cobra": "TOTAL NETO (=Cierre Diario)",
+    "counter_usd": 0.0,
+    "prepagado_usd": 0.0,
+    "total_usd": float(totales["neto_usd"]),
+    "counter_cop": 0.0,
+    "prepagado_cop": 0.0,
+    "total_cop": float(totales["neto_cop"]),
+}])
+
+bucket_summary = pd.concat(
+    [bucket_summary, subtotal_row, descuento_row, neto_row],
+    ignore_index=True,
+)
 
 # Formato moneda
 view = bucket_summary.copy()
