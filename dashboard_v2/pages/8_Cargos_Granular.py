@@ -24,6 +24,21 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
+
+# Codigos de cargo que generan comision al asesor.
+# Solo aplica la porcion COUNTER de estos cargos (lo prepagado ya lo cobro
+# Sixt central y no genera comision local).
+#   AD = conductor adicional
+#   BF = full cover
+#   LD = LDW (Loss Damage Waiver)
+#   BS = ?
+#   UP = upgrade de categoria
+#   CS = child seat
+#   BC = road assistance
+#   PF = ? (posiblemente Protection Fee — aun no aparece, pero se incluye)
+#   SL = liability
+COMISIONABLES = ["AD", "BF", "LD", "BS", "UP", "CS", "BC", "PF", "SL"]
+
 from components.auth import require_auth, require_page, is_admin, logout_button
 from components.common import (
     inject_styles, render_header, section, kpi,
@@ -145,6 +160,9 @@ num_cols = ["subtotal_usd", "subtotal_cop", "prepagado_usd",
             "counter_usd", "prepagado_cop", "counter_cop"]
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+# Flag de comisionable: cargo cuyo counter aporta a la base de comision del asesor
+df["es_comisionable"] = df["codigo"].isin(COMISIONABLES)
 
 # Query 2: totales (bruto, descuento, neto) desde vw_rentals_resumen
 # Estos son los MISMOS numeros que muestra Cierre Diario en sus KPIs.
@@ -302,15 +320,28 @@ code_summary = (
     .sort_values(["bucket_cobra", "total_usd"], ascending=[True, False])
 )
 
+# Flag de comision al nivel de codigo
+code_summary["comision"] = code_summary["codigo"].apply(
+    lambda c: "Si" if c in COMISIONABLES else ""
+)
+
 view_codes = code_summary.copy()
 for c in ("counter_usd", "prepagado_usd", "total_usd"):
     view_codes[c] = view_codes[c].apply(lambda v: fmt_money(v, "USD"))
 for c in ("counter_cop", "prepagado_cop", "total_cop"):
     view_codes[c] = view_codes[c].apply(lambda v: fmt_money(v, "COP"))
 
+# Reordenar para poner "Comision" al lado de "Codigo"
+view_codes = view_codes[[
+    "bucket_cobra", "codigo", "comision", "descripcion", "contratos", "cargos",
+    "counter_usd", "prepagado_usd", "total_usd",
+    "counter_cop", "prepagado_cop", "total_cop",
+]]
+
 view_codes = view_codes.rename(columns={
     "bucket_cobra": "Bucket",
     "codigo": "Codigo",
+    "comision": "Comision?",
     "descripcion": "Descripcion",
     "contratos": "Contratos",
     "cargos": "Cargos",
@@ -322,6 +353,10 @@ view_codes = view_codes.rename(columns={
     "total_cop": "Total COP",
 })
 st.dataframe(view_codes, use_container_width=True, hide_index=True)
+st.caption(
+    f"Codigos que generan comision (counter solamente): "
+    f"{', '.join(COMISIONABLES)}"
+)
 
 
 st.markdown("---")
@@ -332,55 +367,98 @@ st.markdown("---")
 # =============================================================================
 section("Ventas por asesor (codigo handover) — base de comisiones")
 st.caption(
-    "Solo cuenta lo cobrado en COUNTER (las comisiones no aplican a prepagado "
-    "porque el cobro lo hace Sixt central, no el asesor). "
-    "Usa fecha de entrega (handover) del vehiculo, no fecha de devolucion. "
-    "El codigo de asesor corresponde a operador_handover_codigo en silver — "
+    "Base comisionable = SUMA del counter SOLO para codigos comisionables "
+    f"({', '.join(COMISIONABLES)}). "
+    "El resto del counter (tarifa T, location Y, otros adicionales) NO genera "
+    "comision para el asesor. "
+    "Usa fecha de entrega (handover) del vehiculo. "
+    "El codigo asesor corresponde a operador_handover_codigo en silver — "
     "proximamente se mapeara a nombre con una tabla de asesores."
+)
+
+# Calcular counter del cargo SOLO si es comisionable, sino 0
+df["counter_comisionable_usd"] = df.apply(
+    lambda r: r["counter_usd"] if r["es_comisionable"] else 0.0,
+    axis=1,
+)
+df["counter_comisionable_cop"] = df.apply(
+    lambda r: r["counter_cop"] if r["es_comisionable"] else 0.0,
+    axis=1,
 )
 
 asesor_summary = (
     df.groupby("asesor_codigo", dropna=False)
     .agg(
         contratos=("numero_contrato", "nunique"),
-        cargos_counter=("counter_usd",
-                        lambda x: int((x > 0).sum())),
-        counter_usd=("counter_usd", "sum"),
-        counter_cop=("counter_cop", "sum"),
+        cargos_counter=("counter_usd", lambda x: int((x > 0).sum())),
+        # Comisionables (lo que realmente genera comision)
+        base_comisionable_usd=("counter_comisionable_usd", "sum"),
+        base_comisionable_cop=("counter_comisionable_cop", "sum"),
+        # Counter total (info — para ver cuanto del total counter es comisionable)
+        counter_total_usd=("counter_usd", "sum"),
+        counter_total_cop=("counter_cop", "sum"),
+        # Atendido total (info)
         total_usd_atendido=("subtotal_usd", "sum"),
         total_cop_atendido=("subtotal_cop", "sum"),
     )
     .reset_index()
-    .sort_values("counter_usd", ascending=False)
+    .sort_values("base_comisionable_usd", ascending=False)
 )
 
-# Asesor "null" / sin codigo: ponemos string vacio
-asesor_summary["asesor_codigo"] = asesor_summary["asesor_codigo"].fillna("(sin codigo)").astype(str)
+# % comisionable del counter total
+asesor_summary["pct_comisionable"] = (
+    asesor_summary["base_comisionable_usd"]
+    / asesor_summary["counter_total_usd"].replace(0, pd.NA) * 100
+).round(1)
+
+# Asesor "null" / sin codigo: ponemos string visible
+asesor_summary["asesor_codigo"] = (
+    asesor_summary["asesor_codigo"].fillna("(sin codigo)").astype(str)
+)
 
 view_asesor = asesor_summary.copy()
-for c in ("counter_usd", "total_usd_atendido"):
+for c in ("base_comisionable_usd", "counter_total_usd", "total_usd_atendido"):
     view_asesor[c] = view_asesor[c].apply(lambda v: fmt_money(v, "USD"))
-for c in ("counter_cop", "total_cop_atendido"):
+for c in ("base_comisionable_cop", "counter_total_cop", "total_cop_atendido"):
     view_asesor[c] = view_asesor[c].apply(lambda v: fmt_money(v, "COP"))
+view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
+    lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
+)
+
+# Reordenar: lo mas importante (base comisionable) primero
+view_asesor = view_asesor[[
+    "asesor_codigo", "contratos", "cargos_counter",
+    "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
+    "counter_total_usd", "counter_total_cop",
+    "total_usd_atendido", "total_cop_atendido",
+]]
 
 view_asesor = view_asesor.rename(columns={
     "asesor_codigo": "Codigo asesor",
-    "contratos": "Contratos atendidos",
-    "cargos_counter": "Cargos con counter",
-    "counter_usd": "Counter USD (comisionable)",
-    "counter_cop": "Counter COP (comisionable)",
-    "total_usd_atendido": "Total USD atendido (info)",
-    "total_cop_atendido": "Total COP atendido (info)",
+    "contratos": "Contratos",
+    "cargos_counter": "Cargos counter",
+    "base_comisionable_usd": "BASE COMISIONABLE USD",
+    "base_comisionable_cop": "BASE COMISIONABLE COP",
+    "pct_comisionable": "% comisionable",
+    "counter_total_usd": "Counter total USD",
+    "counter_total_cop": "Counter total COP",
+    "total_usd_atendido": "Total USD atendido",
+    "total_cop_atendido": "Total COP atendido",
 })
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 
 # Totales para sanity check
-total_counter_usd = asesor_summary["counter_usd"].sum()
-total_counter_cop = asesor_summary["counter_cop"].sum()
+total_comisionable_usd = asesor_summary["base_comisionable_usd"].sum()
+total_comisionable_cop = asesor_summary["base_comisionable_cop"].sum()
+total_counter_usd = asesor_summary["counter_total_usd"].sum()
+total_counter_cop = asesor_summary["counter_total_cop"].sum()
+
 st.caption(
-    f"Total counter (suma de todos los asesores): "
-    f"{fmt_money(total_counter_usd, 'USD')} / {fmt_money(total_counter_cop, 'COP')}. "
-    f"Debe coincidir con la columna 'Counter' de la fila TOTAL del bucket COBRA arriba."
+    f"Total base comisionable (suma de todos los asesores): "
+    f"**{fmt_money(total_comisionable_usd, 'USD')}** / "
+    f"**{fmt_money(total_comisionable_cop, 'COP')}**. "
+    f"Total counter (todos los codigos): {fmt_money(total_counter_usd, 'USD')} / "
+    f"{fmt_money(total_counter_cop, 'COP')}."
 )
 
 
