@@ -197,61 +197,114 @@ if submitted:
     elif not rntl_mvnr.strip().isdigit():
         st.error("El numero de contrato debe ser solo digitos.")
     else:
-        params = {
-            "rntl_mvnr": int(rntl_mvnr.strip()),
-            "sede_codigo": int(sede_map.get(sede_nombre, 0)),
-            "sede_nombre": sede_nombre,
-            "fecha_emision": fecha_emision,
-            "moneda": "COP",
-            "numero_factura": numero_factura.strip() or None,
-            "numero_recibo": numero_recibo.strip() or None,
-            "monto_base": monto_base,
-            "iva": iva,
-            "monto_total": monto_total,
-            "monto_prepagado": monto_prepagado,
-            "monto_counter": monto_counter,
-            "prepaid": prepaid,
-            "observaciones": observaciones.strip() or None,
-            "capturado_por": username,
-        }
-        try:
-            if editing:
-                params["invoice_id"] = st.session_state["_editing_id"]
-                execute_write("""
-                    UPDATE operational.invoices SET
-                        rntl_mvnr = :rntl_mvnr, sede_codigo = :sede_codigo,
-                        sede_nombre = :sede_nombre, fecha_emision = :fecha_emision,
-                        moneda = :moneda, numero_factura = :numero_factura,
-                        numero_recibo = :numero_recibo, monto_base = :monto_base,
-                        iva = :iva, monto_total = :monto_total,
-                        monto_prepagado = :monto_prepagado, monto_counter = :monto_counter,
-                        prepaid = :prepaid, observaciones = :observaciones,
-                        capturado_por = :capturado_por
-                    WHERE invoice_id = :invoice_id
-                """, params)
-                st.success(f"Factura #{params['invoice_id']} actualizada.")
-                st.session_state["_editing_id"] = None
-                st.session_state["_editing_data"] = {}
+        contrato_int = int(rntl_mvnr.strip())
+
+        # Pre-flight: regla 1:1 contrato -> factura. Solo aplica al crear.
+        # Check global (sin filtro de sede) porque rntl_mvnr es global en Sixt:
+        # un contrato facturado en sede A no se puede re-facturar en sede B.
+        existing_dup = None
+        if not editing:
+            existing = load_query(
+                "SELECT invoice_id, sede_nombre, finalizada "
+                "FROM operational.invoices "
+                "WHERE rntl_mvnr = :c ORDER BY invoice_id",
+                {"c": contrato_int},
+            )
+            if not existing.empty:
+                existing_dup = existing
+
+        if existing_dup is not None:
+            if user_is_admin or "*" in user_branches:
+                # Admin ve detalle completo (IDs, sede, status) para decidir.
+                ids_list = ", ".join(
+                    f"#{int(r['invoice_id'])} "
+                    f"({'cerrada' if r['finalizada'] else 'abierta'}, "
+                    f"sede {r['sede_nombre']})"
+                    for _, r in existing_dup.iterrows()
+                )
+                st.error(
+                    f"Ya existe factura(s) para el contrato {contrato_int}: "
+                    f"{ids_list}. Edita la existente o eliminala con el "
+                    f"widget de admin abajo. No se permiten duplicados (1 factura = 1 contrato)."
+                )
             else:
-                execute_write("""
-                    INSERT INTO operational.invoices
-                      (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
-                       numero_factura, numero_recibo, monto_base, iva, monto_total,
-                       monto_prepagado, monto_counter, prepaid, observaciones, capturado_por)
-                    VALUES
-                      (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
-                       :numero_factura, :numero_recibo, :monto_base, :iva, :monto_total,
-                       :monto_prepagado, :monto_counter, :prepaid, :observaciones, :capturado_por)
-                """, params)
-                tag = "prepagada" if prepaid else "no prepagada"
-                st.success(f"Factura guardada — {sede_nombre} — contrato {rntl_mvnr} — "
-                           f"{fmt_money(monto_total, 'COP')} ({tag}).")
-                # Limpia el prefill del recordatorio para que el campo no
-                # reaparezca con el contrato ya facturado en el proximo render.
-                st.session_state.pop("_prefill_contrato", None)
-            load_query.clear()
-        except Exception as e:
-            st.error(f"Error guardando: {e}")
+                # Sede user: no revelar sede de la factura existente si es de otra sede.
+                own_invoices = existing_dup[
+                    existing_dup["sede_nombre"] == user_branches[0]
+                ]
+                if not own_invoices.empty:
+                    ids_list = ", ".join(
+                        f"#{int(r['invoice_id'])} "
+                        f"({'cerrada' if r['finalizada'] else 'abierta'})"
+                        for _, r in own_invoices.iterrows()
+                    )
+                    st.error(
+                        f"Ya existe factura para el contrato {contrato_int}: "
+                        f"{ids_list}. Edita la existente abajo. "
+                        f"No se permiten duplicados."
+                    )
+                else:
+                    st.error(
+                        f"Ya existe factura para el contrato {contrato_int} "
+                        f"en otra sede. Si crees que es un error, contacta al admin. "
+                        f"No se permiten duplicados."
+                    )
+        else:
+            params = {
+                "rntl_mvnr": contrato_int,
+                "sede_codigo": int(sede_map.get(sede_nombre, 0)),
+                "sede_nombre": sede_nombre,
+                "fecha_emision": fecha_emision,
+                "moneda": "COP",
+                "numero_factura": numero_factura.strip() or None,
+                "numero_recibo": numero_recibo.strip() or None,
+                "monto_base": monto_base,
+                "iva": iva,
+                "monto_total": monto_total,
+                "monto_prepagado": monto_prepagado,
+                "monto_counter": monto_counter,
+                "prepaid": prepaid,
+                "observaciones": observaciones.strip() or None,
+                "capturado_por": username,
+            }
+            try:
+                if editing:
+                    params["invoice_id"] = st.session_state["_editing_id"]
+                    execute_write("""
+                        UPDATE operational.invoices SET
+                            rntl_mvnr = :rntl_mvnr, sede_codigo = :sede_codigo,
+                            sede_nombre = :sede_nombre, fecha_emision = :fecha_emision,
+                            moneda = :moneda, numero_factura = :numero_factura,
+                            numero_recibo = :numero_recibo, monto_base = :monto_base,
+                            iva = :iva, monto_total = :monto_total,
+                            monto_prepagado = :monto_prepagado, monto_counter = :monto_counter,
+                            prepaid = :prepaid, observaciones = :observaciones,
+                            capturado_por = :capturado_por
+                        WHERE invoice_id = :invoice_id
+                    """, params)
+                    st.success(f"Factura #{params['invoice_id']} actualizada.")
+                    st.session_state["_editing_id"] = None
+                    st.session_state["_editing_data"] = {}
+                else:
+                    execute_write("""
+                        INSERT INTO operational.invoices
+                          (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
+                           numero_factura, numero_recibo, monto_base, iva, monto_total,
+                           monto_prepagado, monto_counter, prepaid, observaciones, capturado_por)
+                        VALUES
+                          (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
+                           :numero_factura, :numero_recibo, :monto_base, :iva, :monto_total,
+                           :monto_prepagado, :monto_counter, :prepaid, :observaciones, :capturado_por)
+                    """, params)
+                    tag = "prepagada" if prepaid else "no prepagada"
+                    st.success(f"Factura guardada — {sede_nombre} — contrato {rntl_mvnr} — "
+                               f"{fmt_money(monto_total, 'COP')} ({tag}).")
+                    # Limpia el prefill del recordatorio para que el campo no
+                    # reaparezca con el contrato ya facturado en el proximo render.
+                    st.session_state.pop("_prefill_contrato", None)
+                load_query.clear()
+            except Exception as e:
+                st.error(f"Error guardando: {e}")
 
 
 st.markdown("---")
@@ -274,6 +327,13 @@ st.caption(
 )
 
 open_sql = f"""
+    WITH dups AS (
+        SELECT i.rntl_mvnr, ARRAY_AGG(i.invoice_id ORDER BY i.invoice_id) AS all_ids
+        FROM operational.invoices i
+        WHERE TRUE {sede_where}
+        GROUP BY i.rntl_mvnr
+        HAVING COUNT(*) > 1
+    )
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter,
@@ -289,10 +349,12 @@ open_sql = f"""
                 THEN i.monto_total - ROUND(r.total_con_iva_usd * t.trm_cop_per_usd, 0)
                 ELSE NULL END             AS diferencia,
            CASE WHEN r.numero_contrato IS NULL THEN TRUE ELSE FALSE END
-                                          AS pendiente_silver
+                                          AS pendiente_silver,
+           d.all_ids                      AS dup_all_ids
     FROM operational.invoices i
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
+    LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
     WHERE i.finalizada = FALSE {sede_where}
     ORDER BY r.fecha_handover_real DESC NULLS LAST, i.capturado_at DESC
 """
@@ -422,6 +484,18 @@ else:
                 "<span style='color:#d32f2f;font-weight:bold;'>Vencida</span>"
             )
 
+        # Indicador de duplicado: si este contrato tiene otras facturas en
+        # operational.invoices, mostrar IDs de las hermanas (regla 1:1 violada).
+        dup_all = row.get("dup_all_ids")
+        if isinstance(dup_all, (list, tuple)):
+            others = [int(x) for x in dup_all if int(x) != inv_id]
+            if others:
+                others_str = ", ".join(f"#{i}" for i in others)
+                sub_parts.append(
+                    f"<span style='color:#d32f2f;font-weight:bold;'>"
+                    f"DUPLICADO con {others_str}</span>"
+                )
+
         st.markdown(
             f"<div style='font-size:0.82rem;color:#666;margin-left:0.5rem;"
             f"margin-top:-0.5rem;margin-bottom:0.4rem;'>"
@@ -452,7 +526,16 @@ st.caption(
 # JOIN a silver + dim_trm_diaria para validar contra TRM oficial.
 # TRM usada se deduce: si monto_cop = usd * trm, entonces trm_usada = monto_cop / usd.
 # Esto permite ver si el asesor uso una TRM distinta (vieja, redondeada, etc.).
+# CTE `dups`: detecta contratos con >1 factura (regla 1:1 violada).
+# Filtrado por sede_where para que sede users solo vean duplicados de su sede.
 fin_sql = f"""
+    WITH dups AS (
+        SELECT i.rntl_mvnr, ARRAY_AGG(i.invoice_id ORDER BY i.invoice_id) AS all_ids
+        FROM operational.invoices i
+        WHERE TRUE {sede_where}
+        GROUP BY i.rntl_mvnr
+        HAVING COUNT(*) > 1
+    )
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
@@ -468,10 +551,12 @@ fin_sql = f"""
                 ELSE NULL END           AS diferencia,
            CASE WHEN r.total_con_iva_usd IS NOT NULL AND r.total_con_iva_usd > 0
                 THEN ROUND((i.monto_total / r.total_con_iva_usd)::numeric, 2)
-                ELSE NULL END           AS trm_usada_calculada
+                ELSE NULL END           AS trm_usada_calculada,
+           d.all_ids                    AS dup_all_ids
     FROM operational.invoices i
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
+    LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
     WHERE i.finalizada = TRUE {sede_where}
     ORDER BY i.finalizada_at DESC
     LIMIT 50
@@ -483,9 +568,31 @@ else:
     # Diferencia entre TRM usada y TRM oficial (cuanto se desvio el asesor)
     df_fin["diff_trm"] = df_fin["trm_usada_calculada"] - df_fin["trm_oficial"]
 
+    # Duplicados: dup_all_ids viene como lista (o None si no hay duplicados).
+    # Mostramos las OTRAS facturas que comparten contrato (excluyendo self).
+    def _fmt_dups(all_ids, self_id):
+        if not isinstance(all_ids, (list, tuple)):
+            return "-"
+        others = [int(x) for x in all_ids if int(x) != int(self_id)]
+        if not others:
+            return "-"
+        return "Dup con " + ", ".join(f"#{i}" for i in others)
+
+    df_fin["duplicados"] = df_fin.apply(
+        lambda r: _fmt_dups(r.get("dup_all_ids"), r["invoice_id"]), axis=1
+    )
+
+    n_dups = int((df_fin["duplicados"] != "-").sum())
+    if n_dups > 0:
+        st.warning(
+            f"Se detectaron {n_dups} factura(s) duplicada(s) — mismo contrato "
+            f"con multiples facturas. Revisar columna 'Duplicados' y eliminar "
+            f"las que sobran (regla 1:1)."
+        )
+
     # Vista formateada
     view = df_fin[[
-        "invoice_id", "fecha_emision", "sede_nombre", "rntl_mvnr",
+        "invoice_id", "fecha_emision", "sede_nombre", "rntl_mvnr", "duplicados",
         "numero_factura", "numero_recibo",
         "fecha_entrega",
         "monto_total", "sistema_cop", "diferencia",
@@ -513,6 +620,7 @@ else:
         "fecha_emision": "Fecha emision",
         "sede_nombre": "Sede",
         "rntl_mvnr": "Contrato",
+        "duplicados": "Duplicados",
         "numero_factura": "Num factura",
         "numero_recibo": "Num recibo",
         "fecha_entrega": "Entrega",
@@ -587,6 +695,60 @@ else:
                         st.success(
                             f"Factura #{reopen_id} reabierta "
                             f"(contrato {int(row['rntl_mvnr'])}, sede {row['sede_nombre']})."
+                        )
+                        load_query.clear()
+                        st.rerun()
+
+        # -----------------------------------------------------------------
+        # ADMIN ONLY: Eliminar permanentemente una factura por ID
+        # -----------------------------------------------------------------
+        # Para borrar duplicados o facturas creadas por error (typos, tests).
+        # Accion irreversible — requiere confirmacion explicita.
+        st.markdown("##### Eliminar factura (admin)")
+        st.caption(
+            "Elimina PERMANENTEMENTE una factura por ID. No se puede deshacer. "
+            "Usar para duplicados o facturas creadas por error."
+        )
+        del_cols = st.columns([2, 2, 1])
+        delete_id_str = del_cols[0].text_input(
+            "ID de factura a eliminar",
+            key="_admin_delete_id",
+            placeholder="ej. 116",
+        )
+        delete_confirm = del_cols[1].checkbox(
+            "Confirmo que quiero eliminarla (irreversible)",
+            key="_admin_delete_confirm",
+        )
+        if del_cols[2].button("Eliminar", key="_admin_delete_btn", type="primary"):
+            try:
+                delete_id = int(delete_id_str.strip())
+            except (ValueError, AttributeError):
+                st.error("Ingresa un ID valido (numero entero).")
+            else:
+                if not delete_confirm:
+                    st.error("Marca la casilla de confirmacion antes de eliminar.")
+                else:
+                    check = load_query(
+                        "SELECT invoice_id, rntl_mvnr, sede_nombre, monto_total, "
+                        "       finalizada "
+                        "FROM operational.invoices WHERE invoice_id = :id",
+                        {"id": delete_id},
+                    )
+                    if check.empty:
+                        st.error(f"No existe factura con ID {delete_id}.")
+                    else:
+                        row = check.iloc[0]
+                        execute_write(
+                            "DELETE FROM operational.invoices WHERE invoice_id = :id",
+                            {"id": delete_id},
+                        )
+                        status_tag = "cerrada" if bool(row["finalizada"]) else "abierta"
+                        st.success(
+                            f"Factura #{delete_id} ELIMINADA "
+                            f"(contrato {int(row['rntl_mvnr'])}, "
+                            f"sede {row['sede_nombre']}, "
+                            f"monto {fmt_money(float(row['monto_total']), 'COP')}, "
+                            f"estaba {status_tag})."
                         )
                         load_query.clear()
                         st.rerun()
