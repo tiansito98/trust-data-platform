@@ -38,6 +38,11 @@ SOURCE_LABEL = f"datos.gov.co/resource/{DATASET_ID}"
 HISTORY_START = "2024-01-01"
 PAGE_SIZE = 1000
 HTTP_TIMEOUT = 30
+# Retry config para errores transitorios de datos.gov.co (503, network blips, etc.)
+# Banrep tiende a tener hiccups exactamente a la hora de publicacion (~18-19 COT)
+# por congestion. 5 intentos con 60 seg de espera = ~5 min max si todo falla.
+HTTP_MAX_RETRIES = 5
+HTTP_RETRY_BACKOFF = 60
 
 LOG_FILE = log_path("external_trm")
 
@@ -49,6 +54,12 @@ def log(msg: str):
 
 
 def fetch_page(where_clause: str, offset: int) -> list[dict]:
+    """Pide una pagina al API de datos.gov.co con retry para errores transitorios.
+
+    Reintenta hasta HTTP_MAX_RETRIES veces (espera HTTP_RETRY_BACKOFF seg entre
+    intentos) si el servidor devuelve 5xx o hay error de red. Esto cubre el
+    caso comun de Banrep colgado a la hora pico de publicacion (~18-19 COT).
+    """
     params = {
         "$where": where_clause,
         "$order": "vigenciadesde ASC",
@@ -56,8 +67,34 @@ def fetch_page(where_clause: str, offset: int) -> list[dict]:
         "$offset": offset,
     }
     url = f"{BASE_URL}?{urllib.parse.urlencode(params)}"
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
-        return json.load(r)
+
+    last_err: Exception | None = None
+    for attempt in range(1, HTTP_MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            # Solo reintenta errores transitorios (5xx). 4xx (404, 401, etc.)
+            # son problemas de configuracion, no se arreglan reintentando.
+            if 500 <= e.code < 600 and attempt < HTTP_MAX_RETRIES:
+                log(f"   HTTP {e.code} - intento {attempt}/{HTTP_MAX_RETRIES}, "
+                    f"reintento en {HTTP_RETRY_BACKOFF}s...")
+                time.sleep(HTTP_RETRY_BACKOFF)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            if attempt < HTTP_MAX_RETRIES:
+                log(f"   Error de red ({type(e).__name__}) - "
+                    f"intento {attempt}/{HTTP_MAX_RETRIES}, "
+                    f"reintento en {HTTP_RETRY_BACKOFF}s...")
+                time.sleep(HTTP_RETRY_BACKOFF)
+                continue
+            raise
+
+    # Si llegamos aqui es que todos los reintentos fallaron
+    raise last_err if last_err else RuntimeError("fetch_page failed sin error")
 
 
 def fetch_all(where_clause: str) -> list[dict]:
