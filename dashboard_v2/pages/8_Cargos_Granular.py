@@ -162,6 +162,18 @@ num_cols = ["subtotal_usd", "subtotal_cop", "prepagado_usd",
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+# Limpieza del split prepay/counter en COP.
+# Silver (vw_rentals_detail) tiene un bug: para algunos cargos prepagados,
+# counter_cargo_cop reporta el subtotal_cop completo aunque counter_cargo_usd=0.
+# Tambien hay ruido de TRM rounding (counter_cop ±$500 con counter_usd=0).
+# USD tiene precision de cents y es source of truth: si counter_usd ~= 0,
+# entonces counter_cop debe ser 0 y el monto va a prepagado.
+_noise_mask = df["counter_usd"].abs() < 0.01
+df.loc[_noise_mask, "prepagado_cop"] = df.loc[_noise_mask, "subtotal_cop"]
+df.loc[_noise_mask, "prepagado_usd"] = df.loc[_noise_mask, "subtotal_usd"]
+df.loc[_noise_mask, "counter_cop"] = 0.0
+df.loc[_noise_mask, "counter_usd"] = 0.0
+
 # Flag de comisionable: cargo cuyo counter aporta a la base de comision del asesor
 df["es_comisionable"] = df["codigo"].isin(COMISIONABLES)
 
