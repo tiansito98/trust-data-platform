@@ -377,14 +377,57 @@ def xlsx_download_button(
         key: key unica para el boton (necesaria si hay multiples en la pagina).
     """
     import io
+    import datetime as _dt
+    import math
+    from decimal import Decimal
 
     if df is None or len(df) == 0:
         st.caption("Sin datos para exportar.")
         return
 
+    # Sanitize df: openpyxl no acepta tz-aware datetimes, listas, dicts,
+    # Decimal NaN/Inf, ni floats inf. Limpiamos columna por columna.
+    safe = df.copy()
+    for col in safe.columns:
+        s = safe[col]
+
+        # tz-aware datetimes: openpyxl no los soporta. Convertir a naive.
+        if hasattr(s, "dt"):
+            try:
+                if getattr(s.dt, "tz", None) is not None:
+                    safe[col] = s.dt.tz_localize(None)
+                    continue
+            except (AttributeError, TypeError):
+                pass
+
+        if s.dtype != object:
+            continue
+
+        # Object dtype: puede tener listas, dicts, Decimals raros, etc.
+        def _clean_cell(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple, set)):
+                return ", ".join(str(x) for x in v) if v else None
+            if isinstance(v, dict):
+                return str(v)
+            if isinstance(v, Decimal):
+                if v.is_nan() or v.is_infinite():
+                    return None
+                return v
+            if isinstance(v, float):
+                if math.isnan(v) or math.isinf(v):
+                    return None
+                return v
+            if isinstance(v, _dt.datetime) and v.tzinfo is not None:
+                return v.replace(tzinfo=None)
+            return v
+
+        safe[col] = s.map(_clean_cell)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])  # Excel: max 31 chars
+        safe.to_excel(writer, index=False, sheet_name=sheet_name[:31])  # Excel: max 31 chars
     buf.seek(0)
 
     st.download_button(
