@@ -419,23 +419,19 @@ asesor_summary = (
         # Comisionables (lo que realmente genera comision)
         base_comisionable_usd=("counter_comisionable_usd", "sum"),
         base_comisionable_cop=("counter_comisionable_cop", "sum"),
-        # Counter total (info — para ver cuanto del total counter es comisionable)
-        counter_total_usd=("counter_usd", "sum"),
-        counter_total_cop=("counter_cop", "sum"),
-        # Atendido total (info)
-        total_usd_atendido=("subtotal_usd", "sum"),
-        total_cop_atendido=("subtotal_cop", "sum"),
+        # Counter total se usa internamente para % comisionable, no se muestra
+        _counter_total_usd=("counter_usd", "sum"),
     )
     .reset_index()
     .sort_values("base_comisionable_usd", ascending=False)
 )
 
-# % comisionable del counter total.
+# % comisionable = base comisionable / counter total (interno, no mostrado).
 # Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
 # y Decimal / pd.NA * 100 queda dtype object → .round(1) falla en pandas/3.14.
 # .where(cond) mantiene float64 (NaN donde counter=0, no pd.NA).
 _base_f = pd.to_numeric(asesor_summary["base_comisionable_usd"], errors="coerce")
-_cnt_f = pd.to_numeric(asesor_summary["counter_total_usd"], errors="coerce")
+_cnt_f = pd.to_numeric(asesor_summary["_counter_total_usd"], errors="coerce")
 asesor_summary["pct_comisionable"] = (
     (_base_f / _cnt_f.where(_cnt_f != 0)) * 100
 ).round(1)
@@ -446,20 +442,20 @@ asesor_summary["asesor_codigo"] = (
 )
 
 view_asesor = asesor_summary.copy()
-for c in ("base_comisionable_usd", "counter_total_usd", "total_usd_atendido"):
-    view_asesor[c] = view_asesor[c].apply(lambda v: fmt_money(v, "USD"))
-for c in ("base_comisionable_cop", "counter_total_cop", "total_cop_atendido"):
-    view_asesor[c] = view_asesor[c].apply(lambda v: fmt_money(v, "COP"))
+view_asesor["base_comisionable_usd"] = view_asesor["base_comisionable_usd"].apply(
+    lambda v: fmt_money(v, "USD")
+)
+view_asesor["base_comisionable_cop"] = view_asesor["base_comisionable_cop"].apply(
+    lambda v: fmt_money(v, "COP")
+)
 view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
     lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
 )
 
-# Reordenar: lo mas importante (base comisionable) primero
+# Solo mostramos columnas relevantes para comisiones
 view_asesor = view_asesor[[
     "asesor_codigo", "contratos", "cargos_counter",
     "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
-    "counter_total_usd", "counter_total_cop",
-    "total_usd_atendido", "total_cop_atendido",
 ]]
 
 view_asesor = view_asesor.rename(columns={
@@ -469,31 +465,26 @@ view_asesor = view_asesor.rename(columns={
     "base_comisionable_usd": "BASE COMISIONABLE USD",
     "base_comisionable_cop": "BASE COMISIONABLE COP",
     "pct_comisionable": "% comisionable",
-    "counter_total_usd": "Counter total USD",
-    "counter_total_cop": "Counter total COP",
-    "total_usd_atendido": "Total USD atendido",
-    "total_cop_atendido": "Total COP atendido",
 })
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 xlsx_download_button(
-    asesor_summary,
+    asesor_summary[[
+        "asesor_codigo", "contratos", "cargos_counter",
+        "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
+    ]],
     file_name=f"cargos_granular_asesor_{dt.date.today()}",
     sheet_name="Por asesor",
     key="xlsx_cargos_asesor",
 )
 
-# Totales para sanity check
+# Total base comisionable (suma de todos los asesores) — sanity check
 total_comisionable_usd = asesor_summary["base_comisionable_usd"].sum()
 total_comisionable_cop = asesor_summary["base_comisionable_cop"].sum()
-total_counter_usd = asesor_summary["counter_total_usd"].sum()
-total_counter_cop = asesor_summary["counter_total_cop"].sum()
 
 st.caption(
     f"Total base comisionable (suma de todos los asesores): "
     f"**{fmt_money(total_comisionable_usd, 'USD')}** / "
-    f"**{fmt_money(total_comisionable_cop, 'COP')}**. "
-    f"Total counter (todos los codigos): {fmt_money(total_counter_usd, 'USD')} / "
-    f"{fmt_money(total_counter_cop, 'COP')}."
+    f"**{fmt_money(total_comisionable_cop, 'COP')}**."
 )
 
 
