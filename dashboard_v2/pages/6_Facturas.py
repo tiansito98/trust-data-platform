@@ -26,7 +26,7 @@ from components.auth import (
 )
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
-    fmt_money, render_trm_today_sidebar,
+    fmt_money, render_trm_today_sidebar, xlsx_download_button,
 )
 
 IVA_PORCENTAJE = 19.0
@@ -639,6 +639,12 @@ else:
         f"Mostrando ultimas {len(view)} facturas finalizadas. "
         f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
         f"negativo = uso una mas baja."
+    )
+    xlsx_download_button(
+        df_fin,
+        file_name=f"facturas_finalizadas_{dt.date.today()}",
+        sheet_name="Finalizadas",
+        key="xlsx_facturas_finalizadas",
     )
 
     # -----------------------------------------------------------------

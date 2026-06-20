@@ -15,13 +15,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import datetime as dt
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from components.common import (
     inject_styles, render_header, section, kpi, fmt_money, fmt_money_short,
-    fmt_int, load_query, apply_trm,
+    fmt_int, load_query, apply_trm, xlsx_download_button,
     PLOTLY_LAYOUT, SIXT_ORANGE, SIXT_BLACK,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
@@ -157,6 +159,12 @@ else:
             "pct_adic": "% Adic",
         })
         st.dataframe(view, use_container_width=True, hide_index=True)
+        xlsx_download_button(
+            df_sede,
+            file_name=f"ingresos_sede_{dt.date.today()}",
+            sheet_name="Por sede",
+            key="xlsx_ingresos_sede",
+        )
 
 
 # =============================================================================
@@ -232,6 +240,12 @@ if not df_det.empty:
             "monto": f"Revenue ({cur})",
         })
         st.dataframe(view, use_container_width=True, hide_index=True)
+        xlsx_download_button(
+            df_cat,
+            file_name=f"ingresos_categoria_{dt.date.today()}",
+            sheet_name="Por categoria cargo",
+            key="xlsx_ingresos_categoria",
+        )
 
     # =========================================================================
     # Top 20 codigos de cargo
@@ -282,3 +296,9 @@ if not df_det.empty:
         "pct_total": "% del top 20",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_top,
+        file_name=f"ingresos_top_codigos_{dt.date.today()}",
+        sheet_name="Top 20 codigos",
+        key="xlsx_ingresos_top_codigos",
+    )

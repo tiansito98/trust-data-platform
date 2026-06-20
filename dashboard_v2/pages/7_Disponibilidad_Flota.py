@@ -24,7 +24,7 @@ from components.auth import (
 )
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
-    render_trm_today_sidebar,
+    render_trm_today_sidebar, xlsx_download_button,
 )
 
 
@@ -249,6 +249,14 @@ styled = styled.set_table_styles([
 section(f"Cuadro de disponibilidad - {sede_nombre} - {selected_label}")
 st.dataframe(styled, use_container_width=True, height=600)
 st.caption(f"{pivot_estado.shape[0]} vehiculos x {last_day} dias")
+# Export sin colores: pivot_estado (RENTADO/DISPONIBLE/TALLER/...) por dia.
+# El usuario puede recolorear en Excel con formato condicional si necesita.
+xlsx_download_button(
+    pivot_estado.reset_index(),
+    file_name=f"disponibilidad_flota_{sede_nombre.replace(' ', '_')}_{selected_label}",
+    sheet_name="Estado por dia",
+    key="xlsx_flota_grid",
+)
 
 
 # =============================================================================
@@ -364,6 +372,12 @@ if recent.empty:
     st.info("No hay entradas manuales para esta sede.")
 else:
     st.dataframe(recent, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        recent,
+        file_name=f"disponibilidad_flota_manuales_{sede_nombre.replace(' ', '_')}_{dt.date.today()}",
+        sheet_name="Manuales recientes",
+        key="xlsx_flota_manuales",
+    )
 
     selected_ids = st.multiselect(
         "Seleccionar entradas para borrar (por ID)",

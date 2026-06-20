@@ -346,3 +346,51 @@ def get_canal_options() -> list:
         "ORDER BY canal_principal"
     )
     return df["canal_principal"].tolist()
+
+
+# =============================================================================
+# Excel export
+# =============================================================================
+def xlsx_download_button(
+    df: pd.DataFrame,
+    file_name: str,
+    label: str = "Descargar Excel (.xlsx)",
+    sheet_name: str = "Datos",
+    key: str | None = None,
+) -> None:
+    """Boton de descarga xlsx con datos crudos (numeros como numeros, no texto).
+
+    El boton built-in de st.dataframe exporta CSV y no se puede cambiar.
+    Esta helper agrega un boton aparte que exporta xlsx para que los usuarios
+    no tengan que abrir el CSV en Excel y re-formatearlo.
+
+    Datos crudos: floats/ints/dates pasan como tipo nativo a Excel para que
+    se puedan filtrar, sumar y pivotear sin reformateo. Si la columna ya viene
+    formateada como string (ej. fmt_money() aplicado antes), se exporta como
+    string — para evitarlo, pasar el DataFrame ANTES de aplicar los formatos.
+
+    Args:
+        df: DataFrame a exportar (idealmente crudo, no formateado a string).
+        file_name: nombre del archivo SIN extension. Se agrega .xlsx.
+        label: texto del boton.
+        sheet_name: nombre de la hoja en el Excel.
+        key: key unica para el boton (necesaria si hay multiples en la pagina).
+    """
+    import io
+
+    if df is None or len(df) == 0:
+        st.caption("Sin datos para exportar.")
+        return
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])  # Excel: max 31 chars
+    buf.seek(0)
+
+    st.download_button(
+        label=label,
+        data=buf,
+        file_name=f"{file_name}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=key,
+    )

@@ -43,6 +43,7 @@ from components.auth import require_auth, require_page, is_admin, logout_button
 from components.common import (
     inject_styles, render_header, section, kpi,
     fmt_money, load_query, render_trm_today_sidebar,
+    xlsx_download_button,
 )
 
 
@@ -290,6 +291,12 @@ view = view.rename(columns={
     "total_cop": "Total COP",
 })
 st.dataframe(view, use_container_width=True, hide_index=True)
+xlsx_download_button(
+    bucket_summary,
+    file_name=f"cargos_granular_bucket_{dt.date.today()}",
+    sheet_name="Bucket COBRA",
+    key="xlsx_cargos_bucket",
+)
 
 
 st.markdown("---")
@@ -353,6 +360,12 @@ view_codes = view_codes.rename(columns={
     "total_cop": "Total COP",
 })
 st.dataframe(view_codes, use_container_width=True, hide_index=True)
+xlsx_download_button(
+    code_summary,
+    file_name=f"cargos_granular_codigos_{dt.date.today()}",
+    sheet_name="Por codigo",
+    key="xlsx_cargos_codigos",
+)
 st.caption(
     f"Codigos que generan comision (counter solamente): "
     f"{', '.join(COMISIONABLES)}"
@@ -450,6 +463,12 @@ view_asesor = view_asesor.rename(columns={
     "total_cop_atendido": "Total COP atendido",
 })
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
+xlsx_download_button(
+    asesor_summary,
+    file_name=f"cargos_granular_asesor_{dt.date.today()}",
+    sheet_name="Por asesor",
+    key="xlsx_cargos_asesor",
+)
 
 # Totales para sanity check
 total_comisionable_usd = asesor_summary["base_comisionable_usd"].sum()

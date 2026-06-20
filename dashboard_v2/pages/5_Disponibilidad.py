@@ -12,12 +12,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import datetime as dt
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from components.common import (
     inject_styles, render_header, section, kpi, fmt_int, fmt_pct, load_query,
+    xlsx_download_button,
     PLOTLY_LAYOUT, SIXT_ORANGE, SIXT_BLACK,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
@@ -139,6 +142,12 @@ with c_right:
         "utilizacion_pct": "Utilizacion",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_sede,
+        file_name=f"disponibilidad_sede_{dt.date.today()}",
+        sheet_name="Por sede",
+        key="xlsx_disp_sede",
+    )
 
 # ---------- Por categoria ----------
 section("Por categoria de grupo (CRS)")
@@ -187,6 +196,12 @@ if not df_cat.empty:
             "util_pct": "Utilizacion",
         })
         st.dataframe(view, use_container_width=True, hide_index=True)
+        xlsx_download_button(
+            df_cat,
+            file_name=f"disponibilidad_categoria_{dt.date.today()}",
+            sheet_name="Por categoria",
+            key="xlsx_disp_categoria",
+        )
 
 # ---------- Detalle vehiculo por vehiculo ----------
 section("Detalle por vehiculo (snapshot)")
@@ -222,3 +237,9 @@ if not df_det.empty:
     })
     view["Vehiculo (int_num)"] = view["Vehiculo (int_num)"].astype("Int64").astype(str)
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_det,
+        file_name=f"disponibilidad_detalle_{dt.date.today()}",
+        sheet_name="Detalle vehiculos",
+        key="xlsx_disp_detalle",
+    )

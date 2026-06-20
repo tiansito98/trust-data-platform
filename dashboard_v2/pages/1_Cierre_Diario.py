@@ -19,12 +19,14 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import datetime as dt
+
 import pandas as pd
 import streamlit as st
 
 from components.common import (
     inject_styles, render_header, section, kpi, fmt_money, fmt_money_short,
-    fmt_int, load_query, apply_trm,
+    fmt_int, load_query, apply_trm, xlsx_download_button,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
 from components.auth import require_auth, require_page, logout_button
@@ -191,6 +193,12 @@ if modo.startswith("Resumen"):
             "operador_handover_codigo": "Asesor",
         })
         st.dataframe(view, use_container_width=True, hide_index=True)
+        xlsx_download_button(
+            df_resumen[cols_view],
+            file_name=f"cierre_diario_resumen_{dt.date.today()}",
+            sheet_name="Resumen contratos",
+            key="xlsx_cierre_resumen",
+        )
 
 # ---------- Modo Detalle (Q1): factura por contrato ----------
 else:
@@ -472,3 +480,9 @@ else:
             footer = pd.DataFrame(footer_rows)
             factura = pd.concat([det_view, footer], ignore_index=True)
             st.dataframe(factura, use_container_width=True, hide_index=True)
+            xlsx_download_button(
+                factura,
+                file_name=f"factura_{contrato_str}_{dt.date.today()}",
+                sheet_name=f"Contrato {contrato_str}",
+                key=f"xlsx_factura_{contrato_str}",
+            )

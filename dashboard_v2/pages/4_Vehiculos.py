@@ -17,9 +17,11 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import datetime as dt
+
 from components.common import (
     inject_styles, render_header, section, kpi, fmt_money, fmt_money_short,
-    fmt_int, fmt_pct, load_query,
+    fmt_int, fmt_pct, load_query, xlsx_download_button,
     PLOTLY_LAYOUT, SIXT_ORANGE, SIXT_BLACK,
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
@@ -107,6 +109,12 @@ with c_right:
         "dias_avg": "Dias avg",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_cat.head(15),
+        file_name=f"vehiculos_acriss_{dt.date.today()}",
+        sheet_name="ACRISS top15",
+        key="xlsx_vehiculos_acriss",
+    )
 
 # ---------- Upgrades vs downgrades ----------
 section("Upgrades vs downgrades (reservado -> entregado)")
@@ -156,6 +164,12 @@ else:
         f"neto{suf}": f"Neto ({cur})",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_ud,
+        file_name=f"vehiculos_upgrades_{dt.date.today()}",
+        sheet_name="Upgrades-Downgrades",
+        key="xlsx_vehiculos_upgrades",
+    )
 
 # ---------- Top modelos fisicos ----------
 section("Top modelos fisicos entregados")
@@ -204,3 +218,9 @@ if not df_mod.empty:
         "ticket_usd": "Ticket avg (USD)",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        df_mod,
+        file_name=f"vehiculos_top_modelos_{dt.date.today()}",
+        sheet_name="Top modelos",
+        key="xlsx_vehiculos_modelos",
+    )
