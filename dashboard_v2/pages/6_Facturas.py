@@ -804,6 +804,9 @@ with reminder_slot:
           -- placa/vehiculo vacios, operador 7777777 y revenue 0; no son rentas
           -- reales y no se facturan. El placeholder real tiene placa vacia.
           AND COALESCE(TRIM(r.placa), '') <> ''
+          -- Excluir contratos con revenue 0 (cortesias, status-match con placa
+          -- real, asesor 7784272, etc.). Si no hay nada que cobrar no hay factura.
+          AND COALESCE(r.total_con_iva_usd, 0) > 0
           AND i.invoice_id IS NULL
           {rem_where}
         ORDER BY r.fecha_handover_real DESC
