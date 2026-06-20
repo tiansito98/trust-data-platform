@@ -405,10 +405,14 @@ asesor_summary = (
     .sort_values("base_comisionable_usd", ascending=False)
 )
 
-# % comisionable del counter total
+# % comisionable del counter total.
+# Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
+# y Decimal / pd.NA * 100 queda dtype object → .round(1) falla en pandas/3.14.
+# .where(cond) mantiene float64 (NaN donde counter=0, no pd.NA).
+_base_f = pd.to_numeric(asesor_summary["base_comisionable_usd"], errors="coerce")
+_cnt_f = pd.to_numeric(asesor_summary["counter_total_usd"], errors="coerce")
 asesor_summary["pct_comisionable"] = (
-    asesor_summary["base_comisionable_usd"]
-    / asesor_summary["counter_total_usd"].replace(0, pd.NA) * 100
+    (_base_f / _cnt_f.where(_cnt_f != 0)) * 100
 ).round(1)
 
 # Asesor "null" / sin codigo: ponemos string visible
