@@ -523,11 +523,34 @@ st.caption(
     "silver, la diferencia, la TRM oficial Banrep del dia de entrega y la "
     "TRM efectivamente usada (deducida del monto cobrado)."
 )
+
+# Filtro por rango de fechas (default: ultimos 90 dias).
+# Antes habia un LIMIT 50 que ocultaba facturas viejas si en los ultimos
+# dias se finalizaban muchas. El filtro por fecha es mas predecible.
+_today = dt.date.today()
+_default_desde = _today - dt.timedelta(days=90)
+hist_cols = st.columns([1, 1, 4])
+hist_desde = hist_cols[0].date_input(
+    "Desde (fecha entrega contrato)",
+    value=_default_desde,
+    key="_hist_desde",
+    help="Filtra por fecha de handover del contrato. Default: ultimos 90 dias.",
+)
+hist_hasta = hist_cols[1].date_input(
+    "Hasta (fecha entrega contrato)",
+    value=_today,
+    key="_hist_hasta",
+    help="Hasta esta fecha de handover del contrato.",
+)
+
 # JOIN a silver + dim_trm_diaria para validar contra TRM oficial.
 # TRM usada se deduce: si monto_cop = usd * trm, entonces trm_usada = monto_cop / usd.
 # Esto permite ver si el asesor uso una TRM distinta (vieja, redondeada, etc.).
 # CTE `dups`: detecta contratos con >1 factura (regla 1:1 violada).
 # Filtrado por sede_where para que sede users solo vean duplicados de su sede.
+# Filtramos por fecha de handover (silver). Si el contrato no esta en silver
+# (factura creada antes del pipeline refresh), incluimos la factura igual
+# basados en fecha_emision para no perderla del historial.
 fin_sql = f"""
     WITH dups AS (
         SELECT i.rntl_mvnr, ARRAY_AGG(i.invoice_id ORDER BY i.invoice_id) AS all_ids
@@ -558,10 +581,19 @@ fin_sql = f"""
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
     WHERE i.finalizada = TRUE {sede_where}
+      AND (
+            -- Si esta en silver: filtra por handover del contrato
+            (r.fecha_handover_real::date BETWEEN :hist_desde AND :hist_hasta)
+            -- Si NO esta en silver: filtra por fecha de emision (para no perderla)
+            OR (r.fecha_handover_real IS NULL
+                AND i.fecha_emision BETWEEN :hist_desde AND :hist_hasta)
+      )
     ORDER BY i.finalizada_at DESC
-    LIMIT 50
 """
-df_fin = load_query(fin_sql, sede_params if sede_params else {})
+_fin_params = {"hist_desde": hist_desde, "hist_hasta": hist_hasta}
+if sede_params:
+    _fin_params.update(sede_params)
+df_fin = load_query(fin_sql, _fin_params)
 if df_fin.empty:
     st.info("No hay facturas finalizadas.")
 else:
@@ -636,7 +668,8 @@ else:
 
     st.dataframe(view, use_container_width=True, hide_index=True)
     st.caption(
-        f"Mostrando ultimas {len(view)} facturas finalizadas. "
+        f"Mostrando {len(view)} facturas finalizadas "
+        f"(entrega entre {hist_desde} y {hist_hasta}). "
         f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
         f"negativo = uso una mas baja."
     )
