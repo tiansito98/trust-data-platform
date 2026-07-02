@@ -393,23 +393,26 @@ st.markdown("---")
 section("Ventas por asesor (codigo handover) — base de comisiones")
 st.caption(
     "Base comisionable = SUMA del counter SOLO para codigos comisionables "
-    f"({', '.join(COMISIONABLES)}). "
-    "El resto del counter (tarifa T, location Y, otros adicionales) NO genera "
-    "comision para el asesor. "
+    f"({', '.join(COMISIONABLES)}) y SOLO cuando el cargo es 100% counter "
+    "(prepagado=0). "
+    "Los MIXTOS (parte prepago + parte counter) NO cuentan porque el cargo "
+    "ya venia de la reserva — el asesor solo proceso una extension, no lo "
+    "vendio fresh. "
     "Usa fecha de entrega (handover) del vehiculo. "
     "El codigo asesor corresponde a operador_handover_codigo en silver — "
     "proximamente se mapeara a nombre con una tabla de asesores."
 )
 
-# Calcular counter del cargo SOLO si es comisionable, sino 0
-df["counter_comisionable_usd"] = df.apply(
-    lambda r: r["counter_usd"] if r["es_comisionable"] else 0.0,
-    axis=1,
-)
-df["counter_comisionable_cop"] = df.apply(
-    lambda r: r["counter_cop"] if r["es_comisionable"] else 0.0,
-    axis=1,
-)
+# Regla comisionable: SOLO cargos PURE COUNTER de codigos comisionables.
+# - PURE COUNTER = counter_usd > 0 AND prepagado_usd == 0 (no venia de reserva).
+# - MIXTO (prepagado + counter) NO cuenta porque el cargo ya existia en reserva
+#   y el asesor solo proceso una extension. No lo "vendio" fresh.
+# - Threshold 0.01 USD para robustez ante ruido residual (aunque ya limpiamos).
+is_pure_counter = (df["counter_usd"] > 0.01) & (df["prepagado_usd"] < 0.01)
+df["es_base_comision"] = df["es_comisionable"] & is_pure_counter
+
+df["counter_comisionable_usd"] = df["counter_usd"].where(df["es_base_comision"], 0.0)
+df["counter_comisionable_cop"] = df["counter_cop"].where(df["es_base_comision"], 0.0)
 
 asesor_summary = (
     df.groupby("asesor_codigo", dropna=False)
