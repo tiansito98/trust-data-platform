@@ -44,6 +44,28 @@ render_header("Facturas / Recibos")
 
 
 # =============================================================================
+# Self-healing migration: asegurar columnas de revision.
+# @st.cache_resource -> corre 1 vez por instancia de Streamlit. Idempotente
+# gracias a IF NOT EXISTS, asi que si ya existen es no-op.
+# =============================================================================
+@st.cache_resource
+def _ensure_revisada_columns():
+    try:
+        execute_write("""
+            ALTER TABLE operational.invoices
+                ADD COLUMN IF NOT EXISTS revisada     BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS revisada_at  TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS revisada_por TEXT
+        """, {})
+    except Exception:
+        # Si falla (permisos, etc.), no bloqueamos la pagina. El SELECT con
+        # COALESCE(revisada, FALSE) y las columnas nullables lo manejan.
+        pass
+
+_ensure_revisada_columns()
+
+
+# =============================================================================
 # Sede filtering
 # =============================================================================
 user_branches = get_user_branches()
