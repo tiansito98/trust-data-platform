@@ -563,6 +563,8 @@ fin_sql = f"""
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
            i.finalizada_por, i.finalizada_at,
+           COALESCE(i.revisada, FALSE) AS revisada,
+           i.revisada_at, i.revisada_por,
            r.fecha_handover_real::date AS fecha_entrega,
            r.total_con_iva_usd         AS total_usd,
            t.trm_cop_per_usd           AS trm_oficial,
@@ -622,15 +624,20 @@ else:
             f"las que sobran (regla 1:1)."
         )
 
-    # Vista formateada
+    # Vista formateada. La columna 'Revisada' es CHECKBOX editable — cuando
+    # el usuario la marca, guardamos revisada=TRUE + audit trail (quien/cuando).
     view = df_fin[[
-        "invoice_id", "fecha_emision", "sede_nombre", "rntl_mvnr", "duplicados",
-        "numero_factura", "numero_recibo",
+        "invoice_id", "revisada", "fecha_emision", "sede_nombre", "rntl_mvnr",
+        "duplicados", "numero_factura", "numero_recibo",
         "fecha_entrega",
         "monto_total", "sistema_cop", "diferencia",
         "trm_oficial", "trm_usada_calculada", "diff_trm",
         "finalizada_por", "finalizada_at",
+        "revisada_por", "revisada_at",
     ]].copy()
+
+    # revisada: asegurar bool (viene de Postgres, podria ser None si columna nueva)
+    view["revisada"] = view["revisada"].fillna(False).astype(bool)
 
     # Formato de moneda COP
     for col in ("monto_total", "sistema_cop", "diferencia"):
@@ -642,13 +649,18 @@ else:
         view[col] = view[col].apply(
             lambda v: f"{v:,.2f}" if pd.notna(v) else "-"
         )
-    # finalizada_at: solo fecha+hora bonita
+    # finalizada_at / revisada_at: solo fecha+hora bonita
     view["finalizada_at"] = pd.to_datetime(
         view["finalizada_at"], errors="coerce"
     ).dt.strftime("%Y-%m-%d %H:%M")
+    view["revisada_at"] = pd.to_datetime(
+        view["revisada_at"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M").fillna("-")
+    view["revisada_por"] = view["revisada_por"].fillna("-")
 
     view = view.rename(columns={
         "invoice_id": "ID",
+        "revisada": "Revisada",
         "fecha_emision": "Fecha emision",
         "sede_nombre": "Sede",
         "rntl_mvnr": "Contrato",
@@ -664,12 +676,63 @@ else:
         "diff_trm": "Δ TRM",
         "finalizada_por": "Finalizada por",
         "finalizada_at": "Finalizada en",
+        "revisada_por": "Revisada por",
+        "revisada_at": "Revisada en",
     })
 
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    # data_editor: solo 'Revisada' es editable; el resto disabled.
+    # Cuando el usuario marca/desmarca el checkbox, detectamos el cambio,
+    # persistimos en DB con audit trail, invalidamos cache y hacemos rerun.
+    editable_cols = ["Revisada"]
+    disabled_cols = [c for c in view.columns if c not in editable_cols]
+
+    edited_view = st.data_editor(
+        view,
+        column_config={
+            "Revisada": st.column_config.CheckboxColumn(
+                "Revisada",
+                help="Marca cuando hayas contrastado el contrato fisico contra la factura",
+                default=False,
+            ),
+        },
+        disabled=disabled_cols,
+        hide_index=True,
+        use_container_width=True,
+        key="_fin_editor",
+    )
+
+    # Detectar cambios en la columna 'Revisada' y persistir
+    if not edited_view["Revisada"].equals(view["Revisada"]):
+        for i in range(len(view)):
+            orig = bool(view.iloc[i]["Revisada"])
+            new = bool(edited_view.iloc[i]["Revisada"])
+            if orig == new:
+                continue
+            invoice_id = int(edited_view.iloc[i]["ID"])
+            if new:
+                execute_write("""
+                    UPDATE operational.invoices
+                    SET revisada     = TRUE,
+                        revisada_at  = NOW(),
+                        revisada_por = :user
+                    WHERE invoice_id = :id
+                """, {"id": invoice_id, "user": username})
+            else:
+                execute_write("""
+                    UPDATE operational.invoices
+                    SET revisada     = FALSE,
+                        revisada_at  = NULL,
+                        revisada_por = NULL
+                    WHERE invoice_id = :id
+                """, {"id": invoice_id})
+        load_query.clear()
+        st.rerun()
+
+    n_revisadas = int(view["Revisada"].sum())
     st.caption(
         f"Mostrando {len(view)} facturas finalizadas "
-        f"(entrega entre {hist_desde} y {hist_hasta}). "
+        f"(entrega entre {hist_desde} y {hist_hasta}) — "
+        f"{n_revisadas} revisada(s), {len(view) - n_revisadas} pendiente(s) de revision. "
         f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
         f"negativo = uso una mas baja."
     )
