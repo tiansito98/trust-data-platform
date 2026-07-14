@@ -392,12 +392,13 @@ st.markdown("---")
 # =============================================================================
 section("Ventas por asesor (codigo handover) — base de comisiones")
 st.caption(
-    "Base comisionable = SUMA del counter SOLO para codigos comisionables "
-    f"({', '.join(COMISIONABLES)}) y SOLO cuando el cargo es 100% counter "
-    "(prepagado=0). "
+    "Base comisionable = SUMA del counter (CON IVA 19%) SOLO para codigos "
+    f"comisionables ({', '.join(COMISIONABLES)}) y SOLO cuando el cargo es "
+    "100% counter (prepagado=0). "
     "Los MIXTOS (parte prepago + parte counter) NO cuentan porque el cargo "
     "ya venia de la reserva — el asesor solo proceso una extension, no lo "
     "vendio fresh. "
+    "IVA incluido porque la comision se calcula sobre el monto CON IVA. "
     "Usa fecha de entrega (handover) del vehiculo. "
     "El codigo asesor corresponde a operador_handover_codigo en silver — "
     "proximamente se mapeara a nombre con una tabla de asesores."
@@ -433,11 +434,24 @@ asesor_summary = (
 # Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
 # y Decimal / pd.NA * 100 queda dtype object → .round(1) falla en pandas/3.14.
 # .where(cond) mantiene float64 (NaN donde counter=0, no pd.NA).
+# IMPORTANTE: pct se calcula ANTES de aplicar IVA a la base para que la ratio
+# se mantenga (%) — de otro modo se inflaria 19%.
 _base_f = pd.to_numeric(asesor_summary["base_comisionable_usd"], errors="coerce")
 _cnt_f = pd.to_numeric(asesor_summary["_counter_total_usd"], errors="coerce")
 asesor_summary["pct_comisionable"] = (
     (_base_f / _cnt_f.where(_cnt_f != 0)) * 100
 ).round(1)
+
+# IVA (19%) sobre la base comisionable. La comision se calcula sobre el
+# monto CON IVA (asi lo definio el negocio). Aplicamos DESPUES del pct para
+# no distorsionarlo.
+IVA_FACTOR_COMISION = 1.19
+asesor_summary["base_comisionable_usd"] = (
+    asesor_summary["base_comisionable_usd"] * IVA_FACTOR_COMISION
+)
+asesor_summary["base_comisionable_cop"] = (
+    asesor_summary["base_comisionable_cop"] * IVA_FACTOR_COMISION
+)
 
 # Asesor "null" / sin codigo: ponemos string visible
 asesor_summary["asesor_codigo"] = (
@@ -465,8 +479,8 @@ view_asesor = view_asesor.rename(columns={
     "asesor_codigo": "Codigo asesor",
     "contratos": "Contratos",
     "cargos_counter": "Cargos counter",
-    "base_comisionable_usd": "BASE COMISIONABLE USD",
-    "base_comisionable_cop": "BASE COMISIONABLE COP",
+    "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
+    "base_comisionable_cop": "BASE COMISIONABLE COP (c/IVA)",
     "pct_comisionable": "% comisionable",
 })
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
