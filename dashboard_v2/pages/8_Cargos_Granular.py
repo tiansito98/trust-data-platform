@@ -458,6 +458,44 @@ asesor_summary["asesor_codigo"] = (
     asesor_summary["asesor_codigo"].fillna("(sin codigo)").astype(str)
 )
 
+# LEFT JOIN a operational.op_asesores para mostrar nombres.
+# Si no hay match (asesor sin mapear todavia), muestra "-".
+# La tabla puede o no existir; try/except para robustez.
+try:
+    _asesores_map = load_query(
+        "SELECT codigo_silver, nombres, apellidos "
+        "FROM operational.op_asesores "
+        "WHERE codigo_silver IS NOT NULL"
+    )
+    if not _asesores_map.empty:
+        _asesores_map["codigo_silver"] = (
+            _asesores_map["codigo_silver"].astype("Int64").astype(str)
+        )
+        _asesores_map["nombre_completo"] = (
+            _asesores_map["nombres"].fillna("") + " " +
+            _asesores_map["apellidos"].fillna("")
+        ).str.strip()
+        # Normalizamos codigo_asesor a string para el merge
+        asesor_summary["_codigo_num"] = (
+            pd.to_numeric(asesor_summary["asesor_codigo"], errors="coerce")
+            .astype("Int64").astype(str)
+        )
+        asesor_summary = asesor_summary.merge(
+            _asesores_map[["codigo_silver", "nombre_completo"]],
+            left_on="_codigo_num",
+            right_on="codigo_silver",
+            how="left",
+        )
+        asesor_summary = asesor_summary.drop(columns=["_codigo_num", "codigo_silver"])
+    else:
+        asesor_summary["nombre_completo"] = None
+except Exception:
+    asesor_summary["nombre_completo"] = None
+
+asesor_summary["nombre_completo"] = (
+    asesor_summary["nombre_completo"].fillna("(sin mapear)")
+)
+
 view_asesor = asesor_summary.copy()
 view_asesor["base_comisionable_usd"] = view_asesor["base_comisionable_usd"].apply(
     lambda v: fmt_money(v, "USD")
@@ -471,12 +509,13 @@ view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
 
 # Solo mostramos columnas relevantes para comisiones
 view_asesor = view_asesor[[
-    "asesor_codigo", "contratos", "cargos_counter",
+    "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
     "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
 ]]
 
 view_asesor = view_asesor.rename(columns={
     "asesor_codigo": "Codigo asesor",
+    "nombre_completo": "Nombre",
     "contratos": "Contratos",
     "cargos_counter": "Cargos counter",
     "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
@@ -486,7 +525,7 @@ view_asesor = view_asesor.rename(columns={
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 xlsx_download_button(
     asesor_summary[[
-        "asesor_codigo", "contratos", "cargos_counter",
+        "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
         "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
     ]],
     file_name=f"cargos_granular_asesor_{dt.date.today()}",
