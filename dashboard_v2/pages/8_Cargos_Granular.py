@@ -400,8 +400,20 @@ st.caption(
     "vendio fresh. "
     "IVA incluido porque la comision se calcula sobre el monto CON IVA. "
     "Usa fecha de entrega (handover) del vehiculo. "
-    "El codigo asesor corresponde a operador_handover_codigo en silver — "
-    "proximamente se mapeara a nombre con una tabla de asesores."
+    "Columnas 'Dias ocupacion' y 'Dias renta' reflejan actividad del asesor "
+    "en el rango de fechas seleccionado arriba."
+)
+
+# Meta de dias (para calcular % cumplimiento por asesor).
+# Aplicamos la misma meta a todos los asesores por ahora; a futuro puede
+# personalizarse por asesor en op_asesores.
+meta_cols = st.columns([1, 3])
+meta_dias = meta_cols[0].number_input(
+    "Meta de dias renta (por asesor)",
+    min_value=0, max_value=1000, value=90, step=5,
+    key="_cargos_meta_dias",
+    help="Se usa para calcular % de cumplimiento por asesor "
+         "(dias_renta / meta). Aplica a todos los asesores.",
 )
 
 # Regla comisionable: SOLO cargos PURE COUNTER de codigos comisionables.
@@ -429,6 +441,83 @@ asesor_summary = (
     .reset_index()
     .sort_values("base_comisionable_usd", ascending=False)
 )
+
+# Dias por asesor (ocupacion + renta) para el rango [desde, hasta].
+# Expande cada contrato a carro-dia CLIPPED al rango elegido, agrupa por asesor.
+# Misma logica que silver.vw_asesor_dias_mes pero ad-hoc por rango arbitrario.
+dias_sql = f"""
+    WITH rentas AS (
+        SELECT
+            numero_contrato, placa,
+            operador_handover_codigo AS asesor_codigo,
+            fecha_handover_real::date AS f_ini,
+            LEAST(
+                COALESCE(fecha_devolucion_real::date, CURRENT_DATE),
+                CURRENT_DATE
+            ) AS f_fin
+        FROM silver.vw_rentals_resumen
+        WHERE rental_currency = 'USD'
+          AND TRIM(COALESCE(placa, '')) <> ''
+          AND fecha_handover_real IS NOT NULL
+          AND fecha_handover_real::date <= CURRENT_DATE
+          -- Overlap con rango [desde, hasta]:
+          AND fecha_handover_real::date <= :hasta
+          AND LEAST(COALESCE(fecha_devolucion_real::date, CURRENT_DATE),
+                    CURRENT_DATE) >= :desde
+          {sede_clause_resumen}
+    ),
+    carro_dia AS (
+        SELECT
+            r.asesor_codigo, r.numero_contrato, r.placa,
+            gs::date AS fecha
+        FROM rentas r
+        CROSS JOIN LATERAL generate_series(
+            GREATEST(r.f_ini, :desde::date),
+            LEAST(r.f_fin, :hasta::date),
+            INTERVAL '1 day'
+        ) gs
+    )
+    SELECT
+        asesor_codigo,
+        COUNT(DISTINCT placa || '~' || fecha::text) AS dias_ocupacion,
+        COUNT(*)                                    AS dias_renta
+    FROM carro_dia
+    GROUP BY asesor_codigo
+"""
+df_dias = load_query(dias_sql, params)
+if not df_dias.empty:
+    for c in ("dias_ocupacion", "dias_renta"):
+        df_dias[c] = pd.to_numeric(df_dias[c], errors="coerce").fillna(0).astype(int)
+    # Normalizar codigo a mismo tipo que asesor_summary para el merge
+    df_dias["asesor_codigo"] = df_dias["asesor_codigo"].astype("Float64")
+    asesor_summary["asesor_codigo_num"] = pd.to_numeric(
+        asesor_summary["asesor_codigo"], errors="coerce"
+    ).astype("Float64")
+    asesor_summary = asesor_summary.merge(
+        df_dias, left_on="asesor_codigo_num", right_on="asesor_codigo",
+        how="left", suffixes=("", "_dias"),
+    )
+    asesor_summary = asesor_summary.drop(
+        columns=["asesor_codigo_num", "asesor_codigo_dias"], errors="ignore"
+    )
+else:
+    asesor_summary["dias_ocupacion"] = 0
+    asesor_summary["dias_renta"] = 0
+
+asesor_summary["dias_ocupacion"] = (
+    asesor_summary["dias_ocupacion"].fillna(0).astype(int)
+)
+asesor_summary["dias_renta"] = (
+    asesor_summary["dias_renta"].fillna(0).astype(int)
+)
+
+# % cumplimiento de meta (basado en dias_renta)
+if meta_dias > 0:
+    asesor_summary["pct_meta"] = (
+        (asesor_summary["dias_renta"] / meta_dias) * 100
+    ).round(1)
+else:
+    asesor_summary["pct_meta"] = 0.0
 
 # % comisionable = base comisionable / counter total (interno, no mostrado).
 # Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
@@ -506,10 +595,14 @@ view_asesor["base_comisionable_cop"] = view_asesor["base_comisionable_cop"].appl
 view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
     lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
 )
+view_asesor["pct_meta"] = view_asesor["pct_meta"].apply(
+    lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
+)
 
 # Solo mostramos columnas relevantes para comisiones
 view_asesor = view_asesor[[
     "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
+    "dias_ocupacion", "dias_renta", "pct_meta",
     "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
 ]]
 
@@ -518,6 +611,9 @@ view_asesor = view_asesor.rename(columns={
     "nombre_completo": "Nombre",
     "contratos": "Contratos",
     "cargos_counter": "Cargos counter",
+    "dias_ocupacion": "Dias ocupacion",
+    "dias_renta": "Dias renta",
+    "pct_meta": f"% meta ({meta_dias} dias)",
     "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
     "base_comisionable_cop": "BASE COMISIONABLE COP (c/IVA)",
     "pct_comisionable": "% comisionable",
@@ -526,6 +622,7 @@ st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 xlsx_download_button(
     asesor_summary[[
         "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
+        "dias_ocupacion", "dias_renta", "pct_meta",
         "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
     ]],
     file_name=f"cargos_granular_asesor_{dt.date.today()}",
