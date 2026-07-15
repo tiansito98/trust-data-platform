@@ -404,16 +404,16 @@ st.caption(
     "en el rango de fechas seleccionado arriba."
 )
 
-# Meta de dias (para calcular % cumplimiento por asesor).
-# Aplicamos la misma meta a todos los asesores por ahora; a futuro puede
-# personalizarse por asesor en op_asesores.
-meta_cols = st.columns([1, 3])
-meta_dias = meta_cols[0].number_input(
-    "Meta de dias renta (por asesor)",
-    min_value=0, max_value=1000, value=90, step=5,
+# Meta de dias renta (24h) — total del periodo/sede seleccionado.
+# Se usa para calcular % de cumplimiento global (dias_renta_24h_total / meta).
+meta_dias = st.number_input(
+    "Meta de dias renta 24h (total del periodo)",
+    min_value=0, max_value=100000, value=1500, step=50,
     key="_cargos_meta_dias",
-    help="Se usa para calcular % de cumplimiento por asesor "
-         "(dias_renta / meta). Aplica a todos los asesores.",
+    help="Meta total de dias renta 24h para el rango de fechas y sedes "
+         "seleccionados. Se calcula un % de cumplimiento global. "
+         "Los dias renta 24h son bloques de 24h reales — un contrato de 25h "
+         "cuenta como 2 dias.",
 )
 
 # Regla comisionable: SOLO cargos PURE COUNTER de codigos comisionables.
@@ -442,82 +442,99 @@ asesor_summary = (
     .sort_values("base_comisionable_usd", ascending=False)
 )
 
-# Dias por asesor (ocupacion + renta) para el rango [desde, hasta].
-# Expande cada contrato a carro-dia CLIPPED al rango elegido, agrupa por asesor.
-# Misma logica que silver.vw_asesor_dias_mes pero ad-hoc por rango arbitrario.
-dias_sql = f"""
+# Dias por SEDE (ocupacion + renta 24h) para el rango [desde, hasta].
+# - dias_ocupacion: metrica acida (COUNT DISTINCT placa+fecha) expandiendo
+#   cada contrato a carro-dia CLIPPED al rango.
+# - dias_renta_24h: bloques de 24h REALES clipped al rango (usa timestamps
+#   hora_handover / hora_devolucion, no solo fechas). Ejemplo: contrato de
+#   25h cuenta como 2 dias, no 2 dias calendario.
+dias_sql_sede = f"""
     WITH rentas AS (
         SELECT
-            numero_contrato, placa,
-            operador_handover_codigo AS asesor_codigo,
-            fecha_handover_real::date AS f_ini,
+            r.numero_contrato, r.placa,
+            r.sede_handover,
+            r.fecha_handover_real::date AS f_ini,
             LEAST(
-                COALESCE(fecha_devolucion_real::date, CURRENT_DATE),
+                COALESCE(r.fecha_devolucion_real::date, CURRENT_DATE),
                 CURRENT_DATE
-            ) AS f_fin
-        FROM silver.vw_rentals_resumen
-        WHERE rental_currency = 'USD'
-          AND TRIM(COALESCE(placa, '')) <> ''
-          AND fecha_handover_real IS NOT NULL
-          AND fecha_handover_real::date <= CURRENT_DATE
+            ) AS f_fin,
+            f.hora_handover, f.hora_devolucion
+        FROM silver.vw_rentals_resumen r
+        LEFT JOIN silver.vw_rentals_full f
+               ON f.numero_contrato = r.numero_contrato
+        WHERE r.rental_currency = 'USD'
+          AND TRIM(COALESCE(r.placa, '')) <> ''
+          AND r.fecha_handover_real IS NOT NULL
+          AND f.hora_handover IS NOT NULL
+          AND r.fecha_handover_real::date <= CURRENT_DATE
           -- Overlap con rango [desde, hasta]:
-          AND fecha_handover_real::date <= :hasta
-          AND LEAST(COALESCE(fecha_devolucion_real::date, CURRENT_DATE),
+          AND r.fecha_handover_real::date <= :hasta
+          AND LEAST(COALESCE(r.fecha_devolucion_real::date, CURRENT_DATE),
                     CURRENT_DATE) >= :desde
           {sede_clause_resumen}
     ),
+    -- Metrica A: expandir a carro-dia clipped al rango
     carro_dia AS (
         SELECT
-            r.asesor_codigo, r.numero_contrato, r.placa,
-            gs::date AS fecha
+            r.sede_handover, r.placa, gs::date AS fecha
         FROM rentas r
         CROSS JOIN LATERAL generate_series(
             GREATEST(r.f_ini, CAST(:desde AS date)),
             LEAST(r.f_fin, CAST(:hasta AS date)),
             INTERVAL '1 day'
         ) gs
+    ),
+    ocupacion AS (
+        SELECT sede_handover,
+               COUNT(DISTINCT placa || '~' || fecha::text) AS dias_ocupacion
+        FROM carro_dia
+        GROUP BY sede_handover
+    ),
+    -- Metrica B: dias 24h clipped a rango via timestamps
+    renta_24h AS (
+        SELECT
+            sede_handover,
+            SUM(
+                GREATEST(
+                    CEIL(
+                        EXTRACT(EPOCH FROM (
+                            LEAST(
+                                COALESCE(hora_devolucion, CURRENT_TIMESTAMP),
+                                CURRENT_TIMESTAMP,
+                                (CAST(:hasta AS date) + INTERVAL '1 day')::timestamp
+                            )
+                            - GREATEST(hora_handover, CAST(:desde AS date)::timestamp)
+                        )) / 86400.0
+                    )::int,
+                    1
+                )
+            ) AS dias_renta_24h,
+            COUNT(*) AS contratos
+        FROM rentas
+        GROUP BY sede_handover
     )
     SELECT
-        asesor_codigo,
-        COUNT(DISTINCT placa || '~' || fecha::text) AS dias_ocupacion,
-        COUNT(*)                                    AS dias_renta
-    FROM carro_dia
-    GROUP BY asesor_codigo
+        COALESCE(o.sede_handover, r.sede_handover) AS sede,
+        COALESCE(o.dias_ocupacion, 0)              AS dias_ocupacion,
+        COALESCE(r.dias_renta_24h, 0)              AS dias_renta_24h,
+        COALESCE(r.contratos, 0)                   AS contratos
+    FROM ocupacion o
+    FULL OUTER JOIN renta_24h r ON r.sede_handover = o.sede_handover
+    ORDER BY dias_renta_24h DESC
 """
-df_dias = load_query(dias_sql, params)
-if not df_dias.empty:
-    for c in ("dias_ocupacion", "dias_renta"):
-        df_dias[c] = pd.to_numeric(df_dias[c], errors="coerce").fillna(0).astype(int)
-    # Normalizar codigo a mismo tipo que asesor_summary para el merge
-    df_dias["asesor_codigo"] = df_dias["asesor_codigo"].astype("Float64")
-    asesor_summary["asesor_codigo_num"] = pd.to_numeric(
-        asesor_summary["asesor_codigo"], errors="coerce"
-    ).astype("Float64")
-    asesor_summary = asesor_summary.merge(
-        df_dias, left_on="asesor_codigo_num", right_on="asesor_codigo",
-        how="left", suffixes=("", "_dias"),
-    )
-    asesor_summary = asesor_summary.drop(
-        columns=["asesor_codigo_num", "asesor_codigo_dias"], errors="ignore"
-    )
-else:
-    asesor_summary["dias_ocupacion"] = 0
-    asesor_summary["dias_renta"] = 0
+df_dias_sede = load_query(dias_sql_sede, params)
+if not df_dias_sede.empty:
+    for c in ("dias_ocupacion", "dias_renta_24h", "contratos"):
+        df_dias_sede[c] = pd.to_numeric(
+            df_dias_sede[c], errors="coerce"
+        ).fillna(0).astype(int)
 
-asesor_summary["dias_ocupacion"] = (
-    asesor_summary["dias_ocupacion"].fillna(0).astype(int)
+total_dias_ocupacion = int(df_dias_sede["dias_ocupacion"].sum()) if not df_dias_sede.empty else 0
+total_dias_renta_24h = int(df_dias_sede["dias_renta_24h"].sum()) if not df_dias_sede.empty else 0
+pct_meta_global = (
+    round((total_dias_renta_24h / meta_dias) * 100, 1)
+    if meta_dias > 0 else 0.0
 )
-asesor_summary["dias_renta"] = (
-    asesor_summary["dias_renta"].fillna(0).astype(int)
-)
-
-# % cumplimiento de meta (basado en dias_renta)
-if meta_dias > 0:
-    asesor_summary["pct_meta"] = (
-        (asesor_summary["dias_renta"] / meta_dias) * 100
-    ).round(1)
-else:
-    asesor_summary["pct_meta"] = 0.0
 
 # % comisionable = base comisionable / counter total (interno, no mostrado).
 # Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
@@ -585,6 +602,37 @@ asesor_summary["nombre_completo"] = (
     asesor_summary["nombre_completo"].fillna("(sin mapear)")
 )
 
+# ---------- KPIs de dias (TOTAL del periodo + sede filtrada) ----------
+kpi_c1, kpi_c2, kpi_c3 = st.columns(3)
+kpi(kpi_c1, "Dias ocupacion (total)", f"{total_dias_ocupacion:,}")
+kpi(kpi_c2, "Dias renta 24h (total)", f"{total_dias_renta_24h:,}")
+kpi(
+    kpi_c3,
+    f"% Cumplimiento meta ({meta_dias:,} dias)",
+    f"{pct_meta_global:.1f}%",
+)
+
+# Tabla de breakdown por sede (si hay mas de una sede en el periodo)
+if not df_dias_sede.empty and len(df_dias_sede) > 0:
+    _sede_view = df_dias_sede.copy()
+    _sede_view["pct_meta"] = (
+        (_sede_view["dias_renta_24h"] / meta_dias * 100).round(1)
+        if meta_dias > 0 else 0.0
+    )
+    _sede_view["pct_meta"] = _sede_view["pct_meta"].apply(lambda v: f"{v:.1f}%")
+    _sede_view = _sede_view[[
+        "sede", "contratos", "dias_ocupacion", "dias_renta_24h", "pct_meta"
+    ]].rename(columns={
+        "sede": "Sede",
+        "contratos": "Contratos",
+        "dias_ocupacion": "Dias ocupacion",
+        "dias_renta_24h": "Dias renta 24h",
+        "pct_meta": f"% Meta ({meta_dias:,})",
+    })
+    st.markdown("**Breakdown por sede:**")
+    st.dataframe(_sede_view, use_container_width=True, hide_index=True)
+
+# ---------- Tabla por asesor (solo comisiones, sin dias) ----------
 view_asesor = asesor_summary.copy()
 view_asesor["base_comisionable_usd"] = view_asesor["base_comisionable_usd"].apply(
     lambda v: fmt_money(v, "USD")
@@ -595,14 +643,10 @@ view_asesor["base_comisionable_cop"] = view_asesor["base_comisionable_cop"].appl
 view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
     lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
 )
-view_asesor["pct_meta"] = view_asesor["pct_meta"].apply(
-    lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
-)
 
 # Solo mostramos columnas relevantes para comisiones
 view_asesor = view_asesor[[
     "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
-    "dias_ocupacion", "dias_renta", "pct_meta",
     "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
 ]]
 
@@ -611,9 +655,6 @@ view_asesor = view_asesor.rename(columns={
     "nombre_completo": "Nombre",
     "contratos": "Contratos",
     "cargos_counter": "Cargos counter",
-    "dias_ocupacion": "Dias ocupacion",
-    "dias_renta": "Dias renta",
-    "pct_meta": f"% meta ({meta_dias} dias)",
     "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
     "base_comisionable_cop": "BASE COMISIONABLE COP (c/IVA)",
     "pct_comisionable": "% comisionable",
@@ -622,7 +663,6 @@ st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 xlsx_download_button(
     asesor_summary[[
         "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
-        "dias_ocupacion", "dias_renta", "pct_meta",
         "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
     ]],
     file_name=f"cargos_granular_asesor_{dt.date.today()}",
