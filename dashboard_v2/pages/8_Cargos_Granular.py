@@ -548,6 +548,126 @@ st.markdown("---")
 
 
 # =============================================================================
+# Seccion 3b: Drill-down por asesor — contratos con base comisionable
+# =============================================================================
+section("Drill-down: contratos con base comisionable por asesor")
+st.caption(
+    "Selecciona un asesor para ver los contratos y cargos exactos que "
+    "aportan a su base comisionable. Solo aparecen cargos comisionables "
+    f"({', '.join(COMISIONABLES)}) que fueron 100% counter (no MIXTO). "
+    "Montos mostrados CON IVA 19%."
+)
+
+# Solo asesores que tienen algo en la base comisionable
+_asesores_base = asesor_summary[
+    pd.to_numeric(asesor_summary["base_comisionable_usd"], errors="coerce") > 0
+].copy().sort_values("base_comisionable_usd", ascending=False)
+
+if _asesores_base.empty:
+    st.info("Ningun asesor tiene base comisionable en el periodo/sedes seleccionados.")
+else:
+    # Etiqueta: "Nombre (Codigo)" si esta mapeado, "Codigo — (sin mapear)" si no
+    def _drill_label(row):
+        codigo = row["asesor_codigo"]
+        nombre = row["nombre_completo"]
+        if nombre == "(sin mapear)":
+            return f"{codigo} — (sin mapear)"
+        return f"{nombre} ({codigo})"
+
+    _asesores_base["_drill_label"] = _asesores_base.apply(_drill_label, axis=1)
+    _options = ["-- Seleccionar asesor --"] + _asesores_base["_drill_label"].tolist()
+    _selected = st.selectbox(
+        "Asesor",
+        options=_options,
+        key="_drill_asesor_sel",
+        help="Ordenados por base comisionable (mayor a menor).",
+    )
+
+    if _selected != "-- Seleccionar asesor --":
+        # Extraer el codigo del selected
+        _sel_row = _asesores_base[_asesores_base["_drill_label"] == _selected].iloc[0]
+        _codigo_sel = _sel_row["asesor_codigo"]  # string
+        _codigo_num = pd.to_numeric(_codigo_sel, errors="coerce")
+
+        # Filtrar df a solo cargos de ese asesor que aportan a base
+        _drill = df[
+            (pd.to_numeric(df["asesor_codigo"], errors="coerce") == _codigo_num)
+            & (df["es_base_comision"])
+        ].copy()
+
+        if _drill.empty:
+            st.warning("No hay cargos base para este asesor en el periodo.")
+        else:
+            # Aplicar IVA (misma logica que la tabla de arriba)
+            _drill["counter_ciiva_usd"] = _drill["counter_usd"] * IVA_FACTOR_COMISION
+            _drill["counter_ciiva_cop"] = _drill["counter_cop"] * IVA_FACTOR_COMISION
+
+            # Vista limpia
+            _drill_view = _drill[[
+                "numero_contrato", "fecha_entrega", "sede",
+                "codigo", "descripcion",
+                "counter_usd", "counter_ciiva_usd",
+                "counter_cop", "counter_ciiva_cop",
+            ]].copy()
+
+            # Format money
+            for c in ("counter_usd", "counter_ciiva_usd"):
+                _drill_view[c] = _drill_view[c].apply(lambda v: fmt_money(v, "USD"))
+            for c in ("counter_cop", "counter_ciiva_cop"):
+                _drill_view[c] = _drill_view[c].apply(lambda v: fmt_money(v, "COP"))
+
+            _drill_view = _drill_view.rename(columns={
+                "numero_contrato": "Contrato",
+                "fecha_entrega": "Entrega",
+                "sede": "Sede",
+                "codigo": "Cod",
+                "descripcion": "Descripcion",
+                "counter_usd": "Counter USD (s/IVA)",
+                "counter_ciiva_usd": "Counter USD (c/IVA)",
+                "counter_cop": "Counter COP (s/IVA)",
+                "counter_ciiva_cop": "Counter COP (c/IVA)",
+            })
+
+            # Ordenar por contrato para agrupar visualmente
+            _drill_view = _drill_view.sort_values(["Contrato", "Cod"])
+
+            st.dataframe(_drill_view, use_container_width=True, hide_index=True)
+
+            # Totales de este asesor
+            _n_cargos = len(_drill)
+            _n_contratos = _drill["numero_contrato"].nunique()
+            _total_usd_ciiva = _drill["counter_ciiva_usd"].sum()
+            _total_cop_ciiva = _drill["counter_ciiva_cop"].sum()
+
+            st.caption(
+                f"**{_n_cargos}** cargo(s) comisionable(s) en **{_n_contratos}** "
+                f"contrato(s). "
+                f"Base total: **{fmt_money(_total_usd_ciiva, 'USD')}** / "
+                f"**{fmt_money(_total_cop_ciiva, 'COP')}** (c/IVA). "
+                f"Este numero debe coincidir con la fila del asesor en la tabla "
+                f"de arriba."
+            )
+
+            # Export
+            xlsx_download_button(
+                _drill[[
+                    "numero_contrato", "fecha_entrega", "sede",
+                    "codigo", "descripcion",
+                    "counter_usd", "counter_ciiva_usd",
+                    "counter_cop", "counter_ciiva_cop",
+                ]],
+                file_name=(
+                    f"drill_asesor_{_codigo_sel}_{dt.date.today()}"
+                ),
+                sheet_name="Detalle base comision",
+                key=f"xlsx_drill_asesor_{_codigo_sel}",
+            )
+
+
+st.markdown("---")
+
+
+# =============================================================================
 # Seccion 4: Descargar data raw
 # =============================================================================
 section("Exportar")
