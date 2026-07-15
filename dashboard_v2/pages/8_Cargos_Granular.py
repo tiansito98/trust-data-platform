@@ -472,8 +472,8 @@ dias_sql = f"""
             gs::date AS fecha
         FROM rentas r
         CROSS JOIN LATERAL generate_series(
-            GREATEST(r.f_ini, :desde::date),
-            LEAST(r.f_fin, :hasta::date),
+            GREATEST(r.f_ini, CAST(:desde AS date)),
+            LEAST(r.f_fin, CAST(:hasta AS date)),
             INTERVAL '1 day'
         ) gs
     )
