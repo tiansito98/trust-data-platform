@@ -758,11 +758,11 @@ else:
         f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
         f"negativo = uso una mas baja."
     )
-    # Export: dropear dup_all_ids (lista de Postgres, openpyxl no soporta listas).
-    # La columna formateada 'duplicados' (string "Dup con #X, #Y") sigue presente.
-    df_fin_export = df_fin.drop(columns=["dup_all_ids"], errors="ignore").copy()
+    # Export: EXACTAMENTE las columnas mostradas en la tabla (mismas etiquetas
+    # y orden que el data_editor). Los montos ya vienen formateados como texto
+    # con estilo europeo ($1.502.654 / TRM 2,00 / -).
     xlsx_download_button(
-        df_fin_export,
+        view,
         file_name=f"facturas_finalizadas_{dt.date.today()}",
         sheet_name="Finalizadas",
         key="xlsx_facturas_finalizadas",
