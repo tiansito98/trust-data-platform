@@ -1707,6 +1707,88 @@ def build_kpi_sede_categoria_anual(engine):
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
 
+def build_asesor_dias_mes(engine):
+    """Dias rentados por asesor por mes.
+
+    Expande cada contrato a un registro por dia calendario (carro-dia) y
+    agrega dos metricas por asesor + mes:
+
+      A) dias_ocupacion = COUNT(DISTINCT (placa, fecha))
+         Metrica acida de ocupacion — cuenta 1 por carro por dia aunque haya
+         solapes intradia. Es la que alimenta metas de dias absolutos.
+
+      B) dias_renta = COUNT(*) de registros carro-dia
+         Indicador de intensidad — cuenta solapes/rotacion intradia. Hoy
+         A ≈ B porque Sixt renta por dia (no por horas); la diferencia
+         B - A mide rotacion intradia y sirve a futuro.
+
+    Reglas:
+      - f_ini = fecha_handover_real::date
+      - f_fin = LEAST(COALESCE(fecha_devolucion_real::date, hoy), hoy)
+        (recorta contratos abiertos/futuros a hoy)
+      - Un dia por cada fecha en [f_ini, f_fin] inclusivo.
+      - Revenue prorrateado por dia = neto_usd / dias.
+      - Filtros de higiene: rental_currency='USD', placa NO vacia (excluye
+        status-match dummies), fecha_handover <= hoy.
+
+    Asesor = operador_handover_codigo (mismo que usa Cargos Granular para
+    comisiones — asi las dos cosas casan por la misma llave).
+    """
+    log("\n>> Construyendo vw_asesor_dias_mes")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.vw_asesor_dias_mes CASCADE")
+    _exec(engine, "DROP VIEW  IF EXISTS silver.vw_asesor_dias_mes CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver.vw_asesor_dias_mes AS
+        WITH rentas AS (
+            SELECT
+                numero_contrato,
+                placa,
+                operador_handover_codigo AS asesor_codigo,
+                sede_handover,
+                fecha_handover_real::date AS f_ini,
+                LEAST(
+                    COALESCE(fecha_devolucion_real::date, CURRENT_DATE),
+                    CURRENT_DATE
+                )                        AS f_fin,
+                COALESCE(neto_usd, 0)    AS neto_usd
+            FROM silver.vw_rentals_resumen
+            WHERE rental_currency = 'USD'
+              AND TRIM(COALESCE(placa, '')) <> ''
+              AND fecha_handover_real IS NOT NULL
+              AND fecha_handover_real::date <= CURRENT_DATE
+        ),
+        carro_dia AS (
+            SELECT
+                r.numero_contrato,
+                r.asesor_codigo,
+                r.sede_handover,
+                r.placa,
+                gs::date              AS fecha,
+                TO_CHAR(gs, 'YYYY-MM') AS anio_mes,
+                r.neto_usd / GREATEST((r.f_fin - r.f_ini) + 1, 1) AS rev_dia
+            FROM rentas r
+            CROSS JOIN LATERAL generate_series(
+                r.f_ini, r.f_fin, INTERVAL '1 day'
+            ) gs
+        )
+        SELECT
+            anio_mes,
+            asesor_codigo,
+            COUNT(DISTINCT placa || '~' || fecha::text) AS dias_ocupacion,
+            COUNT(*)                                    AS dias_renta,
+            COUNT(DISTINCT numero_contrato)             AS contratos,
+            COUNT(DISTINCT placa)                       AS placas_distintas,
+            ROUND(SUM(rev_dia)::numeric, 2)             AS revenue_neto_usd
+        FROM carro_dia
+        GROUP BY anio_mes, asesor_codigo
+        ORDER BY anio_mes DESC, dias_ocupacion DESC
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_asesor_dias_mes_am_ac ON silver.vw_asesor_dias_mes(anio_mes, asesor_codigo)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.vw_asesor_dias_mes")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
 # =============================================================================
 # main
 # =============================================================================
@@ -1756,6 +1838,9 @@ def main():
     build_utilizacion_sede_categoria_mes(engine)
     build_flota_segmento_anual(engine)
     build_kpi_sede_categoria_anual(engine)
+
+    # 12. Dias rentados por asesor (para metas y drill-down)
+    build_asesor_dias_mes(engine)
 
     report_counts(engine)
 
