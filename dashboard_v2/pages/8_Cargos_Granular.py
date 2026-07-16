@@ -121,33 +121,39 @@ if sedes_sel:
 #   - rental_currency = 'USD'
 # NO filtramos por TRIM(placa)!='' porque Cierre Diario no lo hace
 # (incluye contratos shadow de status-match, que aportan $0 pero existen).
+#
+# COP: computamos USD * TRM Banrep (dim_trm_diaria) por fila para cuadrar
+# con Cierre Diario. Los campos _cop nativos de silver usan TRM interna
+# Sixt y quedaban ~1.3% distintos del NETO de Cierre Diario.
 charges_sql = f"""
     SELECT
-        numero_contrato,
-        sede_handover                       AS sede,
-        fecha_handover_real::date           AS fecha_entrega,
-        cargo_codigo                        AS codigo,
-        cargo_descripcion                   AS descripcion,
-        cargo_categoria                     AS categoria,
+        d.numero_contrato,
+        d.sede_handover                       AS sede,
+        d.fecha_handover_real::date           AS fecha_entrega,
+        d.cargo_codigo                        AS codigo,
+        d.cargo_descripcion                   AS descripcion,
+        d.cargo_categoria                     AS categoria,
         CASE
-            WHEN cargo_codigo = 'T'                THEN 'VENTAS'
-            WHEN cargo_codigo IN ('BF','LD','SL')  THEN 'COBERTURAS'
-            WHEN cargo_codigo = 'Y'                THEN 'TAX (Y)'
-            ELSE                                        'ADICIONALES'
-        END                                 AS bucket_cobra,
-        canal_cobro_tarifa,
-        operador_handover_codigo            AS asesor_codigo,
-        operador_checkout_codigo            AS asesor_checkout,
-        subtotal_usd,
-        subtotal_cop,
-        prepagado_cargo_usd                 AS prepagado_usd,
-        counter_cargo_usd                   AS counter_usd,
-        prepagado_cargo_cop                 AS prepagado_cop,
-        counter_cargo_cop                   AS counter_cop
-    FROM vw_rentals_detail
-    WHERE fecha_handover_real::date BETWEEN :desde AND :hasta
-      AND fuente_cargo = 'RENTAL_COUNTER'
-      AND rental_currency = 'USD'
+            WHEN d.cargo_codigo = 'T'                THEN 'VENTAS'
+            WHEN d.cargo_codigo IN ('BF','LD','SL')  THEN 'COBERTURAS'
+            WHEN d.cargo_codigo = 'Y'                THEN 'TAX (Y)'
+            ELSE                                          'ADICIONALES'
+        END                                    AS bucket_cobra,
+        d.canal_cobro_tarifa,
+        d.operador_handover_codigo             AS asesor_codigo,
+        d.operador_checkout_codigo             AS asesor_checkout,
+        d.subtotal_usd,
+        ROUND(d.subtotal_usd::numeric * t.trm_cop_per_usd, 0)         AS subtotal_cop,
+        d.prepagado_cargo_usd                  AS prepagado_usd,
+        d.counter_cargo_usd                    AS counter_usd,
+        ROUND(d.prepagado_cargo_usd::numeric * t.trm_cop_per_usd, 0)  AS prepagado_cop,
+        ROUND(d.counter_cargo_usd::numeric * t.trm_cop_per_usd, 0)    AS counter_cop
+    FROM vw_rentals_detail d
+    LEFT JOIN dim_trm_diaria t
+           ON t.fecha = d.fecha_handover_real::date
+    WHERE d.fecha_handover_real::date BETWEEN :desde AND :hasta
+      AND d.fuente_cargo = 'RENTAL_COUNTER'
+      AND d.rental_currency = 'USD'
       {sede_clause_detail}
 """
 df = load_query(charges_sql, params)
@@ -179,23 +185,26 @@ df["es_comisionable"] = df["codigo"].isin(COMISIONABLES)
 
 # Query 2: totales (bruto, descuento, neto) desde vw_rentals_resumen
 # Estos son los MISMOS numeros que muestra Cierre Diario en sus KPIs.
-# Necesitamos descuento_usd/cop porque en detail solo tenemos subtotal (bruto).
+# COP: computamos USD * TRM Banrep (dim_trm_diaria) por fila para cuadrar
+# con Cierre Diario (regla del repo: siempre TRM Banrep, no la interna Sixt).
 totales_sql = f"""
     SELECT
-        COUNT(*)                                AS contratos,
-        COALESCE(SUM(bruto_usd), 0)             AS bruto_usd,
-        COALESCE(SUM(descuento_usd), 0)         AS descuento_usd,
-        COALESCE(SUM(neto_usd), 0)              AS neto_usd,
-        COALESCE(SUM(iva_usd), 0)               AS iva_usd,
-        COALESCE(SUM(total_con_iva_usd), 0)     AS total_con_iva_usd,
-        COALESCE(SUM(bruto_cop), 0)             AS bruto_cop,
-        COALESCE(SUM(descuento_cop), 0)         AS descuento_cop,
-        COALESCE(SUM(neto_cop), 0)              AS neto_cop,
-        COALESCE(SUM(iva_cop), 0)               AS iva_cop,
-        COALESCE(SUM(total_con_iva_cop), 0)     AS total_con_iva_cop
-    FROM vw_rentals_resumen
-    WHERE fecha_handover_real::date BETWEEN :desde AND :hasta
-      AND rental_currency = 'USD'
+        COUNT(*)                                          AS contratos,
+        COALESCE(SUM(r.bruto_usd), 0)                     AS bruto_usd,
+        COALESCE(SUM(r.descuento_usd), 0)                 AS descuento_usd,
+        COALESCE(SUM(r.neto_usd), 0)                      AS neto_usd,
+        COALESCE(SUM(r.iva_usd), 0)                       AS iva_usd,
+        COALESCE(SUM(r.total_con_iva_usd), 0)             AS total_con_iva_usd,
+        COALESCE(SUM(ROUND(r.bruto_usd::numeric         * t.trm_cop_per_usd, 0)), 0) AS bruto_cop,
+        COALESCE(SUM(ROUND(r.descuento_usd::numeric     * t.trm_cop_per_usd, 0)), 0) AS descuento_cop,
+        COALESCE(SUM(ROUND(r.neto_usd::numeric           * t.trm_cop_per_usd, 0)), 0) AS neto_cop,
+        COALESCE(SUM(ROUND(r.iva_usd::numeric            * t.trm_cop_per_usd, 0)), 0) AS iva_cop,
+        COALESCE(SUM(ROUND(r.total_con_iva_usd::numeric  * t.trm_cop_per_usd, 0)), 0) AS total_con_iva_cop
+    FROM vw_rentals_resumen r
+    LEFT JOIN dim_trm_diaria t
+           ON t.fecha = r.fecha_handover_real::date
+    WHERE r.fecha_handover_real::date BETWEEN :desde AND :hasta
+      AND r.rental_currency = 'USD'
       {sede_clause_resumen}
 """
 df_tot = load_query(totales_sql, params)
