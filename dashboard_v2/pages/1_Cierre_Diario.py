@@ -80,6 +80,13 @@ SELECT numero_contrato, fecha_handover_real, fecha_devolucion_real, dias_renta,
        prepagado_usd, counter_usd, prepagado_cop, counter_cop
 FROM vw_rentals_resumen
 WHERE {where_sql}
+  -- Excluir no-shows y cancelaciones (contratos sin placa o total 0).
+  -- Los "sin placa + asesor 7777777" son placeholders sistemicos de Sixt
+  -- para no-shows/cancelaciones. Los "placa real + total 0" son
+  -- cancelaciones capturadas por asesor local. Ninguno debe contar
+  -- como ingreso.
+  AND TRIM(COALESCE(placa, '')) <> ''
+  AND COALESCE(total_con_iva_usd, 0) > 0
 ORDER BY DATE(fecha_handover_real) DESC, numero_contrato
 """
 df_resumen = load_query(resumen_sql, params)

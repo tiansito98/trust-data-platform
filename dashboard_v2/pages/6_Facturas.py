@@ -26,8 +26,9 @@ from components.auth import (
 )
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
-    fmt_money, render_trm_today_sidebar, xlsx_download_button,
+    fmt_money, xlsx_download_button,
 )
+from components.filters import render_sidebar_filters
 
 IVA_PORCENTAJE = 19.0
 VALIDATION_TOLERANCE_COP = 500  # diferencia maxima aceptable
@@ -38,7 +39,12 @@ st.set_page_config(page_title="TRUST - Facturas", layout="wide")
 require_auth()
 require_page("6_Facturas")
 inject_styles()
-render_trm_today_sidebar()
+
+# Filtro sidebar unificado (mismo componente que Cierre Diario, Ingresos, etc.)
+# El rango de fechas se usa para el HISTORIAL. Pendientes y abiertas tienen
+# su propia logica (no dependen del rango).
+filtros = render_sidebar_filters(default_days=90)
+
 logout_button()
 render_header("Facturas / Recibos")
 
@@ -539,30 +545,22 @@ st.markdown("---")
 # =============================================================================
 # 4. FACTURAS FINALIZADAS (historial)
 # =============================================================================
-section("Historial de facturas finalizadas")
+section("Historial de facturas")
 st.caption(
-    "Vista retrospectiva. Muestra que se cobro, que decia el contrato segun "
-    "silver, la diferencia, la TRM oficial Banrep del dia de entrega y la "
-    "TRM efectivamente usada (deducida del monto cobrado)."
+    "Vista retrospectiva de TODAS las facturas (abiertas + finalizadas). "
+    "Muestra que se cobro, que decia el contrato segun silver, la "
+    "diferencia, la TRM oficial Banrep del dia de entrega y la TRM "
+    "efectivamente usada (deducida del monto cobrado). El checkbox "
+    "'Revisada' solo aplica a facturas finalizadas."
 )
 
-# Filtro por rango de fechas (default: ultimos 90 dias).
-# Antes habia un LIMIT 50 que ocultaba facturas viejas si en los ultimos
-# dias se finalizaban muchas. El filtro por fecha es mas predecible.
-_today = dt.date.today()
-_default_desde = _today - dt.timedelta(days=90)
-hist_cols = st.columns([1, 1, 4])
-hist_desde = hist_cols[0].date_input(
-    "Desde (fecha entrega contrato)",
-    value=_default_desde,
-    key="_hist_desde",
-    help="Filtra por fecha de handover del contrato. Default: ultimos 90 dias.",
-)
-hist_hasta = hist_cols[1].date_input(
-    "Hasta (fecha entrega contrato)",
-    value=_today,
-    key="_hist_hasta",
-    help="Hasta esta fecha de handover del contrato.",
+# Rango de fechas viene del sidebar unificado — consistente con el resto
+# del dashboard. Usa fecha_handover_real del contrato para filtrar.
+hist_desde = filtros.fecha_desde
+hist_hasta = filtros.fecha_hasta
+st.caption(
+    f"Filtrando por handover entre **{hist_desde}** y **{hist_hasta}** "
+    f"(ajusta el rango en el sidebar izquierdo)."
 )
 
 # JOIN a silver + dim_trm_diaria para validar contra TRM oficial.
@@ -582,6 +580,7 @@ fin_sql = f"""
         HAVING COUNT(*) > 1
     )
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
+           i.finalizada,
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
            i.finalizada_por, i.finalizada_at,
@@ -604,7 +603,7 @@ fin_sql = f"""
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
-    WHERE i.finalizada = TRUE {sede_where}
+    WHERE TRUE {sede_where}
       AND (
             -- Si esta en silver: filtra por handover del contrato
             (r.fecha_handover_real::date BETWEEN :hist_desde AND :hist_hasta)
@@ -612,15 +611,23 @@ fin_sql = f"""
             OR (r.fecha_handover_real IS NULL
                 AND i.fecha_emision BETWEEN :hist_desde AND :hist_hasta)
       )
-    ORDER BY i.finalizada_at DESC
+    -- Orden: finalizadas por fecha finalizacion, abiertas por captura
+    ORDER BY i.finalizada DESC,
+             COALESCE(i.finalizada_at, i.capturado_at) DESC
 """
 _fin_params = {"hist_desde": hist_desde, "hist_hasta": hist_hasta}
 if sede_params:
     _fin_params.update(sede_params)
 df_fin = load_query(fin_sql, _fin_params)
 if df_fin.empty:
-    st.info("No hay facturas finalizadas.")
+    st.info("No hay facturas en este rango.")
 else:
+    # Estado legible para display + control de editabilidad del checkbox
+    df_fin["finalizada"] = df_fin["finalizada"].fillna(False).astype(bool)
+    df_fin["estado"] = df_fin["finalizada"].apply(
+        lambda v: "Finalizada" if v else "Abierta"
+    )
+
     # Diferencia entre TRM usada y TRM oficial (cuanto se desvio el asesor)
     df_fin["diff_trm"] = df_fin["trm_usada_calculada"] - df_fin["trm_oficial"]
 
@@ -646,11 +653,11 @@ else:
             f"las que sobran (regla 1:1)."
         )
 
-    # Vista formateada. La columna 'Revisada' es CHECKBOX editable — cuando
-    # el usuario la marca, guardamos revisada=TRUE + audit trail (quien/cuando).
+    # Vista formateada. La columna 'Revisada' es CHECKBOX editable SOLO para
+    # facturas finalizadas. Para abiertas se desactiva (aún no cerraron).
     view = df_fin[[
-        "invoice_id", "revisada", "fecha_emision", "sede_nombre", "rntl_mvnr",
-        "duplicados", "numero_factura", "numero_recibo",
+        "invoice_id", "estado", "revisada", "fecha_emision", "sede_nombre",
+        "rntl_mvnr", "duplicados", "numero_factura", "numero_recibo",
         "fecha_entrega",
         "monto_total", "sistema_cop", "diferencia",
         "trm_oficial", "trm_usada_calculada", "diff_trm",
@@ -682,6 +689,7 @@ else:
 
     view = view.rename(columns={
         "invoice_id": "ID",
+        "estado": "Estado",
         "revisada": "Revisada",
         "fecha_emision": "Fecha emision",
         "sede_nombre": "Sede",
@@ -723,13 +731,20 @@ else:
         key="_fin_editor",
     )
 
-    # Detectar cambios en la columna 'Revisada' y persistir
+    # Detectar cambios en la columna 'Revisada' y persistir.
+    # SOLO se aceptan cambios en filas cuyo Estado = 'Finalizada'.
+    # (Las abiertas no pueden marcarse como revisadas — la factura aun no cerro.)
     if not edited_view["Revisada"].equals(view["Revisada"]):
+        cambios_rechazados = 0
         for i in range(len(view)):
             orig = bool(view.iloc[i]["Revisada"])
             new = bool(edited_view.iloc[i]["Revisada"])
             if orig == new:
                 continue
+            estado_row = view.iloc[i]["Estado"]
+            if estado_row != "Finalizada":
+                cambios_rechazados += 1
+                continue  # ignoramos edicion en abiertas
             invoice_id = int(edited_view.iloc[i]["ID"])
             if new:
                 execute_write("""
@@ -747,14 +762,21 @@ else:
                         revisada_por = NULL
                     WHERE invoice_id = :id
                 """, {"id": invoice_id})
+        if cambios_rechazados > 0:
+            st.warning(
+                f"{cambios_rechazados} cambio(s) ignorado(s) — solo se puede "
+                f"marcar como Revisada una factura Finalizada."
+            )
         load_query.clear()
         st.rerun()
 
+    n_abiertas = int((view["Estado"] == "Abierta").sum())
+    n_finalizadas = int((view["Estado"] == "Finalizada").sum())
     n_revisadas = int(view["Revisada"].sum())
     st.caption(
-        f"Mostrando {len(view)} facturas finalizadas "
-        f"(entrega entre {hist_desde} y {hist_hasta}) — "
-        f"{n_revisadas} revisada(s), {len(view) - n_revisadas} pendiente(s) de revision. "
+        f"Mostrando {len(view)} facturas (entrega entre {hist_desde} y {hist_hasta}) — "
+        f"{n_finalizadas} finalizada(s), {n_abiertas} abierta(s), "
+        f"{n_revisadas} revisada(s). "
         f"'Δ TRM' positivo = el asesor uso una TRM mas alta que la oficial; "
         f"negativo = uso una mas baja."
     )

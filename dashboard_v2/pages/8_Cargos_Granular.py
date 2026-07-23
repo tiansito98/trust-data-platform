@@ -57,40 +57,21 @@ if not is_admin():
     st.stop()
 
 inject_styles()
-render_trm_today_sidebar()
 logout_button()
 render_header("Cargos Granular (Admin)")
 
 
 # =============================================================================
-# Filtros
+# Filtros — sidebar unificado (mismo que Cierre Diario, Ingresos, Vehiculos)
 # =============================================================================
-section("Filtros")
+from components.filters import render_sidebar_filters, render_active_filters_banner  # noqa: E402
 
-# Default: ultimos 7 dias (incluyendo hoy)
-default_end = dt.date.today()
-default_start = default_end - dt.timedelta(days=6)
+filtros = render_sidebar_filters(default_days=7)
+render_active_filters_banner(filtros)
 
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    desde = st.date_input("Desde", value=default_start, key="cg_desde")
-with c2:
-    hasta = st.date_input("Hasta", value=default_end, key="cg_hasta")
-with c3:
-    # Cargar sedes para el multiselect
-    sedes_df = load_query(
-        "SELECT DISTINCT sede_handover AS sede "
-        "FROM vw_rentals_resumen "
-        "WHERE sede_handover IS NOT NULL "
-        "ORDER BY sede_handover"
-    )
-    sedes_opts = sedes_df["sede"].tolist()
-    sedes_sel = st.multiselect(
-        "Sedes (opcional - todas si vacio)",
-        options=sedes_opts,
-        default=[],
-        key="cg_sedes",
-    )
+desde = filtros.fecha_desde
+hasta = filtros.fecha_hasta
+sedes_sel = filtros.sedes_codigos  # ahora usa CODIGOS de sede, no nombres
 
 if (hasta - desde).days < 0:
     st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
@@ -110,8 +91,9 @@ sede_clause_detail = ""
 sede_clause_resumen = ""
 params = {"desde": desde, "hasta": hasta}
 if sedes_sel:
-    sede_clause_detail = "AND sede_handover = ANY(:sedes)"
-    sede_clause_resumen = "AND sede_handover = ANY(:sedes)"
+    # Ahora usamos CODIGO de sede (int) — consistente con Cierre Diario/Ingresos/etc.
+    sede_clause_detail = "AND d.sede_handover_codigo = ANY(:sedes)"
+    sede_clause_resumen = "AND r.sede_handover_codigo = ANY(:sedes)"
     params["sedes"] = list(sedes_sel)
 
 # Query 1: cargos individuales desde vw_rentals_detail
@@ -154,6 +136,9 @@ charges_sql = f"""
     WHERE d.fecha_handover_real::date BETWEEN :desde AND :hasta
       AND d.fuente_cargo = 'RENTAL_COUNTER'
       AND d.rental_currency = 'USD'
+      -- Excluir no-shows y cancelaciones (contratos sin placa o total 0)
+      AND TRIM(COALESCE(d.placa, '')) <> ''
+      AND COALESCE(d.subtotal_usd, 0) > 0
       {sede_clause_detail}
 """
 df = load_query(charges_sql, params)
@@ -205,6 +190,9 @@ totales_sql = f"""
            ON t.fecha = r.fecha_handover_real::date
     WHERE r.fecha_handover_real::date BETWEEN :desde AND :hasta
       AND r.rental_currency = 'USD'
+      -- Excluir no-shows y cancelaciones (sin placa o total 0)
+      AND TRIM(COALESCE(r.placa, '')) <> ''
+      AND COALESCE(r.total_con_iva_usd, 0) > 0
       {sede_clause_resumen}
 """
 df_tot = load_query(totales_sql, params)
@@ -413,17 +401,43 @@ st.caption(
     "en el rango de fechas seleccionado arriba."
 )
 
-# Meta de dias renta (24h) — total del periodo/sede seleccionado.
-# Se usa para calcular % de cumplimiento global (dias_renta_24h_total / meta).
-meta_dias = st.number_input(
-    "Meta de dias renta 24h (total del periodo)",
-    min_value=0, max_value=100000, value=1500, step=50,
-    key="_cargos_meta_dias",
-    help="Meta total de dias renta 24h para el rango de fechas y sedes "
-         "seleccionados. Se calcula un % de cumplimiento global. "
-         "Los dias renta 24h son bloques de 24h reales — un contrato de 25h "
-         "cuenta como 2 dias.",
-)
+# Metas de dias renta 24h POR SEDE.
+# Cada sede tiene su propia meta (senior/junior/tamano de flota difieren).
+# Default 500 dias por sede; el usuario ajusta cada una segun corresponda.
+SEDES_CONOCIDAS = [
+    "BOGOTA EL DORADO INTL AIRPORT",
+    "MEDELLIN AP JOSE MARIA CORDOVA",
+    "MEDELLIN CITY EL POBLADO",
+    "PEREIRA AIRPORT MATECANA INTL",
+    "BUCARAMANGA AIRPORT",
+    "SANTA MARTA SIMON BOLIVAR",
+]
+DEFAULT_META_SEDE = 500  # Ajustable por sede en la UI
+
+with st.expander("Metas de dias renta 24h (por sede)", expanded=False):
+    st.caption(
+        "Ajusta la meta mensual de dias renta 24h por sede. Los valores "
+        "se mantienen mientras dure la sesion. Un contrato de 25h "
+        "cuenta como 2 dias (bloques de 24h clipped al rango)."
+    )
+    meta_por_sede = {}
+    meta_cols_ui = st.columns(3)
+    for idx, sede in enumerate(SEDES_CONOCIDAS):
+        with meta_cols_ui[idx % 3]:
+            # Etiqueta corta para no romper layout
+            sede_short = sede.replace(" INTL AIRPORT", "").replace(
+                " AP JOSE MARIA CORDOVA", " AP"
+            ).replace(" AIRPORT MATECANA INTL", "").replace(
+                " SIMON BOLIVAR", ""
+            ).replace(" CITY", "").replace(" EL DORADO", "")
+            meta_por_sede[sede] = st.number_input(
+                f"Meta {sede_short}",
+                min_value=0, max_value=10000, value=DEFAULT_META_SEDE, step=50,
+                key=f"_cargos_meta_{sede}",
+            )
+
+# Meta global = suma de metas por sede (para KPI de total)
+meta_dias = sum(meta_por_sede.values()) if meta_por_sede else 0
 
 # Regla comisionable: SOLO cargos PURE COUNTER de codigos comisionables.
 # - PURE COUNTER = counter_usd > 0 AND prepagado_usd == 0 (no venia de reserva).
@@ -621,24 +635,27 @@ kpi(
     f"{pct_meta_global:.1f}%",
 )
 
-# Tabla de breakdown por sede (si hay mas de una sede en el periodo)
+# Tabla de breakdown por sede — cada sede tiene su propia meta
 if not df_dias_sede.empty and len(df_dias_sede) > 0:
     _sede_view = df_dias_sede.copy()
-    _sede_view["pct_meta"] = (
-        (_sede_view["dias_renta_24h"] / meta_dias * 100).round(1)
-        if meta_dias > 0 else 0.0
-    )
-    _sede_view["pct_meta"] = _sede_view["pct_meta"].apply(lambda v: f"{v:.1f}%")
+    # Meta especifica por sede (viene del dict meta_por_sede)
+    _sede_view["meta"] = _sede_view["sede"].map(meta_por_sede).fillna(0).astype(int)
+    _sede_view["pct_meta_num"] = _sede_view.apply(
+        lambda r: (r["dias_renta_24h"] / r["meta"] * 100) if r["meta"] > 0 else 0.0,
+        axis=1,
+    ).round(1)
+    _sede_view["pct_meta"] = _sede_view["pct_meta_num"].apply(lambda v: f"{v:.1f}%")
     _sede_view = _sede_view[[
-        "sede", "contratos", "dias_ocupacion", "dias_renta_24h", "pct_meta"
+        "sede", "contratos", "dias_ocupacion", "dias_renta_24h", "meta", "pct_meta"
     ]].rename(columns={
         "sede": "Sede",
         "contratos": "Contratos",
         "dias_ocupacion": "Dias ocupacion",
         "dias_renta_24h": "Dias renta 24h",
-        "pct_meta": f"% Meta ({meta_dias:,})",
+        "meta": "Meta",
+        "pct_meta": "% Cumplimiento",
     })
-    st.markdown("**Breakdown por sede:**")
+    st.markdown("**Breakdown por sede (con meta especifica):**")
     st.dataframe(_sede_view, use_container_width=True, hide_index=True)
 
 # ---------- Tabla por asesor (solo comisiones, sin dias) ----------

@@ -236,6 +236,9 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 7. **Convención `vw_*`:** all views materialized as `CREATE TABLE`. Pattern: `DROP TABLE IF EXISTS ... CASCADE; DROP VIEW IF EXISTS ... CASCADE;` before creating.
 8. **Idempotence:** any pipeline runs twice without breaking anything.
 9. **Dummy vehicle filter:** `vehiculo_int_num = 99999999` is a Sixt administrative placeholder. Filter it out from vehicle analytics with `TRIM(vehiculo) != ''`.
+10. **No-show / cancelación filter:** contratos con `TRIM(placa) = ''` (asesor 7777777 sistémico) o `total_con_iva_usd = 0` son no-shows y cancelaciones. NO se cuentan como ingreso en Cierre Diario ni Cargos Granular. Filtro: `TRIM(COALESCE(placa,'')) <> '' AND COALESCE(total_con_iva_usd,0) > 0`.
+11. **Standardized date range filter:** todas las páginas del dashboard usan `render_sidebar_filters()` de `components/filters.py`. NO crear datepickers propios en páginas nuevas — usar el sidebar unificado para consistencia.
+12. **operational.op_asesores:** tabla maestra manual de asesores (nombre + codigo_silver + codigo_hr). Se mantiene con INSERT/UPDATE manuales. El pipeline NO la toca. Requerida para mostrar nombres en Cargos Granular via LEFT JOIN por `codigo_silver = operador_handover_codigo`.
 
 ## Sixt data model — key columns
 
