@@ -139,32 +139,12 @@ neto = df_resumen[f"neto{suf}"].sum() if n_rentals else 0
 iva = df_resumen[f"iva{suf}"].sum() if n_rentals else 0
 total = df_resumen[f"total_con_iva{suf}"].sum() if n_rentals else 0
 ticket = (neto / n_rentals) if n_rentals else 0
-# Split prepagado / counter (a nivel contrato, netos de descuento).
-# Estos sumados = neto, ambos sin IVA. Con IVA se multiplican por 1.19.
-prepagado = df_resumen[f"prepagado{suf}"].sum() if n_rentals else 0
-counter = df_resumen[f"counter{suf}"].sum() if n_rentals else 0
-prepagado_con_iva = prepagado * 1.19
-counter_con_iva = counter * 1.19
 
-# Fila 1: KPIs principales
 c1, c2, c3, c4 = st.columns(4)
 kpi(c1, "Contratos", fmt_int(n_rentals))
 kpi(c2, "Neto", fmt_money(neto, cur), fmt_money_short(neto, cur))
 kpi(c3, "IVA 19%", fmt_money(iva, cur))
 kpi(c4, "Total con IVA", fmt_money(total, cur), f"Ticket promedio {fmt_money(ticket, cur)}")
-
-# Fila 2: Split prepagado vs counter
-c5, c6 = st.columns(2)
-kpi(
-    c5, "Prepagado (via OTA/Sixt central)",
-    fmt_money(prepagado, cur),
-    f"Con IVA: {fmt_money(prepagado_con_iva, cur)}",
-)
-kpi(
-    c6, "Counter (cobrado en mostrador)",
-    fmt_money(counter, cur),
-    f"Con IVA: {fmt_money(counter_con_iva, cur)}",
-)
 
 # ---------- Modo Resumen (Q2): tabla principal ----------
 if modo.startswith("Resumen"):
@@ -172,6 +152,12 @@ if modo.startswith("Resumen"):
     if n_rentals == 0:
         st.info("Sin contratos para los filtros seleccionados.")
     else:
+        # Prepagado y Counter CON IVA (por contrato). Son split del Neto:
+        # prepagado + counter = neto, luego * 1.19 = total_con_iva.
+        # Mostramos c/IVA para que sumen visualmente con Total c/IVA.
+        df_resumen[f"prepagado_civa{suf}"] = df_resumen[f"prepagado{suf}"] * 1.19
+        df_resumen[f"counter_civa{suf}"] = df_resumen[f"counter{suf}"] * 1.19
+
         cols_view = [
             "numero_contrato",
             "fecha_handover_real", "fecha_devolucion_real", "dias_renta",
@@ -179,6 +165,7 @@ if modo.startswith("Resumen"):
             "placa", "vehiculo", "categoria_entregada", "acriss_entregado",
             f"tarifa{suf}", "adicionales_codigos", f"adicionales{suf}",
             f"descuento{suf}", f"neto{suf}", f"iva{suf}", f"total_con_iva{suf}",
+            f"prepagado_civa{suf}", f"counter_civa{suf}",
             "forma_pago", "partner_nombre", "reserva_prepagada",
             "operador_handover_codigo",
         ]
@@ -193,7 +180,8 @@ if modo.startswith("Resumen"):
         view["partner_nombre"] = view["partner_nombre"].fillna("").astype(str)
 
         money_cols = [f"tarifa{suf}", f"adicionales{suf}", f"descuento{suf}",
-                      f"neto{suf}", f"iva{suf}", f"total_con_iva{suf}"]
+                      f"neto{suf}", f"iva{suf}", f"total_con_iva{suf}",
+                      f"prepagado_civa{suf}", f"counter_civa{suf}"]
         for col in money_cols:
             view[col] = view[col].apply(lambda v: fmt_money(v, cur))
 
@@ -214,6 +202,8 @@ if modo.startswith("Resumen"):
             f"neto{suf}": f"Neto ({cur})",
             f"iva{suf}": f"IVA ({cur})",
             f"total_con_iva{suf}": f"Total c/IVA ({cur})",
+            f"prepagado_civa{suf}": f"Prepagado c/IVA ({cur})",
+            f"counter_civa{suf}": f"Counter c/IVA ({cur})",
             "forma_pago": "Forma pago",
             "partner_nombre": "Tercero",
             "reserva_prepagada": "Prepago",
