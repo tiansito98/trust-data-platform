@@ -139,12 +139,32 @@ neto = df_resumen[f"neto{suf}"].sum() if n_rentals else 0
 iva = df_resumen[f"iva{suf}"].sum() if n_rentals else 0
 total = df_resumen[f"total_con_iva{suf}"].sum() if n_rentals else 0
 ticket = (neto / n_rentals) if n_rentals else 0
+# Split prepagado / counter (a nivel contrato, netos de descuento).
+# Estos sumados = neto, ambos sin IVA. Con IVA se multiplican por 1.19.
+prepagado = df_resumen[f"prepagado{suf}"].sum() if n_rentals else 0
+counter = df_resumen[f"counter{suf}"].sum() if n_rentals else 0
+prepagado_con_iva = prepagado * 1.19
+counter_con_iva = counter * 1.19
 
+# Fila 1: KPIs principales
 c1, c2, c3, c4 = st.columns(4)
 kpi(c1, "Contratos", fmt_int(n_rentals))
 kpi(c2, "Neto", fmt_money(neto, cur), fmt_money_short(neto, cur))
 kpi(c3, "IVA 19%", fmt_money(iva, cur))
 kpi(c4, "Total con IVA", fmt_money(total, cur), f"Ticket promedio {fmt_money(ticket, cur)}")
+
+# Fila 2: Split prepagado vs counter
+c5, c6 = st.columns(2)
+kpi(
+    c5, "Prepagado (via OTA/Sixt central)",
+    fmt_money(prepagado, cur),
+    f"Con IVA: {fmt_money(prepagado_con_iva, cur)}",
+)
+kpi(
+    c6, "Counter (cobrado en mostrador)",
+    fmt_money(counter, cur),
+    f"Con IVA: {fmt_money(counter_con_iva, cur)}",
+)
 
 # ---------- Modo Resumen (Q2): tabla principal ----------
 if modo.startswith("Resumen"):
