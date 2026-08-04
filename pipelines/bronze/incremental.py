@@ -253,12 +253,14 @@ def refresh_table(rs_conn, engine, tbl_cfg: dict):
         log_extraction(engine, target, mode.upper(), int(n_total), new_wm,
                        elapsed, "SUCCESS")
         log(f"   OK ({elapsed:.1f}s)")
+        return target, True
 
     except Exception as e:
         elapsed = time.time() - started
         log_extraction(engine, target, mode.upper(), 0, None, elapsed,
                        "FAILED", str(e)[:500])
         log(f"   FAIL: {e}")
+        return target, False
 
 
 def main():
@@ -273,13 +275,26 @@ def main():
     log(f"  tablas a refresh: {len(tables)}")
 
     started_total = time.time()
+    failed = []
     with open_redshift() as rs_conn:
         for tbl in tables:
-            refresh_table(rs_conn, engine, tbl)
+            target, ok = refresh_table(rs_conn, engine, tbl)
+            if not ok:
+                failed.append(target)
 
     log("\n" + "=" * 70)
-    log(f"  REFRESH COMPLETO en {time.time() - started_total:.1f}s")
+    log(f"  REFRESH COMPLETO en {time.time() - started_total:.1f}s "
+        f"({len(tables) - len(failed)}/{len(tables)} OK)")
     log("=" * 70)
+
+    # Propaga la falla: si ALGUNA tabla fallo, aborta con excepcion para que
+    # run_pipeline.py salga con codigo != 0 y NO reconstruya silver sobre
+    # bronze incompleto. Sin esto, un tunel caido = corrida "verde" vacia.
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)}/{len(tables)} tablas de bronze fallaron: "
+            f"{', '.join(failed)}. Silver NO se reconstruye sobre bronze incompleto."
+        )
 
 
 if __name__ == "__main__":

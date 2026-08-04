@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -50,8 +51,11 @@ def materialize_ssh_key_if_needed() -> None:
     if not key_content.endswith("\n"):
         key_content += "\n"
 
-    fd, path = tempfile.mkstemp(prefix="sixt_ssh_", suffix=".pem")
-    with os.fdopen(fd, "w") as f:
+    # Path estable y reusable (se sobreescribe cada corrida) para NO acumular
+    # llaves en /tmp en una caja de larga vida. En un servidor persistente,
+    # preferir setear SIXT_SSH_KEY_PATH directo (esta funcion hace short-circuit).
+    path = str(Path(tempfile.gettempdir()) / "sixt_ssh_key.pem")
+    with open(path, "w") as f:
         f.write(key_content)
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
@@ -59,6 +63,24 @@ def materialize_ssh_key_if_needed() -> None:
         pass  # Windows runners no aplican chmod tradicional
     os.environ["SIXT_SSH_KEY_PATH"] = path
     print(f">> SSH key materialized at {path}", flush=True)
+
+
+def arm_watchdog() -> None:
+    """
+    Backstop de tiempo: si la corrida excede PIPELINE_TIMEOUT_SEC (default 1200s
+    = 20 min), lanza TimeoutError para abortar. Evita corridas colgadas por blips
+    del pooler/SSH. Solo Unix (SIGALRM); en Windows (corridas manuales) se omite.
+    """
+    timeout = int(os.getenv("PIPELINE_TIMEOUT_SEC", "1200"))
+    if timeout <= 0 or not hasattr(signal, "SIGALRM"):
+        return
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"watchdog: el pipeline excedio {timeout}s; abortando")
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
+    print(f">> watchdog armado: {timeout}s", flush=True)
 
 
 def main():
@@ -76,6 +98,7 @@ def main():
 
     try:
         materialize_ssh_key_if_needed()
+        arm_watchdog()
 
         # 1. Bronze
         if args.full:
