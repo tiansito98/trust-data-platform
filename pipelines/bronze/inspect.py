@@ -22,8 +22,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from pipelines._common import (  # noqa: E402
-    BRONZE_DB, open_local, open_redshift, mandant_code,
+    get_engine, open_redshift, mandant_code,
 )
+from sqlalchemy import text  # noqa: E402
 
 
 def cmd_test_connection():
@@ -58,59 +59,59 @@ def cmd_test_connection():
 
 
 def cmd_inspect_local(table: str | None = None):
+    """Inspecciona bronze en Supabase Postgres (antes era SQLite local).
+
+    Lista tablas con conteos, log de extraccion, y opcionalmente un sample.
+    """
     print("=" * 70)
-    print(f"  INSPECCION BRONZE LOCAL ({BRONZE_DB})")
+    print("  INSPECCION BRONZE (Supabase Postgres)")
     print("=" * 70)
 
-    if not BRONZE_DB.exists():
-        print(f"  [X] No existe {BRONZE_DB}")
-        print("  -> Corre primero: python -m pipelines.bronze.full_load")
-        sys.exit(1)
+    engine = get_engine("bronze")
 
-    print(f"  Tamano: {BRONZE_DB.stat().st_size / 1024 / 1024:.2f} MB")
+    with engine.connect() as conn:
+        conn.execute(text("SET search_path TO bronze, public"))
 
-    con = open_local("bronze", read_only=True)
+        # Lista de tablas en schema bronze
+        tbls = conn.execute(text("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'bronze'
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+        """)).fetchall()
 
-    # Lista de tablas (sqlite_master)
-    tbls = con.execute("""
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table'
-          AND name NOT LIKE 'sqlite_%'
-        ORDER BY name
-    """).fetchall()
+        print(f"\n  [{len(tbls)} tablas en schema bronze]\n")
+        for (tname,) in tbls:
+            try:
+                n = conn.execute(text(f"SELECT COUNT(*) FROM bronze.{tname}")).scalar()
+                print(f"    {tname:60} {n:>14,} filas")
+            except Exception as e:
+                print(f"    {tname:60} ERROR: {e}")
 
-    print(f"\n  [{len(tbls)} tablas en bronze.db]\n")
-    for (tname,) in tbls:
+        # Log de extraccion
+        print("\n  [Ultimas 10 corridas]")
         try:
-            n = con.execute(f"SELECT COUNT(*) FROM {tname}").fetchone()[0]
-            print(f"    {tname:60} {n:>14,} filas")
+            log_df = pd.read_sql_query(text("""
+                SELECT run_datm, table_name, mode, rows_loaded, status,
+                       ROUND(duration_sec::numeric, 1) AS sec
+                FROM bronze.ctrl_extraction_log
+                ORDER BY id DESC LIMIT 10
+            """), conn)
+            print(log_df.to_string(index=False))
         except Exception as e:
-            print(f"    {tname:60} ERROR: {e}")
+            print(f"  (sin tabla ctrl_extraction_log: {e})")
 
-    # Log de extraccion
-    print("\n  [Ultimas 10 corridas]")
-    try:
-        log_df = pd.read_sql_query("""
-            SELECT run_datm, table_name, mode, rows_loaded, status,
-                   ROUND(duration_sec, 1) AS sec
-            FROM ctrl_extraction_log
-            ORDER BY id DESC LIMIT 10
-        """, con)
-        print(log_df.to_string(index=False))
-    except Exception as e:
-        print(f"  (sin tabla ctrl_extraction_log: {e})")
-
-    # Sample de tabla especifica
-    if table:
-        print(f"\n  [Sample 5 filas de {table}]")
-        try:
-            sample = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 5", con)
-            print(sample.to_string())
-        except Exception as e:
-            print(f"  ERROR: {e}")
-
-    con.close()
+        # Sample de tabla especifica
+        if table:
+            print(f"\n  [Sample 5 filas de {table}]")
+            try:
+                sample = pd.read_sql_query(
+                    text(f"SELECT * FROM bronze.{table} LIMIT 5"), conn
+                )
+                print(sample.to_string())
+            except Exception as e:
+                print(f"  ERROR: {e}")
 
 
 def main():
