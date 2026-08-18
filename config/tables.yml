@@ -144,8 +144,8 @@ tables:
     filter_mandant: true
     mode: incremental_watermark
     watermark_col: "sys_upd_datm"
-    pk: ["chrs_resn", "chrs_konr"]
-    notes: "Charges sobre reservas. Watermark estandar sys_upd_datm (no chrs_date)."
+    pk: ["chrs_resn", "chrs_konr", "chrs_inty", "chrs_pos"]
+    notes: "Charges sobre reservas. PK con inty+pos: cada reserva tiene varios cargos con el mismo (resn,konr); sin inty+pos el DELETE-INSERT del upsert borraba el grupo entero al actualizar un subconjunto y perdia cargos (fix 2026-08). Watermark sys_upd_datm."
 
   - source: rent_shop.ch_fct_ra_charges_franchise
     target: rent_shop_ch_fct_ra_charges_franchise
@@ -153,8 +153,8 @@ tables:
     filter_mandant: true
     mode: incremental_watermark
     watermark_col: "sys_upd_datm"
-    pk: ["chra_mvnr", "chra_konr"]
-    notes: "Charges sobre rental agreements. Watermark estandar sys_upd_datm (no chra_date)."
+    pk: ["chra_mvnr", "chra_konr", "chra_inty", "chra_pos", "chra_mser"]
+    notes: "Charges sobre rental agreements. PK con inty+pos+mser (mser necesario: sin el quedan 260 dups). Mismo bug que RS: sin PK fina el upsert perdia cargos al actualizar un subconjunto (fix 2026-08). Watermark sys_upd_datm."
 
   - source: rent_shop.rt_dim_rates_franchise
     target: rent_shop_rt_dim_rates_franchise
