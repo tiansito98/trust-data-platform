@@ -314,7 +314,7 @@ All factura queries filter by `sede_nombre = :user_sede` for sede-role users. A 
 
 ### Schema (operational.invoices)
 
-Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (**DEPRECATED desde 25-ago-2026** — ya no se escribe; los numeros ahora viven en la tabla hija), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado`, `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
+Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (**DEPRECATED desde 25-ago-2026** — ya no se escribe; los numeros ahora viven en la tabla hija), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado` (COP), `monto_prepagado_usd` (**desde 25-ago-2026** — valor REAL prepagado en USD que digita el asesor desde COBRA; opcional pero **obligatorio si monto_prepagado COP > 0**, el form bloquea el guardado si falta; se captura en USD para no depender de la TRM), `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
 
 ### Numeros de aprobacion (operational.invoice_approvals) — desde 25-ago-2026
 

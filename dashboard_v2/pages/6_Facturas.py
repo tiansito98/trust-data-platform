@@ -228,7 +228,7 @@ with st.form("invoice_form", clear_on_submit=not editing):
         key=_appr_editor_key,
     )
 
-    c6, c7 = st.columns(2)
+    c6, c7, c8 = st.columns(3)
     monto_counter = c6.number_input(
         "Monto en counter (COP, con IVA)",
         min_value=0.0, step=1000.0, format="%.2f",
@@ -240,6 +240,13 @@ with st.form("invoice_form", clear_on_submit=not editing):
         min_value=0.0, step=1000.0, format="%.2f",
         value=float(editing_data.get("monto_prepagado", 0) or 0),
         help="Cuanto del total ya estaba pre-pagado por Sixt o un tercero. Deje 0 si el cliente paga todo en counter.",
+    )
+    monto_prepagado_usd = c8.number_input(
+        "Monto prepagado (USD)",
+        min_value=0.0, step=1.0, format="%.2f",
+        value=float(editing_data.get("monto_prepagado_usd", 0) or 0),
+        help="Valor REAL prepagado en DOLARES (el que muestra COBRA). "
+             "OBLIGATORIO si el prepagado en COP es mayor a 0. Dejar 0 si no hay prepago.",
     )
 
     monto_total_preview = monto_counter + monto_prepagado
@@ -280,6 +287,9 @@ if submitted:
         st.error("El monto total (counter + prepagado) debe ser mayor a 0.")
     elif not rntl_mvnr.strip().isdigit():
         st.error("El numero de contrato debe ser solo digitos.")
+    elif monto_prepagado > 0 and monto_prepagado_usd <= 0:
+        st.error("Escribe el monto prepagado en USD en la casilla de 'Monto prepagado (USD)'. "
+                 "Si hay prepagado en COP, el valor en USD es obligatorio (el que muestra COBRA).")
     else:
         contrato_int = int(rntl_mvnr.strip())
 
@@ -345,6 +355,7 @@ if submitted:
                 "iva": iva,
                 "monto_total": monto_total,
                 "monto_prepagado": monto_prepagado,
+                "monto_prepagado_usd": monto_prepagado_usd if monto_prepagado_usd > 0 else None,
                 "monto_counter": monto_counter,
                 "prepaid": prepaid,
                 "observaciones": observaciones.strip() or None,
@@ -361,7 +372,9 @@ if submitted:
                             moneda = :moneda, numero_factura = :numero_factura,
                             monto_base = :monto_base,
                             iva = :iva, monto_total = :monto_total,
-                            monto_prepagado = :monto_prepagado, monto_counter = :monto_counter,
+                            monto_prepagado = :monto_prepagado,
+                            monto_prepagado_usd = :monto_prepagado_usd,
+                            monto_counter = :monto_counter,
                             prepaid = :prepaid, observaciones = :observaciones,
                             capturado_por = :capturado_por
                         WHERE invoice_id = :invoice_id
@@ -376,11 +389,13 @@ if submitted:
                         INSERT INTO operational.invoices
                           (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
                            numero_factura, monto_base, iva, monto_total,
-                           monto_prepagado, monto_counter, prepaid, observaciones, capturado_por)
+                           monto_prepagado, monto_prepagado_usd, monto_counter,
+                           prepaid, observaciones, capturado_por)
                         VALUES
                           (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
                            :numero_factura, :monto_base, :iva, :monto_total,
-                           :monto_prepagado, :monto_counter, :prepaid, :observaciones, :capturado_por)
+                           :monto_prepagado, :monto_prepagado_usd, :monto_counter,
+                           :prepaid, :observaciones, :capturado_por)
                         RETURNING invoice_id
                     """, params)
                     replace_invoice_approvals(new_id, aprobaciones)
@@ -643,7 +658,8 @@ fin_sql = f"""
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.finalizada,
            i.numero_factura, ap.aprobaciones,
-           i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
+           i.monto_total, i.monto_prepagado, i.monto_prepagado_usd,
+           i.monto_counter, i.prepaid,
            i.finalizada_por, i.finalizada_at,
            COALESCE(i.revisada, FALSE) AS revisada,
            i.revisada_at, i.revisada_por,
@@ -724,7 +740,7 @@ else:
         "invoice_id", "estado", "revisada", "fecha_emision", "sede_nombre",
         "rntl_mvnr", "duplicados", "numero_factura", "aprobaciones",
         "fecha_entrega",
-        "monto_total", "sistema_cop", "diferencia",
+        "monto_total", "monto_prepagado_usd", "sistema_cop", "diferencia",
         "trm_oficial", "trm_usada_calculada", "diff_trm",
         "finalizada_por", "finalizada_at",
         "revisada_por", "revisada_at",
@@ -740,6 +756,10 @@ else:
         view[col] = view[col].apply(
             lambda v: fmt_money(v, "COP") if pd.notna(v) else "-"
         )
+    # Prepagado USD: en dolares (valor real prepagado, independiente de la TRM)
+    view["monto_prepagado_usd"] = view["monto_prepagado_usd"].apply(
+        lambda v: fmt_money(v, "USD") if pd.notna(v) else "-"
+    )
     # TRM con 2 decimales
     for col in ("trm_oficial", "trm_usada_calculada", "diff_trm"):
         view[col] = view[col].apply(
@@ -766,6 +786,7 @@ else:
         "aprobaciones": "Aprobaciones",
         "fecha_entrega": "Entrega",
         "monto_total": "Total cobrado (COP)",
+        "monto_prepagado_usd": "Prepagado (USD)",
         "sistema_cop": "Sistema (COP)",
         "diferencia": "Diferencia (COP)",
         "trm_oficial": "TRM oficial",

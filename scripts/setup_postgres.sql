@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS operational.invoices (
     monto_base        NUMERIC(14,2),
     iva               NUMERIC(14,2),
     monto_total       NUMERIC(14,2) NOT NULL,
-    monto_prepagado   NUMERIC(14,2) NOT NULL DEFAULT 0,
+    monto_prepagado   NUMERIC(14,2) NOT NULL DEFAULT 0,  -- prepagado en COP (suma al total)
+    monto_prepagado_usd NUMERIC(14,2),                   -- valor REAL prepagado en USD (lo digita el asesor desde COBRA; obligatorio si monto_prepagado > 0)
     monto_counter     NUMERIC(14,2),
     -- Flag derivado: TRUE si monto_prepagado > 0.
     prepaid           BOOLEAN NOT NULL DEFAULT FALSE,
