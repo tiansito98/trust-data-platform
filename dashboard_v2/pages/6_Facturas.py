@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import datetime as dt
+import re
 
 import pandas as pd
 import streamlit as st
@@ -26,8 +27,23 @@ from components.auth import (
 )
 from components.common import (
     inject_styles, render_header, section, load_query, execute_write,
+    execute_write_returning, replace_invoice_approvals,
     fmt_money, xlsx_download_button,
 )
+
+
+def _parse_aprobaciones(valores) -> list:
+    """Split defensivo: rompe cualquier '04053Z/100000' o '04053Z-100000' en
+    tokens alfanumericos individuales. Devuelve lista deduplicada (preserva orden)."""
+    out = []
+    for v in valores:
+        if v is None:
+            continue
+        for tok in re.split(r"[^0-9A-Za-z]+", str(v)):
+            tok = tok.strip()
+            if tok:
+                out.append(tok)
+    return list(dict.fromkeys(out))
 from components.filters import render_sidebar_filters
 
 IVA_PORCENTAJE = 19.0
@@ -46,7 +62,17 @@ inject_styles()
 filtros = render_sidebar_filters(default_days=90)
 
 logout_button()
-render_header("Facturas / Recibos")
+render_header("Facturas")
+
+# Aviso del cambio de recibo -> numeros de aprobacion (25-ago-2026).
+st.info(
+    "**Cambio desde el 25 de agosto de 2026:** el 'numero de recibo' se reemplazo por "
+    "**numeros de aprobacion**. Una factura puede tener **uno o varios** (un cobro por linea). "
+    "Agregalos **uno por fila** en el formulario (boton '+') — **NO** los pongas juntos con "
+    "'/' ni '-'. En el historial hay una vista nueva **'Por numero de aprobacion'** (una fila por "
+    "numero) para que contabilidad pueda hacer join directo.",
+    icon="ℹ️",
+)
 
 
 # =============================================================================
@@ -114,6 +140,17 @@ if "_editing_data" not in st.session_state:
 editing = st.session_state["_editing_id"] is not None
 editing_data = st.session_state["_editing_data"]
 
+# Aprobaciones existentes de la factura en edicion (para pre-cargar el editor).
+if editing:
+    _appr_prev = load_query(
+        "SELECT numero_aprobacion FROM operational.invoice_approvals "
+        "WHERE invoice_id = :id ORDER BY approval_id",
+        {"id": st.session_state["_editing_id"]},
+    )
+    _existing_appr = _appr_prev["numero_aprobacion"].tolist() if not _appr_prev.empty else []
+else:
+    _existing_appr = []
+
 
 # =============================================================================
 # 1. FORM: Nueva factura / Editar factura
@@ -163,18 +200,32 @@ with st.form("invoice_form", clear_on_submit=not editing):
         help="Numero del contrato de renta tal como aparece en el contrato firmado.",
     )
 
-    c4, c5 = st.columns(2)
-    numero_factura = c4.text_input(
-        "Numero de factura",
+    numero_factura = st.text_input(
+        "Numero de factura (DIAN)",
         value=editing_data.get("numero_factura", "") or "",
         placeholder="ej. FAC-12345",
         help="Numero consecutivo de la factura DIAN.",
     )
-    numero_recibo = c5.text_input(
-        "Numero de recibo",
-        value=editing_data.get("numero_recibo", "") or "",
-        placeholder="ej. 00045678",
-        help="Numero del recibo del datafono o del comprobante de pago.",
+
+    st.markdown("**Numeros de aprobacion** &nbsp; "
+                "<span style='color:#888;font-size:0.85rem;'>(uno por fila — una factura "
+                "puede tener varios; un cobro por linea)</span>", unsafe_allow_html=True)
+    st.caption("Agrega UNO por fila con el boton '+' de la tabla. NO pongas varios juntos "
+               "con '/' ni '-' (si lo haces, el sistema los separa igual).")
+    _appr_df_in = pd.DataFrame({"numero_aprobacion": (_existing_appr or [""])})
+    _appr_editor_key = f"appr_editor_{st.session_state['_editing_id'] or 'new'}"
+    appr_edited = st.data_editor(
+        _appr_df_in,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "numero_aprobacion": st.column_config.TextColumn(
+                "Numero de aprobacion", max_chars=30,
+                help="Un numero por fila (ej. 04053Z, 100000, 09072I). NO usar '/' ni '-'.",
+            )
+        },
+        key=_appr_editor_key,
     )
 
     c6, c7 = st.columns(2)
@@ -214,6 +265,11 @@ with st.form("invoice_form", clear_on_submit=not editing):
     submitted = st.form_submit_button(btn_label)
 
 if submitted:
+    # Aprobaciones del editor (split defensivo + dedup).
+    aprobaciones = _parse_aprobaciones(
+        appr_edited["numero_aprobacion"].tolist()
+        if "numero_aprobacion" in appr_edited.columns else []
+    )
     monto_total = round(monto_counter + monto_prepagado, 2)
     iva_factor = 1 + IVA_PORCENTAJE / 100.0
     monto_base = round(monto_total / iva_factor, 2)
@@ -285,7 +341,6 @@ if submitted:
                 "fecha_emision": fecha_emision,
                 "moneda": "COP",
                 "numero_factura": numero_factura.strip() or None,
-                "numero_recibo": numero_recibo.strip() or None,
                 "monto_base": monto_base,
                 "iva": iva,
                 "monto_total": monto_total,
@@ -297,36 +352,42 @@ if submitted:
             }
             try:
                 if editing:
-                    params["invoice_id"] = st.session_state["_editing_id"]
+                    edit_id = st.session_state["_editing_id"]
+                    params["invoice_id"] = edit_id
                     execute_write("""
                         UPDATE operational.invoices SET
                             rntl_mvnr = :rntl_mvnr, sede_codigo = :sede_codigo,
                             sede_nombre = :sede_nombre, fecha_emision = :fecha_emision,
                             moneda = :moneda, numero_factura = :numero_factura,
-                            numero_recibo = :numero_recibo, monto_base = :monto_base,
+                            monto_base = :monto_base,
                             iva = :iva, monto_total = :monto_total,
                             monto_prepagado = :monto_prepagado, monto_counter = :monto_counter,
                             prepaid = :prepaid, observaciones = :observaciones,
                             capturado_por = :capturado_por
                         WHERE invoice_id = :invoice_id
                     """, params)
-                    st.success(f"Factura #{params['invoice_id']} actualizada.")
+                    replace_invoice_approvals(edit_id, aprobaciones)
+                    st.success(f"Factura #{edit_id} actualizada "
+                               f"({len(aprobaciones)} aprobacion(es)).")
                     st.session_state["_editing_id"] = None
                     st.session_state["_editing_data"] = {}
                 else:
-                    execute_write("""
+                    new_id = execute_write_returning("""
                         INSERT INTO operational.invoices
                           (rntl_mvnr, sede_codigo, sede_nombre, fecha_emision, moneda,
-                           numero_factura, numero_recibo, monto_base, iva, monto_total,
+                           numero_factura, monto_base, iva, monto_total,
                            monto_prepagado, monto_counter, prepaid, observaciones, capturado_por)
                         VALUES
                           (:rntl_mvnr, :sede_codigo, :sede_nombre, :fecha_emision, :moneda,
-                           :numero_factura, :numero_recibo, :monto_base, :iva, :monto_total,
+                           :numero_factura, :monto_base, :iva, :monto_total,
                            :monto_prepagado, :monto_counter, :prepaid, :observaciones, :capturado_por)
+                        RETURNING invoice_id
                     """, params)
+                    replace_invoice_approvals(new_id, aprobaciones)
                     tag = "prepagada" if prepaid else "no prepagada"
                     st.success(f"Factura guardada — {sede_nombre} — contrato {rntl_mvnr} — "
-                               f"{fmt_money(monto_total, 'COP')} ({tag}).")
+                               f"{fmt_money(monto_total, 'COP')} "
+                               f"({tag}, {len(aprobaciones)} aprobacion(es)).")
                     # Limpia el prefill del recordatorio para que el campo no
                     # reaparezca con el contrato ya facturado en el proximo render.
                     st.session_state.pop("_prefill_contrato", None)
@@ -581,7 +642,7 @@ fin_sql = f"""
     )
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.finalizada,
-           i.numero_factura, i.numero_recibo,
+           i.numero_factura, ap.aprobaciones,
            i.monto_total, i.monto_prepagado, i.monto_counter, i.prepaid,
            i.finalizada_por, i.finalizada_at,
            COALESCE(i.revisada, FALSE) AS revisada,
@@ -603,6 +664,10 @@ fin_sql = f"""
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(numero_aprobacion, ', ' ORDER BY approval_id) AS aprobaciones
+        FROM operational.invoice_approvals ap WHERE ap.invoice_id = i.invoice_id
+    ) ap ON TRUE
     WHERE TRUE {sede_where}
       AND (
             -- Si esta en silver: filtra por handover del contrato
@@ -657,7 +722,7 @@ else:
     # facturas finalizadas. Para abiertas se desactiva (aún no cerraron).
     view = df_fin[[
         "invoice_id", "estado", "revisada", "fecha_emision", "sede_nombre",
-        "rntl_mvnr", "duplicados", "numero_factura", "numero_recibo",
+        "rntl_mvnr", "duplicados", "numero_factura", "aprobaciones",
         "fecha_entrega",
         "monto_total", "sistema_cop", "diferencia",
         "trm_oficial", "trm_usada_calculada", "diff_trm",
@@ -667,6 +732,8 @@ else:
 
     # revisada: asegurar bool (viene de Postgres, podria ser None si columna nueva)
     view["revisada"] = view["revisada"].fillna(False).astype(bool)
+    # aprobaciones: None (factura sin aprobaciones) -> "-"
+    view["aprobaciones"] = view["aprobaciones"].fillna("-").replace("", "-")
 
     # Formato de moneda COP
     for col in ("monto_total", "sistema_cop", "diferencia"):
@@ -696,7 +763,7 @@ else:
         "rntl_mvnr": "Contrato",
         "duplicados": "Duplicados",
         "numero_factura": "Num factura",
-        "numero_recibo": "Num recibo",
+        "aprobaciones": "Aprobaciones",
         "fecha_entrega": "Entrega",
         "monto_total": "Total cobrado (COP)",
         "sistema_cop": "Sistema (COP)",
@@ -789,6 +856,50 @@ else:
         sheet_name="Finalizadas",
         key="xlsx_facturas_finalizadas",
     )
+
+    # -----------------------------------------------------------------
+    # NUEVA VISTA: Por numero de aprobacion (para contabilidad / join)
+    # -----------------------------------------------------------------
+    st.markdown("##### Por numero de aprobacion (para contabilidad)")
+    st.caption(
+        "Una fila por numero de aprobacion (contrato x factura x numero). "
+        "Ideal para que contabilidad haga JOIN directo con estos numeros. "
+        "Filtrado por fecha de emision del rango del sidebar."
+    )
+    _appr_params = {"hist_desde": hist_desde, "hist_hasta": hist_hasta}
+    if sede_params:
+        _appr_params.update(sede_params)
+    df_appr = load_query(f"""
+        SELECT i.rntl_mvnr AS contrato, i.invoice_id, i.sede_nombre,
+               i.fecha_emision, i.numero_factura, a.numero_aprobacion,
+               i.monto_total,
+               CASE WHEN i.finalizada THEN 'Finalizada' ELSE 'Abierta' END AS estado
+        FROM operational.invoices i
+        JOIN operational.invoice_approvals a ON a.invoice_id = i.invoice_id
+        WHERE TRUE {sede_where}
+          AND i.fecha_emision BETWEEN :hist_desde AND :hist_hasta
+        ORDER BY i.rntl_mvnr, i.invoice_id, a.approval_id
+    """, _appr_params)
+    if df_appr.empty:
+        st.info("No hay numeros de aprobacion en este rango.")
+    else:
+        appr_view = df_appr.copy()
+        appr_view["monto_total"] = appr_view["monto_total"].apply(
+            lambda v: fmt_money(v, "COP") if pd.notna(v) else "-")
+        appr_view = appr_view.rename(columns={
+            "contrato": "Contrato", "invoice_id": "ID factura",
+            "sede_nombre": "Sede", "fecha_emision": "Fecha emision",
+            "numero_factura": "Num factura", "numero_aprobacion": "Num aprobacion",
+            "monto_total": "Total (COP)", "estado": "Estado",
+        })
+        st.dataframe(appr_view, use_container_width=True, hide_index=True)
+        st.caption(f"{len(appr_view)} numero(s) de aprobacion.")
+        xlsx_download_button(
+            appr_view,
+            file_name=f"aprobaciones_por_contrato_{dt.date.today()}",
+            sheet_name="Aprobaciones",
+            key="xlsx_aprobaciones",
+        )
 
     # -----------------------------------------------------------------
     # ADMIN ONLY: Reabrir cualquier factura finalizada por ID

@@ -85,7 +85,23 @@ CREATE INDEX IF NOT EXISTS idx_invoices_fecha   ON operational.invoices (fecha_e
 CREATE INDEX IF NOT EXISTS idx_invoices_rntl    ON operational.invoices (rntl_mvnr);
 CREATE INDEX IF NOT EXISTS idx_invoices_sede    ON operational.invoices (sede_codigo, fecha_emision);
 
-COMMENT ON TABLE operational.invoices IS 'Facturas/recibos capturados por el form del dashboard.';
+COMMENT ON TABLE operational.invoices IS 'Facturas capturadas por el form del dashboard.';
+
+-- 3b. Numeros de aprobacion por factura (desde 25-ago-2026)
+-- Reemplaza el antiguo campo numero_recibo (single) por una tabla hija: una
+-- factura puede tener 1..N numeros de aprobacion (un cobro por linea). Una fila
+-- por numero -> contabilidad hace JOIN directo. La migracion inicial partio los
+-- numero_recibo viejos que traian varios juntos (XXX/XXX/XXX) en filas separadas.
+CREATE TABLE IF NOT EXISTS operational.invoice_approvals (
+    approval_id       BIGSERIAL PRIMARY KEY,
+    invoice_id        BIGINT NOT NULL REFERENCES operational.invoices(invoice_id) ON DELETE CASCADE,
+    numero_aprobacion TEXT NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_inv_appr_invoice ON operational.invoice_approvals (invoice_id);
+CREATE INDEX IF NOT EXISTS idx_inv_appr_num     ON operational.invoice_approvals (numero_aprobacion);
+
+COMMENT ON TABLE operational.invoice_approvals IS 'Numeros de aprobacion por factura (1..N). Reemplaza numero_recibo desde 25-ago-2026.';
 
 -- 4. Tabla operativa: disponibilidad manual de vehiculos
 -- El form de Streamlit (Disponibilidad Flota) escribe aqui.

@@ -114,6 +114,35 @@ def execute_write(sql: str, params: dict) -> None:
         conn.execute(text(sql), params)
 
 
+def execute_write_returning(sql: str, params: dict):
+    """Como execute_write pero devuelve la 1a columna de la 1a fila (para RETURNING)."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL search_path TO silver, operational, public"))
+        row = conn.execute(text(sql), params).first()
+        return row[0] if row else None
+
+
+def replace_invoice_approvals(invoice_id: int, aprobaciones: list) -> None:
+    """Reemplaza (delete + insert) los numeros de aprobacion de una factura,
+    en una sola transaccion. `aprobaciones` = lista de strings (uno por numero)."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL search_path TO operational, public"))
+        conn.execute(
+            text("DELETE FROM operational.invoice_approvals WHERE invoice_id = :id"),
+            {"id": int(invoice_id)},
+        )
+        rows = [{"id": int(invoice_id), "n": a.strip()}
+                for a in aprobaciones if a and a.strip()]
+        if rows:
+            conn.execute(
+                text("INSERT INTO operational.invoice_approvals "
+                     "(invoice_id, numero_aprobacion) VALUES (:id, :n)"),
+                rows,
+            )
+
+
 def inject_styles():
     css = (ASSETS_DIR / "styles.css").read_text(encoding="utf-8")
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)

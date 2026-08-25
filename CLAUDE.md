@@ -262,7 +262,7 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 | Ingresos | `2_Ingresos.py` | admin | Tarifa vs adicionales by sede. RPD KPI. COP via Banrep per-row recalc. |
 | Vehiculos | `4_Vehiculos.py` | admin | ACRISS distribution, upgrades/downgrades, top models (dummy vehicles filtered) |
 | Disponibilidad | `5_Disponibilidad.py` | admin | Fleet snapshot (on-rent / ready-to-rent by sede and category) |
-| Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices`). Fields: sede (locked for sede users), fecha, contrato, factura, recibo, monto counter + prepagado (IVA 19% extracted by backend). Sede-role users have their branch locked. |
+| Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices` + child `operational.invoice_approvals`). Fields: sede (locked for sede users), fecha, contrato, numero factura DIAN, **numeros de aprobacion (1..N, una fila por numero — desde 25-ago-2026 reemplazan el antiguo numero_recibo)**, monto counter + prepagado (IVA 19% extracted by backend). El historial tiene 2 vistas: normal (aprobaciones agregadas por coma) y "por numero de aprobacion" (una fila por numero, para join de contabilidad). Sede-role users have their branch locked. |
 | Disponibilidad Flota | `7_Disponibilidad_Flota.py` | all | Monthly vehicle availability grid (vehicle x day). Combines auto data (rentals/reservations from Sixt) with manual entries (taller, PYP, transito, etc.). Staff can register/delete manual states. Writes to `operational.op_disponibilidad_manual`. |
 
 ## Disponibilidad Flota (operational.op_disponibilidad_manual)
@@ -295,9 +295,9 @@ Facturas have a lifecycle: **abierta (draft) → finalizada (cerrada)**. Each fa
 
 ### Create → Edit → Finalize → Validate flow
 
-1. **Asesor creates factura** (draft): types contrato, monto counter + prepagado, numero factura/recibo. Backend computes `monto_total = counter + prepagado`, `monto_base = total / 1.19`, `iva = total - base`, `prepaid = prepagado > 0`. Status: `finalizada = FALSE`.
+1. **Asesor creates factura** (draft): types contrato, monto counter + prepagado, numero factura DIAN y uno o varios **numeros de aprobacion** (una fila por numero en un `data_editor`; se guardan en la tabla hija `operational.invoice_approvals`). Backend computes `monto_total = counter + prepagado`, `monto_base = total / 1.19`, `iva = total - base`, `prepaid = prepagado > 0`. Status: `finalizada = FALSE`.
 
-2. **Asesor edits** (while rental is open): clicks "Editar" on an open factura → form pre-fills → edits montos/recibos → "Guardar cambios" (UPDATE). Can edit as many times as needed.
+2. **Asesor edits** (while rental is open): clicks "Editar" on an open factura → form pre-fills (montos + aprobaciones existentes) → edits montos/aprobaciones → "Guardar cambios" (UPDATE + replace de las aprobaciones: delete+insert en la tabla hija). Can edit as many times as needed.
 
 3. **Vehicle returned → asesor finalizes**: clicks "Finalizar" → sets `finalizada = TRUE`, `finalizada_at = NOW()`, `finalizada_por = username`.
 
@@ -314,7 +314,11 @@ All factura queries filter by `sede_nombre = :user_sede` for sede-role users. A 
 
 ### Schema (operational.invoices)
 
-Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (datafono), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado`, `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
+Key columns: `invoice_id` (PK), `rntl_mvnr` (contract), `sede_nombre`, `fecha_emision`, `numero_factura` (DIAN), `numero_recibo` (**DEPRECATED desde 25-ago-2026** — ya no se escribe; los numeros ahora viven en la tabla hija), `monto_total` (counter + prepagado, IVA included), `monto_counter`, `monto_prepagado`, `monto_base` (backend-computed: total/1.19), `iva` (backend-computed), `prepaid` (boolean: prepagado > 0), `finalizada` (boolean), `finalizada_at`, `finalizada_por`, `capturado_por`, `capturado_at`.
+
+### Numeros de aprobacion (operational.invoice_approvals) — desde 25-ago-2026
+
+Tabla hija: `approval_id` (PK), `invoice_id` (FK → invoices, ON DELETE CASCADE), `numero_aprobacion` (TEXT, alfanumerico ej. 04053Z/100000/09072I), `created_at`. **Una fila por numero** → una factura tiene 1..N aprobaciones. Reemplaza el antiguo `numero_recibo` (single). El form usa un `data_editor` (una fila por numero) con split defensivo (rompe cualquier `XXX/XXX` pegado). Migracion inicial: los `numero_recibo` viejos se partieron en filas (143 facturas traian varios juntos). Helpers en `common.py`: `execute_write_returning` (INSERT ... RETURNING) y `replace_invoice_approvals` (delete+insert).
 
 ## COBRA report reconciliation (manager's monthly batchfile)
 
