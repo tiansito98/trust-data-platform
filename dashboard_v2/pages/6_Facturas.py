@@ -136,6 +136,10 @@ if "_editing_id" not in st.session_state:
     st.session_state["_editing_id"] = None
 if "_editing_data" not in st.session_state:
     st.session_state["_editing_data"] = {}
+# Nonce para forzar un formulario "en blanco": al cambiar, se recrean los widgets
+# (Streamlit no limpia campos de un form sin cambiar su key).
+if "_form_nonce" not in st.session_state:
+    st.session_state["_form_nonce"] = 0
 
 editing = st.session_state["_editing_id"] is not None
 editing_data = st.session_state["_editing_data"]
@@ -164,8 +168,16 @@ if editing:
         st.rerun()
 else:
     section("Nueva factura")
+    if st.button("Limpiar formulario (nueva en blanco)"):
+        st.session_state["_form_nonce"] += 1
+        st.session_state.pop("_prefill_contrato", None)
+        st.rerun()
 
-with st.form("invoice_form", clear_on_submit=not editing):
+# clear_on_submit=False: NO borrar los campos al enviar. Asi, si la validacion
+# falla (ej. falta el prepagado USD), el asesor no pierde lo que ya escribio —
+# solo corrige y vuelve a guardar. En factura nueva exitosa se limpia con el
+# boton "Nueva factura / Limpiar" (abajo).
+with st.form(f"invoice_form_{st.session_state['_form_nonce']}", clear_on_submit=False):
     c1, c2, c3 = st.columns(3)
     fecha_emision = c1.date_input(
         "Fecha emision",
@@ -213,7 +225,8 @@ with st.form("invoice_form", clear_on_submit=not editing):
     st.caption("Agrega UNO por fila con el boton '+' de la tabla. NO pongas varios juntos "
                "con '/' ni '-' (si lo haces, el sistema los separa igual).")
     _appr_df_in = pd.DataFrame({"numero_aprobacion": (_existing_appr or [""])})
-    _appr_editor_key = f"appr_editor_{st.session_state['_editing_id'] or 'new'}"
+    _appr_editor_key = (f"appr_editor_{st.session_state['_editing_id'] or 'new'}_"
+                        f"{st.session_state['_form_nonce']}")
     appr_edited = st.data_editor(
         _appr_df_in,
         num_rows="dynamic",
