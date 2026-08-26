@@ -799,8 +799,19 @@ def build_rentals_full(engine):
             rsv.rsrv_prepaid_flg                              AS prepago_flag,
             ROUND(rsv.rsrv_prepaid_value_local::numeric, 0)   AS prepago_cop,
 
-            r.oprt_bed                                        AS operador_handover_codigo,
-            r.oprt_bed_checkout                               AS operador_checkout_codigo,
+            -- OPERADORES (corregido 2026-08-26).
+            -- Sixt entrega dos campos en fact_rentals y su nombre confunde:
+            --   oprt_bed          -> operador que RECIBE el vehiculo (devolucion)
+            --   oprt_bed_checkout -> operador que ENTREGA / APERTURA el contrato
+            -- ("checkout" = salida del vehiculo de la sede, no cierre del contrato).
+            -- Antes se mapeaban al reves y la comision se le pagaba a quien recibia.
+            -- Fuente sin ambiguedad: fact_rental_vehicles.oprt_bed_handover /
+            -- oprt_bed_return. Validado sobre 2026: 2.467 contratos coinciden,
+            -- 0 discrepancias. oprt_bed_checkout viene NULL ~18% del tiempo, por
+            -- eso la tabla de vehiculos manda y el campo del contrato es respaldo.
+            COALESCE(vprim.oprt_bed_handover, r.oprt_bed_checkout)
+                                                              AS operador_handover_codigo,
+            COALESCE(vult.oprt_bed_return, r.oprt_bed)        AS operador_devolucion_codigo,
 
             ROUND(r.rntl_revenue_main_local::numeric, 0)      AS revenue_base_cop,
             ROUND(r.rntl_revenue_secondary_local::numeric, 0) AS revenue_extras_cop,
@@ -850,6 +861,18 @@ def build_rentals_full(engine):
             ROUND(re.total_cop::numeric, 0)                   AS extras_reserva_total_cop
 
         FROM silver.fact_rentals r
+        -- Primer y ultimo tramo de vehiculo del contrato. Si hubo cambio de carro,
+        -- el que entrega es el del PRIMER tramo y el que recibe el del ULTIMO.
+        LEFT JOIN (
+            SELECT DISTINCT ON (rntl_mvnr) rntl_mvnr, oprt_bed_handover
+            FROM silver.fact_rental_vehicles
+            ORDER BY rntl_mvnr, rvnc_hser
+        ) vprim ON vprim.rntl_mvnr = r.rntl_mvnr
+        LEFT JOIN (
+            SELECT DISTINCT ON (rntl_mvnr) rntl_mvnr, oprt_bed_return
+            FROM silver.fact_rental_vehicles
+            ORDER BY rntl_mvnr, rvnc_hser DESC
+        ) vult ON vult.rntl_mvnr = r.rntl_mvnr
         LEFT JOIN silver.fact_reservations rsv ON rsv.rsrv_resn = r.rsrv_resn
         LEFT JOIN silver.dim_branches bh        ON bh.brnc_code = r.brnc_code_handover
         LEFT JOIN silver.dim_branches br        ON br.brnc_code = r.brnc_code_return
@@ -1108,7 +1131,7 @@ def build_rentals_detail(engine):
                 ELSE 'COUNTER'
             END                                               AS bucket_pago,
 
-            rf.operador_handover_codigo, rf.operador_checkout_codigo,
+            rf.operador_handover_codigo, rf.operador_devolucion_codigo,
             rf.estado_reserva, rf.estado_rental,
 
             rf.revenue_total_cop      AS revenue_total_rental_cop,
@@ -1302,9 +1325,15 @@ def build_disponibilidad_vehiculo_dia(engine):
                 r.vhcl_int_num,
                 d.full_date AS fecha,
                 r.rntl_mvnr AS numero_contrato,
-                r.oprt_bed::text AS asesor_codigo,
+                -- Asesor que APERTURA el contrato (ver nota en build_rentals_full).
+                COALESCE(rv.oprt_bed_handover, r.oprt_bed_checkout)::text AS asesor_codigo,
                 NULLIF(r.rsrv_resn, 0) AS numero_reserva
             FROM silver.fact_rentals r
+            LEFT JOIN (
+                SELECT DISTINCT ON (rntl_mvnr) rntl_mvnr, oprt_bed_handover
+                FROM silver.fact_rental_vehicles
+                ORDER BY rntl_mvnr, rvnc_hser
+            ) rv ON rv.rntl_mvnr = r.rntl_mvnr
             JOIN silver.dim_dates d
               ON d.full_date BETWEEN r.rntl_handover_date::date
                                  AND COALESCE(r.rntl_return_date::date, CURRENT_DATE)

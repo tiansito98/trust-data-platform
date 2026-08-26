@@ -1,12 +1,16 @@
 """
-Cargos Granular - solo admin (trust_admin).
+Cargos Granular - admin (historico completo) y usuarios de sede (su sede, desde agosto 2026).
 
 Vista detallada de TODOS los cargos por periodo, organizada estilo COBRA:
   - Resumen por bucket (VENTAS / COBERTURAS / ADICIONALES / TAX)
   - Desglose por codigo individual de cargo (T, BF, LD, SL, Y, OT, OW, etc.)
   - Split counter vs prepagado (reserva) por cada cargo
-  - Tabla de ventas por asesor (operador_handover_codigo) para calcular comisiones
-    (solo cuenta lo cobrado en counter, no lo prepagado)
+  - Tabla de ventas por asesor (operador_handover_codigo = quien APERTURA el
+    contrato) para calcular comisiones (solo cuenta lo cobrado en counter, no
+    lo prepagado)
+
+Acceso: admin ve todo. Los usuarios de sede ven solo su sede y solo desde
+FECHA_MINIMA_SEDE (agosto 2026) en adelante.
 
 Si filtras por una fecha, el TOTAL NETO debe coincidir con el de Cierre Diario.
 Las dos vistas usan los mismos filtros (fuente_cargo='RENTAL_COUNTER', USD).
@@ -31,13 +35,23 @@ import streamlit as st
 #   AD = conductor adicional
 #   BF = full cover
 #   LD = LDW (Loss Damage Waiver)
-#   BS = ?
+#   BS = silla / booster
 #   UP = upgrade de categoria
 #   CS = child seat
 #   BC = road assistance
-#   PF = ? (posiblemente Protection Fee — aun no aparece, pero se incluye)
+#   PF = Protection Fee (muy raro: 2 contratos en 2026)
 #   SL = liability
+#
+# NO COMISIONAN (decision de negocio, 2026-08-26): OT y FI.
+# Se evaluaron en la auditoria de comisiones de julio 2026 y quedaron fuera
+# de forma explicita. No agregarlos sin aprobacion del area comercial.
 COMISIONABLES = ["AD", "BF", "LD", "BS", "UP", "CS", "BC", "PF", "SL"]
+NO_COMISIONABLES_EXPLICITO = ["OT", "FI"]
+
+# Piso de fecha para usuarios de sede. Antes de esta fecha los datos de
+# comisiones estaban mal atribuidos (ver auditoria julio 2026), asi que solo
+# trust_admin puede consultarlos.
+FECHA_MINIMA_SEDE = dt.date(2026, 8, 1)
 
 from components.auth import require_auth, require_page, is_admin, logout_button
 from components.common import (
@@ -49,16 +63,23 @@ from components.common import (
 
 st.set_page_config(page_title="TRUST - Cargos Granular", layout="wide")
 require_auth()
-# Admin-only: require_page bloquea sede users via su pages list en users.yml.
-# is_admin() es defensa extra por si algun sede llegara aqui.
+# Acceso por pages list en users.yml. Sede: solo su sede y desde agosto 2026.
+# ES_ADMIN decide el piso de fecha y el alcance de sedes mas abajo.
 require_page("8_Cargos_Granular")
-if not is_admin():
-    st.error("Esta pagina es solo para administradores (trust_admin).")
-    st.stop()
+
+# Admin ve todo el historico; sede solo desde FECHA_MINIMA_SEDE.
+ES_ADMIN = is_admin()
+piso_fecha = None if ES_ADMIN else FECHA_MINIMA_SEDE
 
 inject_styles()
 logout_button()
-render_header("Cargos Granular (Admin)")
+render_header("Cargos Granular" if ES_ADMIN else "Cargos Granular (tu sede)")
+if not ES_ADMIN:
+    st.caption(
+        f"Datos disponibles desde el {FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')}. "
+        "Los periodos anteriores estan en revision y solo los consulta "
+        "administracion."
+    )
 
 
 # =============================================================================
@@ -66,7 +87,7 @@ render_header("Cargos Granular (Admin)")
 # =============================================================================
 from components.filters import render_sidebar_filters, render_active_filters_banner  # noqa: E402
 
-filtros = render_sidebar_filters(default_days=7)
+filtros = render_sidebar_filters(default_days=7, min_fecha=piso_fecha)
 render_active_filters_banner(filtros)
 
 desde = filtros.fecha_desde
@@ -76,6 +97,18 @@ sedes_sel = filtros.sedes_codigos  # ahora usa CODIGOS de sede, no nombres
 if (hasta - desde).days < 0:
     st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
     st.stop()
+
+# Guardarrail de servidor: el sidebar ya bloquea el rango, pero el rango tambien
+# viaja en session_state y podria llegar por otra via. Un usuario de sede nunca
+# debe consultar antes de FECHA_MINIMA_SEDE.
+if not ES_ADMIN:
+    if hasta < FECHA_MINIMA_SEDE:
+        st.warning(
+            f"No hay datos disponibles para tu usuario antes del "
+            f"{FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')}."
+        )
+        st.stop()
+    desde = max(desde, FECHA_MINIMA_SEDE)
 
 if (hasta - desde).days > 90:
     st.warning(
@@ -90,6 +123,13 @@ if (hasta - desde).days > 90:
 sede_clause_detail = ""
 sede_clause_resumen = ""
 params = {"desde": desde, "hasta": hasta}
+
+# Un usuario de sede SIEMPRE debe quedar filtrado. Si su sede no resolvio a un
+# codigo, la clausula quedaria vacia y veria toda la compania: cortamos antes.
+if not ES_ADMIN and not sedes_sel:
+    st.error("No pudimos resolver tu sede. Contacta a administracion.")
+    st.stop()
+
 if sedes_sel:
     # Ahora usamos CODIGO de sede (int) — consistente con Cierre Diario/Ingresos/etc.
     sede_clause_detail = "AND d.sede_handover_codigo = ANY(:sedes)"
@@ -123,7 +163,7 @@ charges_sql = f"""
         END                                    AS bucket_cobra,
         d.canal_cobro_tarifa,
         d.operador_handover_codigo             AS asesor_codigo,
-        d.operador_checkout_codigo             AS asesor_checkout,
+        d.operador_devolucion_codigo           AS asesor_devolucion,
         d.subtotal_usd,
         ROUND(d.subtotal_usd::numeric * t.trm_cop_per_usd, 0)         AS subtotal_cop,
         d.prepagado_cargo_usd                  AS prepagado_usd,

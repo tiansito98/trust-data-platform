@@ -238,7 +238,9 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 9. **Dummy vehicle filter:** `vehiculo_int_num = 99999999` is a Sixt administrative placeholder. Filter it out from vehicle analytics with `TRIM(vehiculo) != ''`.
 10. **No-show / cancelación filter:** contratos con `TRIM(placa) = ''` (asesor 7777777 sistémico) o `total_con_iva_usd = 0` son no-shows y cancelaciones. NO se cuentan como ingreso en Cierre Diario ni Cargos Granular. Filtro: `TRIM(COALESCE(placa,'')) <> '' AND COALESCE(total_con_iva_usd,0) > 0`.
 11. **Standardized date range filter:** todas las páginas del dashboard usan `render_sidebar_filters()` de `components/filters.py`. NO crear datepickers propios en páginas nuevas — usar el sidebar unificado para consistencia.
-12. **operational.op_asesores:** tabla maestra manual de asesores (nombre + codigo_silver + codigo_hr). Se mantiene con INSERT/UPDATE manuales. El pipeline NO la toca. Requerida para mostrar nombres en Cargos Granular via LEFT JOIN por `codigo_silver = operador_handover_codigo`.
+12. **Operador de contrato (CRÍTICO):** en el datashare, `oprt_bed_checkout` es quien **entrega/apertura** el contrato (checkout = salida del vehículo) y `oprt_bed` es quien lo **recibe** en la devolución. Silver los tenía invertidos hasta 2026-08-26. La fuente sin ambigüedad es `fact_rental_vehicles.oprt_bed_handover` / `oprt_bed_return`; `oprt_bed_checkout` viene NULL ~18% del tiempo, así que la tabla de vehículos manda. Columnas silver: `operador_handover_codigo` (= apertura, la que comisiona) y `operador_devolucion_codigo`.
+13. **Comisiones de asesor:** 5% sobre el cargo **con IVA** (= 5,95% del valor sin IVA), en COP a TRM Banrep del día de entrega, solo sobre la porción **counter** de cargos *pure counter* (prepagado = 0) y solo para códigos en `COMISIONABLES`. **OT y FI NO comisionan** (decisión de negocio 2026-08-26). Se atribuye a `operador_handover_codigo`.
+14. **operational.op_asesores:** tabla maestra manual de asesores (nombre + codigo_silver + codigo_hr). Se mantiene con INSERT/UPDATE manuales. El pipeline NO la toca. Requerida para mostrar nombres en Cargos Granular via LEFT JOIN por `codigo_silver = operador_handover_codigo`.
 
 ## Sixt data model — key columns
 
@@ -251,6 +253,7 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 - `rsrv_prepaid_flg` → only `1` when Sixt central charged the client directly (sixt.com.co). Wholesaler prepayments show as `0`.
 - `canal_cobro_tarifa` → derived: `SIXT_PREPAGO` / `WHOLESALER` / `COUNTER`. Covers both prepay scenarios.
 - ACRISS → 4-letter category code. Decoded in `dim_vehicle_groups_decoded`.
+- `oprt_bed` / `oprt_bed_checkout` → **ojo con los nombres**: `checkout` = entrega (apertura), `oprt_bed` = devolución. Ver hard rule 12.
 - Bug: column is `rntl_distount_local` (typo in datashare, NOT `discount`).
 
 ## Dashboard pages
@@ -262,6 +265,7 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 | Ingresos | `2_Ingresos.py` | admin | Tarifa vs adicionales by sede. RPD KPI. COP via Banrep per-row recalc. |
 | Vehiculos | `4_Vehiculos.py` | admin | ACRISS distribution, upgrades/downgrades, top models (dummy vehicles filtered) |
 | Disponibilidad | `5_Disponibilidad.py` | admin | Fleet snapshot (on-rent / ready-to-rent by sede and category) |
+| Cargos Granular | `8_Cargos_Granular.py` | all* | Cargos estilo COBRA + tabla de comisiones por asesor. Admin: histórico completo y todas las sedes. Rol `sede`: solo su sede y **solo desde 2026-08-01** (`FECHA_MINIMA_SEDE`), porque antes de esa fecha la atribución de asesor estaba mal. |
 | Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices` + child `operational.invoice_approvals`). Fields: sede (locked for sede users), fecha, contrato, numero factura DIAN, **numeros de aprobacion (1..N, una fila por numero — desde 25-ago-2026 reemplazan el antiguo numero_recibo)**, monto counter + prepagado (IVA 19% extracted by backend). El historial tiene 2 vistas: normal (aprobaciones agregadas por coma) y "por numero de aprobacion" (una fila por numero, para join de contabilidad). Sede-role users have their branch locked. |
 | Disponibilidad Flota | `7_Disponibilidad_Flota.py` | all | Monthly vehicle availability grid (vehicle x day). Combines auto data (rentals/reservations from Sixt) with manual entries (taller, PYP, transito, etc.). Staff can register/delete manual states. Writes to `operational.op_disponibilidad_manual`. |
 

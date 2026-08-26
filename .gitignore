@@ -66,3 +66,9 @@ docs/*_dump.md
 # Dashboard user credentials (hashed but still sensitive).
 # users.yml.example (template with dummy hashes) IS committed.
 dashboard_v2/config/users.yml
+
+# Excel lock files
+~$*.xlsx
+
+# Salidas intermedias de la auditoria de comisiones
+scripts/audit/out/

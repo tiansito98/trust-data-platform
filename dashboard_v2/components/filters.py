@@ -87,10 +87,22 @@ class FilterState:
 
 def render_sidebar_filters(default_days: int = 30,
                            show_acriss: bool = False,
-                           show_canal: bool = False) -> FilterState:
-    """Pinta los filtros en st.sidebar y devuelve un FilterState."""
+                           show_canal: bool = False,
+                           min_fecha: dt.date | None = None) -> FilterState:
+    """Pinta los filtros en st.sidebar y devuelve un FilterState.
+
+    min_fecha: piso duro para el selector de fechas. Si se pasa, el usuario no
+    puede elegir fechas anteriores. Lo usa Cargos Granular para limitar a los
+    usuarios de sede a partir de agosto 2026. El piso tambien recorta el valor
+    que venga persistido en session_state desde otra pagina, porque Streamlit
+    revienta si el valor guardado es menor que min_value.
+    """
     sedes_df = get_sedes()
     d_min, d_max = get_fecha_range()
+    if min_fecha is not None:
+        d_min = max(d_min, min_fecha)
+        if d_max < d_min:
+            d_max = d_min
 
     nombres = sedes_df["nombre"].tolist()
 
@@ -100,12 +112,18 @@ def render_sidebar_filters(default_days: int = 30,
     # paginas; solo usar `key=` (con session_state pre-seedeado) es el patron
     # confiable.
     today = dt.date.today()
-    default_hasta = min(today, d_max)
+    default_hasta = max(min(today, d_max), d_min)
     default_desde = max(d_min, default_hasta - dt.timedelta(days=2))
     if "v2_sedes" not in st.session_state:
         st.session_state["v2_sedes"] = []
     if "v2_fechas" not in st.session_state:
         st.session_state["v2_fechas"] = (default_desde, default_hasta)
+    if min_fecha is not None:
+        _g = st.session_state.get("v2_fechas")
+        if isinstance(_g, tuple) and len(_g) == 2:
+            st.session_state["v2_fechas"] = (max(_g[0], d_min), max(_g[1], d_min))
+        elif isinstance(_g, dt.date):
+            st.session_state["v2_fechas"] = (max(_g, d_min), d_max)
     if "v2_moneda" not in st.session_state:
         st.session_state["v2_moneda"] = "USD"
     if "v2_acriss" not in st.session_state:
