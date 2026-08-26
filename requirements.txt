@@ -8,7 +8,12 @@
 # Actions, no Streamlit Cloud).
 # =============================================================================
 
-streamlit>=1.30.0
+# Techo en 1.62: esa version reescribio st.date_input ("segmented fields and an
+# accessible calendar", release del 2026-08-19) y el calendario perdio el
+# selector de anio/mes y gano un desplegable "Date range". El dashboard depende
+# de poder saltar de anio/mes en un solo gesto, asi que nos quedamos en la UI
+# anterior hasta decidir si migramos.
+streamlit>=1.57,<1.62
 psycopg2-binary>=2.9.9
 sqlalchemy>=2.0.0
 pandas>=2.0.0
