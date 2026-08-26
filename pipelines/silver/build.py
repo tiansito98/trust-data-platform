@@ -990,6 +990,7 @@ def build_rentals_detail(engine):
                 c.chra_inty      AS inty,
                 c.chra_chco      AS code,
                 c.chra_pos       AS posicion,
+                c.chra_mser      AS periodo,
                 c.chra_konr      AS correction_num,
                 c.chra_unit_num  AS cantidad,
                 c.chra_unit_value_local AS unit_cop,
@@ -1028,6 +1029,7 @@ def build_rentals_detail(engine):
                 c.chrs_inty      AS inty,
                 c.chrs_chco      AS code,
                 c.chrs_pos       AS posicion,
+                c.chrs_mser      AS periodo,
                 c.chrs_konr      AS correction_num,
                 c.chrs_unit_num  AS cantidad,
                 c.chrs_unit_value_local AS unit_cop,
@@ -1072,6 +1074,12 @@ def build_rentals_detail(engine):
             ct.descripcion                                    AS cargo_descripcion,
             ct.categoria                                      AS cargo_categoria,
             u.posicion                                        AS cargo_posicion,
+            -- Periodo de facturacion (chra_mser). 0 = venta original; >0 son
+            -- extensiones del contrato, que arrastran el mismo cargo de forma
+            -- automatica. Cuentan como ingreso pero NO como comision: el asesor
+            -- no volvio a vender el adicional. Regla confirmada con la manager
+            -- el 2026-08-26 a proposito del contrato 9523788459.
+            u.periodo                                         AS cargo_periodo,
             u.correction_num                                  AS cargo_correccion,
 
             u.cantidad                                        AS cantidad,

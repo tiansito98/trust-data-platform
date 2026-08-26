@@ -157,6 +157,7 @@ charges_sql = f"""
             ELSE                                          'ADICIONALES'
         END                                    AS bucket_cobra,
         d.canal_cobro_tarifa,
+        d.cargo_periodo                        AS periodo,
         d.operador_handover_codigo             AS asesor_codigo,
         d.operador_devolucion_codigo           AS asesor_devolucion,
         d.subtotal_usd,
@@ -184,7 +185,7 @@ if df.empty:
 
 # Convertir columnas numericas
 num_cols = ["subtotal_usd", "subtotal_cop", "prepagado_usd",
-            "counter_usd", "prepagado_cop", "counter_cop"]
+            "counter_usd", "prepagado_cop", "counter_cop", "periodo"]
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
@@ -430,6 +431,11 @@ st.caption(
     "Los MIXTOS (parte prepago + parte counter) NO cuentan porque el cargo "
     "ya venia de la reserva — el asesor solo proceso una extension, no lo "
     "vendio fresh. "
+    "Tampoco cuentan las EXTENSIONES: si a un contrato se le hace una "
+    "modificacion que lo alarga, Sixt republica los mismos adicionales en un "
+    "periodo nuevo. Ese cargo se arrastra solo, el asesor no lo vuelve a "
+    "vender, y por eso solo comisiona el primer periodo (el ingreso si cuenta "
+    "completo). "
     "IVA incluido porque la comision se calcula sobre el monto CON IVA. "
     "Usa fecha de entrega (handover) del vehiculo. "
     "Columnas 'Dias ocupacion' y 'Dias renta' reflejan actividad del asesor "
@@ -474,13 +480,21 @@ with st.expander("Metas de dias renta 24h (por sede)", expanded=False):
 # Meta global = suma de metas por sede (para KPI de total)
 meta_dias = sum(meta_por_sede.values()) if meta_por_sede else 0
 
-# Regla comisionable: SOLO cargos PURE COUNTER de codigos comisionables.
+# Regla comisionable: SOLO cargos PURE COUNTER, de codigos comisionables, y del
+# PRIMER periodo del contrato.
 # - PURE COUNTER = counter_usd > 0 AND prepagado_usd == 0 (no venia de reserva).
 # - MIXTO (prepagado + counter) NO cuenta porque el cargo ya existia en reserva
 #   y el asesor solo proceso una extension. No lo "vendio" fresh.
+# - PERIODO 0 = venta original. Cuando a un contrato se le hace una modificacion
+#   que lo extiende, Sixt republica los mismos cargos con periodo 1, 2, ... El
+#   adicional se arrastra solo, el asesor no lo vuelve a vender, y por eso la
+#   extension no comisiona. Sigue contando como ingreso. (Regla confirmada con
+#   la manager el 2026-08-26 sobre el contrato 9523788459, extendido del 31-jul
+#   al 31-ago: solo comisiona el primer BF.)
 # - Threshold 0.01 USD para robustez ante ruido residual (aunque ya limpiamos).
 is_pure_counter = (df["counter_usd"] > 0.01) & (df["prepagado_usd"] < 0.01)
-df["es_base_comision"] = df["es_comisionable"] & is_pure_counter
+es_primer_periodo = df["periodo"].fillna(0) == 0
+df["es_base_comision"] = df["es_comisionable"] & is_pure_counter & es_primer_periodo
 
 df["counter_comisionable_usd"] = df["counter_usd"].where(df["es_base_comision"], 0.0)
 df["counter_comisionable_cop"] = df["counter_cop"].where(df["es_base_comision"], 0.0)
