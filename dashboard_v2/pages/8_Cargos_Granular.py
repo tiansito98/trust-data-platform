@@ -69,7 +69,6 @@ require_page("8_Cargos_Granular")
 
 # Admin ve todo el historico; sede solo desde FECHA_MINIMA_SEDE.
 ES_ADMIN = is_admin()
-piso_fecha = None if ES_ADMIN else FECHA_MINIMA_SEDE
 
 inject_styles()
 logout_button()
@@ -87,7 +86,7 @@ if not ES_ADMIN:
 # =============================================================================
 from components.filters import render_sidebar_filters, render_active_filters_banner  # noqa: E402
 
-filtros = render_sidebar_filters(default_days=7, min_fecha=piso_fecha)
+filtros = render_sidebar_filters(default_days=7)
 render_active_filters_banner(filtros)
 
 desde = filtros.fecha_desde
@@ -98,17 +97,26 @@ if (hasta - desde).days < 0:
     st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
     st.stop()
 
-# Guardarrail de servidor: el sidebar ya bloquea el rango, pero el rango tambien
-# viaja en session_state y podria llegar por otra via. Un usuario de sede nunca
-# debe consultar antes de FECHA_MINIMA_SEDE.
+# Piso de fecha: SOLO en esta pagina y SOLO para usuarios de sede.
+# Se recorta la variable local, nunca st.session_state["v2_fechas"], porque esa
+# key la comparten todas las paginas: si la tocaramos aqui, al volver a Cierre
+# Diario el usuario se encontraria el rango movido sin haberlo pedido.
 if not ES_ADMIN:
     if hasta < FECHA_MINIMA_SEDE:
         st.warning(
-            f"No hay datos disponibles para tu usuario antes del "
-            f"{FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')}."
+            f"El rango seleccionado es anterior al "
+            f"{FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')}, que es desde cuando hay "
+            f"datos disponibles para tu usuario. Ajusta las fechas en el panel "
+            f"de la izquierda."
         )
         st.stop()
-    desde = max(desde, FECHA_MINIMA_SEDE)
+    if desde < FECHA_MINIMA_SEDE:
+        st.info(
+            f"Mostrando desde el {FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')} "
+            f"(elegiste {desde.strftime('%d/%m/%Y')}). Los periodos anteriores "
+            f"solo los consulta administracion."
+        )
+        desde = FECHA_MINIMA_SEDE
 
 if (hasta - desde).days > 90:
     st.warning(
