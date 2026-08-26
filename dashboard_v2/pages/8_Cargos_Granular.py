@@ -67,8 +67,10 @@ require_auth()
 # ES_ADMIN decide el piso de fecha y el alcance de sedes mas abajo.
 require_page("8_Cargos_Granular")
 
-# Admin ve todo el historico; sede solo desde FECHA_MINIMA_SEDE.
+# Solo el admin (trust_admin) ve el calendario completo. Para todos los demas
+# el date_input arranca en FECHA_MINIMA_SEDE.
 ES_ADMIN = is_admin()
+PISO_FECHA = None if ES_ADMIN else FECHA_MINIMA_SEDE
 
 inject_styles()
 logout_button()
@@ -86,7 +88,7 @@ if not ES_ADMIN:
 # =============================================================================
 from components.filters import render_sidebar_filters, render_active_filters_banner  # noqa: E402
 
-filtros = render_sidebar_filters(default_days=7)
+filtros = render_sidebar_filters(default_days=7, min_fecha=PISO_FECHA)
 render_active_filters_banner(filtros)
 
 desde = filtros.fecha_desde
@@ -97,26 +99,11 @@ if (hasta - desde).days < 0:
     st.error("La fecha 'Desde' no puede ser posterior a 'Hasta'.")
     st.stop()
 
-# Piso de fecha: SOLO en esta pagina y SOLO para usuarios de sede.
-# Se recorta la variable local, nunca st.session_state["v2_fechas"], porque esa
-# key la comparten todas las paginas: si la tocaramos aqui, al volver a Cierre
-# Diario el usuario se encontraria el rango movido sin haberlo pedido.
-if not ES_ADMIN:
-    if hasta < FECHA_MINIMA_SEDE:
-        st.warning(
-            f"El rango seleccionado es anterior al "
-            f"{FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')}, que es desde cuando hay "
-            f"datos disponibles para tu usuario. Ajusta las fechas en el panel "
-            f"de la izquierda."
-        )
-        st.stop()
-    if desde < FECHA_MINIMA_SEDE:
-        st.info(
-            f"Mostrando desde el {FECHA_MINIMA_SEDE.strftime('%d/%m/%Y')} "
-            f"(elegiste {desde.strftime('%d/%m/%Y')}). Los periodos anteriores "
-            f"solo los consulta administracion."
-        )
-        desde = FECHA_MINIMA_SEDE
+# Guardarrail: el calendario ya arranca en FECHA_MINIMA_SEDE para los no-admin,
+# asi que esto no deberia dispararse nunca. Queda por si el rango llega por otra
+# via (session_state viejo, cambio futuro en el sidebar).
+if not ES_ADMIN and desde < FECHA_MINIMA_SEDE:
+    desde = FECHA_MINIMA_SEDE
 
 if (hasta - desde).days > 90:
     st.warning(

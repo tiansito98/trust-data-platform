@@ -87,10 +87,27 @@ class FilterState:
 
 def render_sidebar_filters(default_days: int = 30,
                            show_acriss: bool = False,
-                           show_canal: bool = False) -> FilterState:
-    """Pinta los filtros en st.sidebar y devuelve un FilterState."""
+                           show_canal: bool = False,
+                           min_fecha: dt.date | None = None) -> FilterState:
+    """Pinta los filtros en st.sidebar y devuelve un FilterState.
+
+    min_fecha: piso duro del calendario. Si se pasa, el date_input no deja
+    escoger fechas anteriores. Lo usa Cargos Granular para limitar a los
+    usuarios que no son admin a partir de agosto 2026.
+
+    IMPORTANTE: cuando hay piso, el widget usa su PROPIA key de session_state
+    en vez de la compartida "v2_fechas". Sin eso, el rango recortado se le
+    pegaria al usuario en las demas paginas (Cierre Diario, Ingresos, etc.),
+    que comparten esa key para persistir la seleccion entre paginas.
+    """
     sedes_df = get_sedes()
     d_min, d_max = get_fecha_range()
+    if min_fecha is not None:
+        d_min = max(d_min, min_fecha)
+        d_max = max(d_max, d_min)
+        fecha_key = f"v2_fechas_desde_{d_min.isoformat()}"
+    else:
+        fecha_key = "v2_fechas"
 
     nombres = sedes_df["nombre"].tolist()
 
@@ -100,12 +117,12 @@ def render_sidebar_filters(default_days: int = 30,
     # paginas; solo usar `key=` (con session_state pre-seedeado) es el patron
     # confiable.
     today = dt.date.today()
-    default_hasta = min(today, d_max)
+    default_hasta = max(min(today, d_max), d_min)
     default_desde = max(d_min, default_hasta - dt.timedelta(days=2))
     if "v2_sedes" not in st.session_state:
         st.session_state["v2_sedes"] = []
-    if "v2_fechas" not in st.session_state:
-        st.session_state["v2_fechas"] = (default_desde, default_hasta)
+    if fecha_key not in st.session_state:
+        st.session_state[fecha_key] = (default_desde, default_hasta)
     if "v2_moneda" not in st.session_state:
         st.session_state["v2_moneda"] = "USD"
     if "v2_acriss" not in st.session_state:
@@ -142,10 +159,10 @@ def render_sidebar_filters(default_days: int = 30,
             sedes_sel = [b for b in user_branches if b in nombres]
 
         # Fechas. Default ya pre-seedeado a (hoy - 2 .. hoy) arriba; aqui solo
-        # se renderiza el widget que persiste via session_state["v2_fechas"].
+        # se renderiza el widget que persiste via session_state[fecha_key].
         rango = st.date_input(
             "Rango de fechas",
-            key="v2_fechas",
+            key=fecha_key,
             min_value=d_min,
             max_value=d_max,
         )
