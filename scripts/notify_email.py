@@ -112,6 +112,29 @@ def _freshness_lines() -> list[str]:
     return lines or ["  (sin datos de frescura)"]
 
 
+def _rentas_check_line() -> str | None:
+    """Check clave: la ultima entrega real deberia ser ayer (lag<=1)."""
+    try:
+        sys.path.insert(0, str(REPO_ROOT))
+        from pipelines._common import get_engine
+        from sqlalchemy import text
+        eng = get_engine("silver,bronze")
+        with eng.connect() as c:
+            row = c.execute(text(
+                "SELECT fecha_handover_real::date, COUNT(*) FROM silver.vw_rentals_full "
+                "WHERE fecha_handover_real <= CURRENT_DATE "
+                "GROUP BY 1 ORDER BY 1 DESC LIMIT 1")).fetchone()
+        if not row or row[0] is None:
+            return None
+        dia, n = row
+        lag = (datetime.now(timezone.utc).date() - dia).days
+        cuando = {0: "hoy", 1: "ayer"}.get(lag, f"hace {lag} dias")
+        estado = "SI" if lag <= 1 else f"REVISAR ({lag} dias de atraso)"
+        return f"Rentas al dia: {estado}  ->  ultima entrega {dia} ({cuando}), {n} rentas ese dia."
+    except Exception:
+        return None
+
+
 def _last_failure_tail(n: int = 25) -> str:
     p = REPO_ROOT / "logs" / "last_failure.log"
     try:
@@ -132,6 +155,10 @@ def build_email(summary: dict | None):
     L: list[str] = []
     L.append("Pipeline de datos Trust: "
              + ("corrio correctamente." if ok else "FALLO."))
+    if ok:
+        chk = _rentas_check_line()
+        if chk:
+            L.append(chk)
     L.append("")
     L.append(f"Corrida: {now:%Y-%m-%d %H:%M} UTC  ({now_cot:%H:%M} COT)")
 

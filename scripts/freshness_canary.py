@@ -52,7 +52,7 @@ FRESHNESS_PROBES = [
 
 def gather(conn):
     conn.autocommit = True
-    out = {"last_run": None, "fresh": []}
+    out = {"last_run": None, "fresh": [], "rentas_ultimo_dia": None}
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(run_datm) FROM bronze.ctrl_extraction_log "
                     "WHERE status IN ('OK','EMPTY')")
@@ -64,6 +64,15 @@ def gather(conn):
                 out["fresh"].append((label, mx, mn, n))
             except Exception as e:  # noqa: BLE001
                 out["fresh"].append((label, None, None, f"err: {e}"))
+        # Check clave: ultimo dia con entregas reales (<= hoy) y cuantas fueron.
+        try:
+            cur.execute(
+                "SELECT fecha_handover_real::date, COUNT(*) FROM silver.vw_rentals_full "
+                "WHERE fecha_handover_real <= CURRENT_DATE "
+                "GROUP BY 1 ORDER BY 1 DESC LIMIT 1")
+            out["rentas_ultimo_dia"] = cur.fetchone()
+        except Exception:
+            pass
     return out
 
 
@@ -76,7 +85,15 @@ def build_email(fresh_ok: bool, age_h, data, max_age_h):
 
     L = []
     if fresh_ok:
-        L.append("Pipeline de datos Trust: al dia.")
+        L.append("Pipeline de datos Trust: corrio correctamente.")
+        # Check clave: rentas al dia (ultima entrega real deberia ser ayer, lag<=1).
+        ru = data.get("rentas_ultimo_dia")
+        if ru and ru[0]:
+            rlag = (today - ru[0]).days
+            cuando = {0: "hoy", 1: "ayer"}.get(rlag, f"hace {rlag} dias")
+            estado = "SI" if rlag <= 1 else f"REVISAR ({rlag} dias de atraso)"
+            L.append(f"Rentas al dia: {estado}  ->  ultima entrega {ru[0]} ({cuando}), "
+                     f"{ru[1]} rentas ese dia.")
     else:
         L.append("ALERTA: el pipeline NO refresco a tiempo.")
     L.append("")
