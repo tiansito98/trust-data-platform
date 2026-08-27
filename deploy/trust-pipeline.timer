@@ -1,0 +1,17 @@
+[Unit]
+Description=Dispara el pipeline Trust 2x/dia (06:00 y 20:00 COT)
+
+[Timer]
+# Colombia es UTC-5 fijo (sin horario de verano).
+#   06:00 COT = 11:00 UTC   (manana, antes de abrir)
+#   20:00 COT = 01:00 UTC   (noche, despues de cerrar)
+# Fuera del horario laboral 08:00-18:00 COT para no competir por el budget de IO.
+OnCalendar=*-*-* 11:00:00 UTC
+OnCalendar=*-*-* 01:00:00 UTC
+# Si la VM estaba apagada a la hora del disparo, corre al prender.
+Persistent=true
+# Jitter para no pegarle a Supabase en el segundo exacto.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

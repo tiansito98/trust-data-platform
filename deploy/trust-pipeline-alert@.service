@@ -1,0 +1,9 @@
+[Unit]
+Description=Alerta de falla del pipeline Trust (para %i)
+
+[Service]
+Type=oneshot
+User=trust
+Group=trust
+WorkingDirectory=/home/trust/trust-data-platform
+ExecStart=/home/trust/trust-data-platform/scripts/alert_failure.sh

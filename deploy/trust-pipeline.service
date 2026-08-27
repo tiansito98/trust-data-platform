@@ -1,0 +1,19 @@
+[Unit]
+Description=Trust data pipeline (bronze incremental + TRM + silver)
+Documentation=file:///home/trust/trust-data-platform/deploy/README.md
+Wants=network-online.target
+After=network-online.target
+# Si run_vm.sh sale != 0 (pipeline fallo), dispara la alerta.
+OnFailure=trust-pipeline-alert@%n.service
+
+[Service]
+Type=oneshot
+User=trust
+Group=trust
+WorkingDirectory=/home/trust/trust-data-platform
+ExecStart=/home/trust/trust-data-platform/scripts/run_vm.sh
+# Respaldo duro: el watchdog interno (SIGALRM, PIPELINE_TIMEOUT_SEC=1200s) ya
+# mata corridas colgadas; esto es el cinturon por si el proceso se cuelga antes.
+TimeoutStartSec=1800
+# No reintentar en caliente: un retry inmediato duplica el consumo de IO de
+# Supabase (ver CLAUDE.md). La siguiente corrida del timer se encarga.
