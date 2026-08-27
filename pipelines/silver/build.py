@@ -1826,6 +1826,92 @@ def build_asesor_dias_mes(engine):
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
 
+def build_comision_dia(engine):
+    """Base comisionable PRORRATEADA por dia efectivo 24h (para Cargos Granular).
+
+    Grano: 1 fila por (contrato x dia efectivo). Cada dia lleva la fraccion
+    base_total/N de la base comisionable del contrato. Al filtrar una ventana
+    [desde,hasta] la comision queda prorrateada: una renta que cruza meses
+    aporta a cada mes solo sus dias (ej. 25-jun a 4-jul, 10 dias: junio 6/10,
+    julio 4/10).
+
+    Regla (validada con negocio 2026-08-27):
+      - Base del contrato = SUMA de cargos PURE-COUNTER (counter>0 y prepagado=0),
+        periodo 0 (chra_mser), de codigos COMISIONABLES, sin no-shows (placa<>'');
+        con IVA 19%; COP a TRM Banrep del dia de ENTREGA. Identica a la base que
+        ya calculaba Cargos Granular, solo que aqui se reparte por dia.
+      - N = dias efectivos 24h = CEIL((devolucion - entrega)/24h), minimo 1.
+        Regla de 24h: cualquier bloque de 24h EMPEZADO cuenta como dia completo
+        (2pm->3pm del dia siguiente = 25h = 2 dias).
+      - Dias = fechas consecutivas desde la entrega (entrega + 0..N-1).
+      - Atribuida al operador de HANDOVER (quien abrio/vendio), aunque el pedazo
+        caiga en un mes posterior. Consistente con hard rule 13.
+
+    La comision final = 5% de la base (el 5% lo aplica quien paga).
+    Impacto vs el metodo por-entrega anterior: docs/private/comparativa_comisiones_prorrateo.md
+    """
+    log("\n>> Construyendo fact_comision_dia")
+    started = time.time()
+    codes = "'AD','BF','LD','BS','UP','CS','BC','PF','SL'"
+    _exec(engine, "DROP TABLE IF EXISTS silver.fact_comision_dia CASCADE")
+    _exec(engine, "DROP VIEW  IF EXISTS silver.fact_comision_dia CASCADE")
+    _exec(engine, f"""
+        CREATE TABLE silver.fact_comision_dia AS
+        WITH cargos AS (
+            SELECT
+                d.numero_contrato,
+                d.operador_handover_codigo,
+                d.sede_handover,
+                d.sede_handover_codigo,
+                d.fecha_handover_real::date AS f_handover_date,
+                SUM(d.counter_cargo_usd)                                                    AS base_usd,
+                SUM(ROUND(d.counter_cargo_usd::numeric * COALESCE(t.trm_cop_per_usd, 0), 0)) AS base_cop
+            FROM silver.vw_rentals_detail d
+            LEFT JOIN silver.dim_trm_diaria t ON t.fecha = d.fecha_handover_real::date
+            WHERE d.cargo_codigo IN ({codes})
+              AND d.counter_cargo_usd > 0.01
+              AND COALESCE(d.prepagado_cargo_usd, 0) < 0.01
+              AND COALESCE(d.cargo_periodo, 0) = 0
+              AND TRIM(COALESCE(d.placa, '')) <> ''
+            GROUP BY 1, 2, 3, 4, 5
+            HAVING SUM(d.counter_cargo_usd) > 0.01
+        ),
+        conteo AS (
+            SELECT
+                c.*,
+                -- N = duracion COMPLETA del contrato (real si cerro, programada si
+                -- sigue abierto). hora_devolucion trae la devolucion agendada, que
+                -- para abiertas es una fecha futura real. NO capar a NOW(): eso metia
+                -- toda la base en los dias transcurridos y sobre-contaba el mes actual.
+                GREATEST(
+                    CEIL(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(rf.hora_devolucion, NOW())
+                            - COALESCE(rf.hora_handover, c.f_handover_date::timestamp)
+                        )) / 86400.0
+                    )::int, 1
+                ) AS n_dias
+            FROM cargos c
+            LEFT JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
+        )
+        SELECT
+            numero_contrato,
+            operador_handover_codigo,
+            sede_handover,
+            sede_handover_codigo,
+            (f_handover_date + gs)::date                  AS fecha,
+            n_dias,
+            ROUND((base_usd * 1.19 / n_dias)::numeric, 4) AS base_comision_usd_civa_dia,
+            ROUND((base_cop * 1.19 / n_dias)::numeric, 2) AS base_comision_cop_civa_dia
+        FROM conteo
+        CROSS JOIN generate_series(0, n_dias - 1) AS gs
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_comision_dia_op_fecha ON silver.fact_comision_dia(operador_handover_codigo, fecha)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_comision_dia_fecha    ON silver.fact_comision_dia(fecha)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.fact_comision_dia")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
 # =============================================================================
 # main
 # =============================================================================
@@ -1878,6 +1964,9 @@ def main():
 
     # 12. Dias rentados por asesor (para metas y drill-down)
     build_asesor_dias_mes(engine)
+
+    # 13. Comisiones prorrateadas por dia efectivo (Cargos Granular)
+    build_comision_dia(engine)
 
     report_counts(engine)
 

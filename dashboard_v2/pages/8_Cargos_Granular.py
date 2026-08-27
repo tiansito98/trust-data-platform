@@ -117,6 +117,7 @@ if (hasta - desde).days > 90:
 # =============================================================================
 sede_clause_detail = ""
 sede_clause_resumen = ""
+sede_clause_comision = ""  # para silver.fact_comision_dia (sin alias de tabla)
 params = {"desde": desde, "hasta": hasta}
 
 # Un usuario de sede SIEMPRE debe quedar filtrado. Si su sede no resolvio a un
@@ -129,6 +130,7 @@ if sedes_sel:
     # Ahora usamos CODIGO de sede (int) — consistente con Cierre Diario/Ingresos/etc.
     sede_clause_detail = "AND d.sede_handover_codigo = ANY(:sedes)"
     sede_clause_resumen = "AND r.sede_handover_codigo = ANY(:sedes)"
+    sede_clause_comision = "AND sede_handover_codigo = ANY(:sedes)"
     params["sedes"] = list(sedes_sel)
 
 # Query 1: cargos individuales desde vw_rentals_detail
@@ -437,7 +439,11 @@ st.caption(
     "vender, y por eso solo comisiona el primer periodo (el ingreso si cuenta "
     "completo). "
     "IVA incluido porque la comision se calcula sobre el monto CON IVA. "
-    "Usa fecha de entrega (handover) del vehiculo. "
+    "La comision del asesor = 5% de esa base. "
+    "**PRORRATEO POR DIA:** la base se reparte por dia efectivo 24h del contrato, "
+    "asi que una renta que cruza meses aporta a cada mes SOLO sus dias (ej. renta "
+    "del 25-jun al 4-jul: junio 6/10, julio 4/10). Al filtrar un rango ves solo la "
+    "porcion de esos dias. Atribuida al asesor que ENTREGO/abrio el contrato. "
     "Columnas 'Dias ocupacion' y 'Dias renta' reflejan actividad del asesor "
     "en el rango de fechas seleccionado arriba."
 )
@@ -499,20 +505,36 @@ df["es_base_comision"] = df["es_comisionable"] & is_pure_counter & es_primer_per
 df["counter_comisionable_usd"] = df["counter_usd"].where(df["es_base_comision"], 0.0)
 df["counter_comisionable_cop"] = df["counter_cop"].where(df["es_base_comision"], 0.0)
 
-asesor_summary = (
-    df.groupby("asesor_codigo", dropna=False)
-    .agg(
-        contratos=("numero_contrato", "nunique"),
-        cargos_counter=("counter_usd", lambda x: int((x > 0).sum())),
-        # Comisionables (lo que realmente genera comision)
-        base_comisionable_usd=("counter_comisionable_usd", "sum"),
-        base_comisionable_cop=("counter_comisionable_cop", "sum"),
-        # Counter total se usa internamente para % comisionable, no se muestra
-        _counter_total_usd=("counter_usd", "sum"),
+# Base comisionable PRORRATEADA por dia efectivo (silver.fact_comision_dia).
+# Cada renta aporta SOLO sus dias dentro de la ventana [desde,hasta]: una renta
+# que cruza meses ya NO cuenta completa en el mes de entrega, sino que reparte
+# su base por dia (regla 24h). La base viene YA con IVA y en COP a TRM Banrep
+# del dia de entrega. Atribuida al operador de handover. Los flags es_base_comision
+# de df siguen alimentando las secciones 1-2 (cargos/codigos por entrega).
+comision_sql = f"""
+    SELECT operador_handover_codigo         AS asesor_codigo,
+           COUNT(DISTINCT numero_contrato)  AS contratos,
+           SUM(base_comision_usd_civa_dia)  AS base_comisionable_usd,
+           SUM(base_comision_cop_civa_dia)  AS base_comisionable_cop
+    FROM silver.fact_comision_dia
+    WHERE fecha BETWEEN :desde AND :hasta
+      {sede_clause_comision}
+    GROUP BY 1
+"""
+asesor_summary = load_query(comision_sql, params)
+if asesor_summary.empty:
+    asesor_summary = pd.DataFrame(
+        columns=["asesor_codigo", "contratos",
+                 "base_comisionable_usd", "base_comisionable_cop"]
     )
-    .reset_index()
-    .sort_values("base_comisionable_usd", ascending=False)
+# Codigo a entero-string limpio (Postgres lo devuelve como float: 7798873.0).
+asesor_summary["asesor_codigo"] = (
+    pd.to_numeric(asesor_summary["asesor_codigo"], errors="coerce")
+    .astype("Int64").astype(str).replace("<NA>", "(sin codigo)")
 )
+for _c in ("base_comisionable_usd", "base_comisionable_cop", "contratos"):
+    asesor_summary[_c] = pd.to_numeric(asesor_summary[_c], errors="coerce").fillna(0)
+asesor_summary = asesor_summary.sort_values("base_comisionable_usd", ascending=False)
 
 # Dias por SEDE (ocupacion + renta 24h) para el rango [desde, hasta].
 # - dias_ocupacion: metrica acida (COUNT DISTINCT placa+fecha) expandiendo
@@ -608,28 +630,12 @@ pct_meta_global = (
     if meta_dias > 0 else 0.0
 )
 
-# % comisionable = base comisionable / counter total (interno, no mostrado).
-# Cast a float ANTES de dividir: las columnas vienen como Decimal de Postgres,
-# y Decimal / pd.NA * 100 queda dtype object → .round(1) falla en pandas/3.14.
-# .where(cond) mantiene float64 (NaN donde counter=0, no pd.NA).
-# IMPORTANTE: pct se calcula ANTES de aplicar IVA a la base para que la ratio
-# se mantenga (%) — de otro modo se inflaria 19%.
-_base_f = pd.to_numeric(asesor_summary["base_comisionable_usd"], errors="coerce")
-_cnt_f = pd.to_numeric(asesor_summary["_counter_total_usd"], errors="coerce")
-asesor_summary["pct_comisionable"] = (
-    (_base_f / _cnt_f.where(_cnt_f != 0)) * 100
-).round(1)
-
-# IVA (19%) sobre la base comisionable. La comision se calcula sobre el
-# monto CON IVA (asi lo definio el negocio). Aplicamos DESPUES del pct para
-# no distorsionarlo.
-IVA_FACTOR_COMISION = 1.19
-asesor_summary["base_comisionable_usd"] = (
-    asesor_summary["base_comisionable_usd"] * IVA_FACTOR_COMISION
-)
-asesor_summary["base_comisionable_cop"] = (
-    asesor_summary["base_comisionable_cop"] * IVA_FACTOR_COMISION
-)
+# La base de fact_comision_dia YA viene con IVA 19% (no re-aplicar). La comision
+# del asesor = 5% de esa base con IVA (asi lo definio el negocio, hard rule 13).
+IVA_FACTOR_COMISION = 1.19  # se conserva por si alguna seccion lo referencia
+TASA_COMISION = 0.05
+asesor_summary["comision_usd"] = asesor_summary["base_comisionable_usd"] * TASA_COMISION
+asesor_summary["comision_cop"] = asesor_summary["base_comisionable_cop"] * TASA_COMISION
 
 # Asesor "null" / sin codigo: ponemos string visible
 asesor_summary["asesor_codigo"] = (
@@ -707,38 +713,33 @@ if not df_dias_sede.empty and len(df_dias_sede) > 0:
     st.markdown("**Breakdown por sede (con meta especifica):**")
     st.dataframe(_sede_view, use_container_width=True, hide_index=True)
 
-# ---------- Tabla por asesor (solo comisiones, sin dias) ----------
+# ---------- Tabla por asesor (comisiones prorrateadas del periodo) ----------
 view_asesor = asesor_summary.copy()
-view_asesor["base_comisionable_usd"] = view_asesor["base_comisionable_usd"].apply(
-    lambda v: fmt_money(v, "USD")
-)
-view_asesor["base_comisionable_cop"] = view_asesor["base_comisionable_cop"].apply(
-    lambda v: fmt_money(v, "COP")
-)
-view_asesor["pct_comisionable"] = view_asesor["pct_comisionable"].apply(
-    lambda v: f"{v:.1f}%" if pd.notna(v) else "-"
-)
+view_asesor["contratos"] = pd.to_numeric(
+    view_asesor["contratos"], errors="coerce").fillna(0).astype(int)
+for _c, _cur in (("base_comisionable_usd", "USD"), ("comision_usd", "USD"),
+                 ("base_comisionable_cop", "COP"), ("comision_cop", "COP")):
+    view_asesor[_c] = view_asesor[_c].apply(lambda v, cur=_cur: fmt_money(v, cur))
 
-# Solo mostramos columnas relevantes para comisiones
 view_asesor = view_asesor[[
-    "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
-    "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
-]]
-
-view_asesor = view_asesor.rename(columns={
+    "asesor_codigo", "nombre_completo", "contratos",
+    "base_comisionable_cop", "comision_cop",
+    "base_comisionable_usd", "comision_usd",
+]].rename(columns={
     "asesor_codigo": "Codigo asesor",
     "nombre_completo": "Nombre",
     "contratos": "Contratos",
-    "cargos_counter": "Cargos counter",
-    "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
     "base_comisionable_cop": "BASE COMISIONABLE COP (c/IVA)",
-    "pct_comisionable": "% comisionable",
+    "comision_cop": "COMISION COP (5%)",
+    "base_comisionable_usd": "BASE COMISIONABLE USD (c/IVA)",
+    "comision_usd": "COMISION USD (5%)",
 })
 st.dataframe(view_asesor, use_container_width=True, hide_index=True)
 xlsx_download_button(
     asesor_summary[[
-        "asesor_codigo", "nombre_completo", "contratos", "cargos_counter",
-        "base_comisionable_usd", "base_comisionable_cop", "pct_comisionable",
+        "asesor_codigo", "nombre_completo", "contratos",
+        "base_comisionable_cop", "comision_cop",
+        "base_comisionable_usd", "comision_usd",
     ]],
     file_name=f"cargos_granular_asesor_{dt.date.today()}",
     sheet_name="Por asesor",
@@ -764,10 +765,11 @@ st.markdown("---")
 # =============================================================================
 section("Drill-down: contratos con base comisionable por asesor")
 st.caption(
-    "Selecciona un asesor para ver los contratos y cargos exactos que "
-    "aportan a su base comisionable. Solo aparecen cargos comisionables "
-    f"({', '.join(COMISIONABLES)}) que fueron 100% counter (no MIXTO). "
-    "Montos mostrados CON IVA 19%."
+    "Selecciona un asesor para ver los contratos que aportan a su base "
+    "comisionable en la ventana, con el PRORRATEO por dia. 'Dias (ventana / "
+    "total)' muestra cuantos dias efectivos del contrato caen en el rango vs "
+    "el total del contrato; la base mostrada es solo la porcion de esos dias "
+    "(CON IVA 19%). La suma coincide con la fila del asesor de arriba."
 )
 
 # Solo asesores que tienen algo en la base comisionable
@@ -796,84 +798,72 @@ else:
     )
 
     if _selected != "-- Seleccionar asesor --":
-        # Extraer el codigo del selected
         _sel_row = _asesores_base[_asesores_base["_drill_label"] == _selected].iloc[0]
         _codigo_sel = _sel_row["asesor_codigo"]  # string
-        _codigo_num = pd.to_numeric(_codigo_sel, errors="coerce")
+        _cod_raw = pd.to_numeric(_codigo_sel, errors="coerce")
 
-        # Filtrar df a solo cargos de ese asesor que aportan a base
-        _drill = df[
-            (pd.to_numeric(df["asesor_codigo"], errors="coerce") == _codigo_num)
-            & (df["es_base_comision"])
-        ].copy()
-
-        if _drill.empty:
-            st.warning("No hay cargos base para este asesor en el periodo.")
+        if pd.isna(_cod_raw):
+            st.info("Asesor sin codigo mapeado; no hay drill por contrato.")
         else:
-            # Aplicar IVA (misma logica que la tabla de arriba)
-            _drill["counter_ciiva_usd"] = _drill["counter_usd"] * IVA_FACTOR_COMISION
-            _drill["counter_ciiva_cop"] = _drill["counter_cop"] * IVA_FACTOR_COMISION
+            # Contratos del asesor con su PRORRATEO dentro de la ventana.
+            _drill_sql = f"""
+                SELECT numero_contrato,
+                       MAX(sede_handover)              AS sede,
+                       MIN(n_dias)                     AS dias_totales,
+                       COUNT(*)                        AS dias_en_ventana,
+                       SUM(base_comision_usd_civa_dia) AS base_usd,
+                       SUM(base_comision_cop_civa_dia) AS base_cop
+                FROM silver.fact_comision_dia
+                WHERE fecha BETWEEN :desde AND :hasta
+                  AND operador_handover_codigo = :cod
+                  {sede_clause_comision}
+                GROUP BY numero_contrato
+                ORDER BY base_cop DESC
+            """
+            _drill = load_query(_drill_sql, dict(params, cod=int(_cod_raw)))
 
-            # Vista limpia
-            _drill_view = _drill[[
-                "numero_contrato", "fecha_entrega", "sede",
-                "codigo", "descripcion",
-                "counter_usd", "counter_ciiva_usd",
-                "counter_cop", "counter_ciiva_cop",
-            ]].copy()
+            if _drill.empty:
+                st.warning("No hay contratos con base comisionable para este asesor en la ventana.")
+            else:
+                for _c in ("base_usd", "base_cop", "dias_totales", "dias_en_ventana"):
+                    _drill[_c] = pd.to_numeric(_drill[_c], errors="coerce").fillna(0)
+                _drill["comision_cop"] = _drill["base_cop"] * TASA_COMISION
+                _tot_usd = float(_drill["base_usd"].sum())
+                _tot_cop = float(_drill["base_cop"].sum())
+                _n_contratos = int(_drill["numero_contrato"].nunique())
 
-            # Format money
-            for c in ("counter_usd", "counter_ciiva_usd"):
-                _drill_view[c] = _drill_view[c].apply(lambda v: fmt_money(v, "USD"))
-            for c in ("counter_cop", "counter_ciiva_cop"):
-                _drill_view[c] = _drill_view[c].apply(lambda v: fmt_money(v, "COP"))
+                _dv = _drill.copy()
+                _dv["Contrato"] = pd.to_numeric(
+                    _dv["numero_contrato"], errors="coerce").astype("Int64").astype(str)
+                _dv["Dias (ventana / total)"] = (
+                    _dv["dias_en_ventana"].astype(int).astype(str) + " / "
+                    + _dv["dias_totales"].astype(int).astype(str))
+                _dv["Base prorrateada COP (c/IVA)"] = _dv["base_cop"].apply(lambda v: fmt_money(v, "COP"))
+                _dv["Comision COP (5%)"] = _dv["comision_cop"].apply(lambda v: fmt_money(v, "COP"))
+                _dv["Base prorrateada USD (c/IVA)"] = _dv["base_usd"].apply(lambda v: fmt_money(v, "USD"))
+                _dv = _dv[[
+                    "Contrato", "sede", "Dias (ventana / total)",
+                    "Base prorrateada COP (c/IVA)", "Comision COP (5%)",
+                    "Base prorrateada USD (c/IVA)",
+                ]].rename(columns={"sede": "Sede"})
+                st.dataframe(_dv, use_container_width=True, hide_index=True)
 
-            _drill_view = _drill_view.rename(columns={
-                "numero_contrato": "Contrato",
-                "fecha_entrega": "Entrega",
-                "sede": "Sede",
-                "codigo": "Cod",
-                "descripcion": "Descripcion",
-                "counter_usd": "Counter USD (s/IVA)",
-                "counter_ciiva_usd": "Counter USD (c/IVA)",
-                "counter_cop": "Counter COP (s/IVA)",
-                "counter_ciiva_cop": "Counter COP (c/IVA)",
-            })
+                st.caption(
+                    f"**{_n_contratos}** contrato(s) con dias en la ventana. "
+                    f"Base prorrateada total: **{fmt_money(_tot_usd, 'USD')}** / "
+                    f"**{fmt_money(_tot_cop, 'COP')}** (c/IVA). "
+                    f"Coincide con la fila del asesor de arriba."
+                )
 
-            # Ordenar por contrato para agrupar visualmente
-            _drill_view = _drill_view.sort_values(["Contrato", "Cod"])
-
-            st.dataframe(_drill_view, use_container_width=True, hide_index=True)
-
-            # Totales de este asesor
-            _n_cargos = len(_drill)
-            _n_contratos = _drill["numero_contrato"].nunique()
-            _total_usd_ciiva = _drill["counter_ciiva_usd"].sum()
-            _total_cop_ciiva = _drill["counter_ciiva_cop"].sum()
-
-            st.caption(
-                f"**{_n_cargos}** cargo(s) comisionable(s) en **{_n_contratos}** "
-                f"contrato(s). "
-                f"Base total: **{fmt_money(_total_usd_ciiva, 'USD')}** / "
-                f"**{fmt_money(_total_cop_ciiva, 'COP')}** (c/IVA). "
-                f"Este numero debe coincidir con la fila del asesor en la tabla "
-                f"de arriba."
-            )
-
-            # Export
-            xlsx_download_button(
-                _drill[[
-                    "numero_contrato", "fecha_entrega", "sede",
-                    "codigo", "descripcion",
-                    "counter_usd", "counter_ciiva_usd",
-                    "counter_cop", "counter_ciiva_cop",
-                ]],
-                file_name=(
-                    f"drill_asesor_{_codigo_sel}_{dt.date.today()}"
-                ),
-                sheet_name="Detalle base comision",
-                key=f"xlsx_drill_asesor_{_codigo_sel}",
-            )
+                xlsx_download_button(
+                    _drill[[
+                        "numero_contrato", "sede", "dias_en_ventana", "dias_totales",
+                        "base_cop", "comision_cop", "base_usd",
+                    ]],
+                    file_name=f"drill_asesor_{_codigo_sel}_{dt.date.today()}",
+                    sheet_name="Prorrateo por contrato",
+                    key=f"xlsx_drill_asesor_{_codigo_sel}",
+                )
 
 
 st.markdown("---")
