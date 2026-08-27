@@ -1913,6 +1913,182 @@ def build_comision_dia(engine):
 
 
 # =============================================================================
+# Capa GOLD (analitica acida, grano diario) — pagina 9_Analitica (solo admin)
+# =============================================================================
+# Historia desde 2024; dia efectivo = bloque de 24h; capado a hoy (realizado).
+
+GOLD_START = "2024-01-01"
+PHANTOM_DARK_DAYS = 180
+
+
+def _sentinel_date(col: str) -> str:
+    """1899-12-31 = NULL en el datashare Sixt."""
+    return (f"CASE WHEN {col} IS NULL OR {col}::date = DATE '1899-12-31' "
+            f"THEN NULL ELSE {col}::date END")
+
+
+def build_gold_carro_dia(engine):
+    """gold_carro_dia: ocupacion (rentado vs flota) + revenue/tarifa/adicionales
+    prorrateados por dia efectivo 24h, a grano (placa x dia). Sede = ciudad,
+    ACRISS registrado del carro fisico. Porta la logica del notebook RevPAU:
+    numerador sobre carro fisico, denominador = dias en flota (dim_vehicles
+    in/out) con regla PHANTOM FLEET (dark>180d sin grounded ni salida real ->
+    out = ultimo dropoff). Solo USD. Alimenta 9_Analitica + KPIs acidos.
+    """
+    log("\n>> Construyendo gold_carro_dia")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.gold_carro_dia CASCADE")
+    _exec(engine, "DROP VIEW  IF EXISTS silver.gold_carro_dia CASCADE")
+    _exec(engine, f"""
+        CREATE TABLE silver.gold_carro_dia AS
+        WITH rentas AS (
+            SELECT r.numero_contrato, r.placa, r.sede_handover,
+                   r.fecha_handover_real::date AS f_ini,
+                   rf.hora_handover            AS ts_ini,
+                   LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW()) AS ts_fin,
+                   COALESCE(r.neto_usd, 0) AS neto, COALESCE(r.tarifa_usd, 0) AS tar,
+                   COALESCE(r.adicionales_usd, 0) AS adi
+            FROM silver.vw_rentals_resumen r
+            JOIN silver.vw_rentals_full rf ON rf.numero_contrato = r.numero_contrato
+            WHERE r.rental_currency = 'USD'
+              AND r.fecha_handover_real >= DATE '{GOLD_START}'
+              AND r.fecha_handover_real::date <= CURRENT_DATE
+              AND TRIM(COALESCE(r.placa, '')) <> ''
+        ),
+        conteo AS (
+            SELECT *, GREATEST(CEIL(EXTRACT(EPOCH FROM (
+                       ts_fin - COALESCE(ts_ini, f_ini::timestamp))) / 86400.0)::int, 1) AS n
+            FROM rentas
+        ),
+        rented AS (
+            SELECT placa, sede_handover AS sede_rent, (f_ini + gs)::date AS fecha,
+                   neto / n AS rev, tar / n AS tarr, adi / n AS adir
+            FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
+            WHERE (f_ini + gs) <= CURRENT_DATE
+        ),
+        rented_agg AS (
+            SELECT placa, fecha, MAX(sede_rent) AS sede_rent,
+                   SUM(rev) AS rev_usd, SUM(tarr) AS tar_usd, SUM(adir) AS adi_usd,
+                   COUNT(*) AS rentas_dia
+            FROM rented GROUP BY placa, fecha
+        ),
+        home AS (
+            SELECT placa, sede_rent AS home_sede FROM (
+                SELECT placa, sede_rent, COUNT(*) d,
+                       ROW_NUMBER() OVER (PARTITION BY placa ORDER BY COUNT(*) DESC) rn
+                FROM rented GROUP BY placa, sede_rent
+            ) t WHERE rn = 1
+        ),
+        acriss_reg AS (
+            SELECT NULLIF(TRIM(vhcl_plate), '') AS placa,
+                   COALESCE(NULLIF(vhgr_crs, ''), vhcl_group) AS acriss
+            FROM silver.dim_vehicles WHERE NULLIF(TRIM(vhcl_plate), '') IS NOT NULL
+        ),
+        lastr AS (
+            SELECT vhcl_int_num, MAX(rntl_return_date::date) AS last_dropoff
+            FROM silver.fact_rentals
+            WHERE vhcl_int_num IS NOT NULL AND rntl_return_date IS NOT NULL
+              AND rntl_return_date::date <= CURRENT_DATE
+            GROUP BY vhcl_int_num
+        ),
+        veh AS (
+            SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa,
+                   {_sentinel_date('v.vhcl_first_ci_date')} AS in_date,
+                   {_sentinel_date('v.vhcl_grounded_date')} AS out_raw,
+                   ({_sentinel_date('v.vhcl_defleet_checkin_date')} IS NOT NULL
+                    OR {_sentinel_date('v.vhcl_disposal_date')}       IS NOT NULL
+                    OR {_sentinel_date('v.vhcl_final_sale_date')}     IS NOT NULL
+                    OR {_sentinel_date('v.vhcl_deregistration_date')} IS NOT NULL) AS real_exit,
+                   l.last_dropoff
+            FROM silver.dim_vehicles v
+            LEFT JOIN lastr l ON l.vhcl_int_num = v.vhcl_int_num
+            WHERE {_sentinel_date('v.vhcl_first_ci_date')} IS NOT NULL
+              AND v.vhcl_int_num <> 99999999
+              AND NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+        ),
+        veh2 AS (
+            SELECT placa, in_date,
+                   CASE WHEN out_raw IS NULL AND NOT real_exit AND last_dropoff IS NOT NULL
+                             AND (CURRENT_DATE - last_dropoff) > {PHANTOM_DARK_DAYS}
+                        THEN last_dropoff ELSE out_raw END AS out_date
+            FROM veh
+        ),
+        fleet AS (
+            SELECT placa, gs::date AS fecha
+            FROM veh2 CROSS JOIN generate_series(
+                GREATEST(in_date, DATE '{GOLD_START}'),
+                LEAST(COALESCE(out_date, CURRENT_DATE), CURRENT_DATE),
+                INTERVAL '1 day') AS gs
+        ),
+        spine AS (
+            SELECT placa, fecha FROM fleet
+            UNION
+            SELECT placa, fecha FROM rented_agg
+        )
+        SELECT s.placa, s.fecha,
+               COALESCE(ra.sede_rent, h.home_sede, 'SIN_SEDE') AS sede,
+               COALESCE(ar.acriss, 'NA')                       AS acriss,
+               CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END AS rented_day,
+               COALESCE(ra.rentas_dia, 0) AS rentas_dia,
+               COALESCE(ra.rev_usd, 0) AS rev_usd,
+               COALESCE(ra.tar_usd, 0) AS tar_usd,
+               COALESCE(ra.adi_usd, 0) AS adi_usd
+        FROM spine s
+        LEFT JOIN rented_agg ra ON ra.placa = s.placa AND ra.fecha = s.fecha
+        LEFT JOIN home       h  ON h.placa  = s.placa
+        LEFT JOIN acriss_reg ar ON ar.placa = s.placa
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_sede  ON silver.gold_carro_dia(sede, fecha)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.gold_carro_dia")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
+def build_gold_cargo_dia(engine):
+    """gold_cargo_dia: cargos por codigo prorrateados por dia 24h, grano
+    (fecha x sede x codigo). TODO el cargo (prepago+counter, todos los periodos:
+    para ingreso cuentan completos), sin no-shows. Solo USD. Capado a hoy.
+    Alimenta el desglose de cargos de 9_Analitica.
+    """
+    log("\n>> Construyendo gold_cargo_dia")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.gold_cargo_dia CASCADE")
+    _exec(engine, "DROP VIEW  IF EXISTS silver.gold_cargo_dia CASCADE")
+    _exec(engine, f"""
+        CREATE TABLE silver.gold_cargo_dia AS
+        WITH cargos AS (
+            SELECT d.numero_contrato, d.cargo_codigo, d.sede_handover,
+                   d.fecha_handover_real::date AS f_ini,
+                   SUM(d.subtotal_usd) AS val_usd
+            FROM silver.vw_rentals_detail d
+            WHERE d.fecha_handover_real >= DATE '{GOLD_START}'
+              AND d.fecha_handover_real::date <= CURRENT_DATE
+              AND TRIM(COALESCE(d.placa, '')) <> ''
+            GROUP BY 1, 2, 3, 4
+        ),
+        conteo AS (
+            SELECT c.*, GREATEST(CEIL(EXTRACT(EPOCH FROM (
+                       LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW())
+                       - COALESCE(rf.hora_handover, c.f_ini::timestamp))) / 86400.0)::int, 1) AS n
+            FROM cargos c
+            JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
+        ),
+        expl AS (
+            SELECT sede_handover, cargo_codigo, (f_ini + gs)::date AS fecha, val_usd / n AS val_dia
+            FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
+            WHERE (f_ini + gs) <= CURRENT_DATE
+        )
+        SELECT fecha, sede_handover AS sede, cargo_codigo,
+               ROUND(SUM(val_dia)::numeric, 2) AS subtotal_usd
+        FROM expl GROUP BY fecha, sede_handover, cargo_codigo
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_cargo_dia_fecha ON silver.gold_cargo_dia(fecha)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_cargo_dia_cod   ON silver.gold_cargo_dia(cargo_codigo, fecha)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.gold_cargo_dia")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
+# =============================================================================
 # main
 # =============================================================================
 
@@ -1967,6 +2143,10 @@ def main():
 
     # 13. Comisiones prorrateadas por dia efectivo (Cargos Granular)
     build_comision_dia(engine)
+
+    # 14. Capa gold: analitica acida prorrateada (pagina 9_Analitica, solo admin)
+    build_gold_carro_dia(engine)
+    build_gold_cargo_dia(engine)
 
     report_counts(engine)
 
