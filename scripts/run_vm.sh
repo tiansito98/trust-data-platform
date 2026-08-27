@@ -35,7 +35,10 @@ LOG="$REPO/logs/pipeline_${TS}.log"
 } >> "$LOG" 2>&1
 
 # El pipeline es lo que decide el exit code (la alerta depende de esto).
-"$REPO/.venv/bin/python" scripts/run_pipeline.py >> "$LOG" 2>&1
+# --skip-trm: la TRM la actualiza el workflow refresh-trm.yml en GitHub (23:00 UTC).
+# El silver igual reconstruye dim_trm_diaria desde el bronze que dejo refresh-trm,
+# asi que no perdemos TRM; solo evitamos el pull redundante a Banrep.
+"$REPO/.venv/bin/python" scripts/run_pipeline.py --skip-trm >> "$LOG" 2>&1
 rc=$?
 
 ln -sf "$LOG" "$REPO/logs/latest.log"

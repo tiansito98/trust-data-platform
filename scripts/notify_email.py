@@ -53,7 +53,7 @@ def _smtp_config():
         "port": int(os.getenv("SMTP_PORT", "587")),
         "user": user,
         "password": pwd,
-        "to": os.getenv("ALERT_EMAIL_TO", user),
+        "to": os.getenv("ALERT_EMAIL_TO") or user,  # vacio -> usar SMTP_USER
     }
 
 

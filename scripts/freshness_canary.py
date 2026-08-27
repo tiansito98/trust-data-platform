@@ -135,7 +135,7 @@ def send_email(subject, body):
     if not user or not pwd:
         print(">> SMTP no configurado (faltan SMTP_USER/SMTP_PASSWORD): no mando correo.")
         return
-    to = os.getenv("ALERT_EMAIL_TO", user)
+    to = os.getenv("ALERT_EMAIL_TO") or user  # secret vacio en GitHub -> usar SMTP_USER
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "587"))
     msg = MIMEText(body, _charset="utf-8")
