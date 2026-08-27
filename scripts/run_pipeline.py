@@ -83,6 +83,21 @@ def arm_watchdog() -> None:
     print(f">> watchdog armado: {timeout}s", flush=True)
 
 
+def _notify_success(summary: dict) -> None:
+    """
+    Manda el correo de exito con la frescura de datos. Nunca rompe el pipeline
+    (si el correo falla, solo se loguea). En falla NO se llama desde aqui: lo
+    hace systemd OnFailure -> alert_failure.sh, asi tambien cubre un crash duro.
+    Requiere SMTP_* en el .env; si no estan, notify_email hace skip silencioso.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from notify_email import send_pipeline_email
+        send_pipeline_email(summary)
+    except Exception as e:  # noqa: BLE001
+        print(f">> notify_success fallo (ignorado): {e}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true",
@@ -149,6 +164,8 @@ def main():
 
     print("\n=== SUMMARY ===")
     print(json.dumps(summary, indent=2), flush=True)
+
+    _notify_success(summary)
 
 
 if __name__ == "__main__":

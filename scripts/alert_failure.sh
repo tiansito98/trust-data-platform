@@ -2,15 +2,15 @@
 # =============================================================================
 # alert_failure.sh - se dispara cuando el pipeline falla (systemd OnFailure).
 # =============================================================================
-# Manda el motivo de la falla (tail del ultimo log) por un canal opcional:
+# Manda el motivo de la falla (tail del ultimo log) por:
 #
-#   ALERT_WEBHOOK_URL  -> POST JSON {"text": "..."} (Slack / Discord / generico)
-#   ALERT_TELEGRAM_TOKEN + ALERT_TELEGRAM_CHAT  -> mensaje a Telegram
+#   1. Gmail (canal principal) -> notify_email.py, si estan SMTP_* en .env.
+#   2. ALERT_WEBHOOK_URL  -> POST JSON {"text": "..."} (Slack / Discord / generico)
+#   3. ALERT_TELEGRAM_TOKEN + ALERT_TELEGRAM_CHAT  -> mensaje a Telegram
 #
-# Cualquiera de los dos se lee de /home/trust/trust-data-platform/.env.
-# Si no hay ninguno configurado, solo escribe a journald (visible con
-# `journalctl -u trust-pipeline.service`). El canary hosted de GitHub Actions
-# es la red de seguridad que igual avisa aunque este script no tenga canal.
+# Todo se lee de /home/trust/trust-data-platform/.env. Si no hay ningun canal,
+# solo escribe a journald (visible con `journalctl -u trust-pipeline.service`).
+# El canary hosted de GitHub Actions es la red de seguridad que igual avisa.
 # =============================================================================
 set -uo pipefail
 
@@ -33,6 +33,12 @@ Ultimas lineas del log:
 ${TAIL}"
 
 echo "$MSG"   # -> journald
+
+# 1. Correo por Gmail (lee el tail de last_failure.log adentro). No rompe si falla.
+if [ -x "$REPO/.venv/bin/python" ]; then
+  "$REPO/.venv/bin/python" "$REPO/scripts/notify_email.py" --status failure \
+    && echo "correo de falla enviado" || echo "WARN: no se pudo mandar el correo de falla"
+fi
 
 if [ -n "$WEBHOOK" ]; then
   # jq no garantizado: escapar a mano lo minimo para JSON.
