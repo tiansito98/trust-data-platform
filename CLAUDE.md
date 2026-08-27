@@ -120,8 +120,8 @@ Supabase's Session pooler ignores `-c options` in the libpq connection string. A
 | `vw_charges_ra_enriched` | 1 row / charge (VIEW) | Counter charges with code decode + 3 currencies. |
 | `vw_charges_rs_enriched` | 1 row / charge (VIEW) | Reservation charges with code decode. |
 | `fact_comision_dia` | 1 row / contract × día efectivo | Base comisionable prorrateada por día 24h. Alimenta las comisiones de Cargos Granular. Ver hard rule 13. |
-| `gold_carro_dia` | 1 row / placa × día | **Capa gold.** Ocupación ácida (rentado vs flota), revenue/RPD por ciudad, prorrateado 24h, desde 2024. Denominador con regla phantom-fleet. Solo USD. Alimenta `9_Analitica`. |
-| `gold_cargo_dia` | 1 row / fecha × sede × código | **Capa gold.** Cargos por código prorrateados 24h (todos los períodos = ingreso completo). Solo USD. Alimenta el desglose de `9_Analitica`. |
+| `gold_carro_dia` | 1 row / placa × día | **Capa gold.** Ocupación ácida (rentado vs flota), revenue/RPD por ciudad, prorrateado 24h, desde 2024. Denominador con regla phantom-fleet. USD + COP (TRM Banrep del día de entrega). Alimenta `9_Analitica`. |
+| `gold_cargo_dia` | 1 row / fecha × sede × código | **Capa gold.** Cargos por código prorrateados 24h (todos los períodos = ingreso completo). USD + COP (TRM del día de entrega). Alimenta el desglose de `9_Analitica`. |
 
 Static seeds (skip rebuild if already populated):
 - `dim_dates` — calendar 2020-2030, skips if row count matches expected.
@@ -309,7 +309,7 @@ ORDER BY shared_blks_read DESC LIMIT 10;
 | Cargos Granular | `8_Cargos_Granular.py` | all* | Cargos estilo COBRA + tabla de comisiones por asesor. Admin: histórico completo y todas las sedes. Rol `sede`: solo su sede y **solo desde 2026-08-01** (`FECHA_MINIMA_SEDE`), porque antes de esa fecha la atribución de asesor estaba mal. |
 | Facturas | `6_Facturas.py` | all | Invoice capture form (writes to `operational.invoices` + child `operational.invoice_approvals`). Fields: sede (locked for sede users), fecha, contrato, numero factura DIAN, **numeros de aprobacion (1..N, una fila por numero — desde 25-ago-2026 reemplazan el antiguo numero_recibo)**, monto counter + prepagado (IVA 19% extracted by backend). El historial tiene 2 vistas: normal (aprobaciones agregadas por coma) y "por numero de aprobacion" (una fila por numero, para join de contabilidad). Sede-role users have their branch locked. |
 | Disponibilidad Flota | `7_Disponibilidad_Flota.py` | all | Monthly vehicle availability grid (vehicle x day). Combines auto data (rentals/reservations from Sixt) with manual entries (taller, PYP, transito, etc.). Staff can register/delete manual states. Writes to `operational.op_disponibilidad_manual`. |
-| Analitica | `9_Analitica.py` | admin | **Capa gold, solo admin.** Métricas ácidas del período (todo prorrateado por día 24h según el rango): ocupación por ciudad, revenue, RPD, RevPAU, desglose de cargos por código/bucket, **todo vs mismo período del año anterior (YoY)**. Lee `gold_carro_dia` + `gold_cargo_dia`. Solo USD. |
+| Analitica | `9_Analitica.py` | admin | **Capa gold, solo admin.** Métricas ácidas del período (todo prorrateado por día 24h según el rango): ocupación por ciudad, revenue, RPD, RevPAU, desglose de cargos por código/bucket, **todo vs mismo período del año anterior (YoY)**. Lee `gold_carro_dia` + `gold_cargo_dia`. USD/COP con el toggle del sidebar (COP a TRM del día de entrega). |
 
 ## Disponibilidad Flota (operational.op_disponibilidad_manual)
 

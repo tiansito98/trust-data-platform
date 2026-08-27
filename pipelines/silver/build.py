@@ -1947,9 +1947,12 @@ def build_gold_carro_dia(engine):
                    rf.hora_handover            AS ts_ini,
                    LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW()) AS ts_fin,
                    COALESCE(r.neto_usd, 0) AS neto, COALESCE(r.tarifa_usd, 0) AS tar,
-                   COALESCE(r.adicionales_usd, 0) AS adi
+                   COALESCE(r.adicionales_usd, 0) AS adi,
+                   -- TRM Banrep del dia de ENTREGA (se fija ahi para prorratear COP correcto)
+                   COALESCE(t.trm_cop_per_usd, 0) AS trm
             FROM silver.vw_rentals_resumen r
             JOIN silver.vw_rentals_full rf ON rf.numero_contrato = r.numero_contrato
+            LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
             WHERE r.rental_currency = 'USD'
               AND r.fecha_handover_real >= DATE '{GOLD_START}'
               AND r.fecha_handover_real::date <= CURRENT_DATE
@@ -1962,13 +1965,15 @@ def build_gold_carro_dia(engine):
         ),
         rented AS (
             SELECT placa, sede_handover AS sede_rent, (f_ini + gs)::date AS fecha,
-                   neto / n AS rev, tar / n AS tarr, adi / n AS adir
+                   neto / n AS rev, tar / n AS tarr, adi / n AS adir,
+                   (neto * trm) / n AS rev_c, (tar * trm) / n AS tar_c, (adi * trm) / n AS adi_c
             FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
             WHERE (f_ini + gs) <= CURRENT_DATE
         ),
         rented_agg AS (
             SELECT placa, fecha, MAX(sede_rent) AS sede_rent,
                    SUM(rev) AS rev_usd, SUM(tarr) AS tar_usd, SUM(adir) AS adi_usd,
+                   SUM(rev_c) AS rev_cop, SUM(tar_c) AS tar_cop, SUM(adi_c) AS adi_cop,
                    COUNT(*) AS rentas_dia
             FROM rented GROUP BY placa, fecha
         ),
@@ -2032,7 +2037,10 @@ def build_gold_carro_dia(engine):
                COALESCE(ra.rentas_dia, 0) AS rentas_dia,
                COALESCE(ra.rev_usd, 0) AS rev_usd,
                COALESCE(ra.tar_usd, 0) AS tar_usd,
-               COALESCE(ra.adi_usd, 0) AS adi_usd
+               COALESCE(ra.adi_usd, 0) AS adi_usd,
+               COALESCE(ra.rev_cop, 0) AS rev_cop,
+               COALESCE(ra.tar_cop, 0) AS tar_cop,
+               COALESCE(ra.adi_cop, 0) AS adi_cop
         FROM spine s
         LEFT JOIN rented_agg ra ON ra.placa = s.placa AND ra.fecha = s.fecha
         LEFT JOIN home       h  ON h.placa  = s.placa
@@ -2059,8 +2067,11 @@ def build_gold_cargo_dia(engine):
         WITH cargos AS (
             SELECT d.numero_contrato, d.cargo_codigo, d.sede_handover,
                    d.fecha_handover_real::date AS f_ini,
-                   SUM(d.subtotal_usd) AS val_usd
+                   SUM(d.subtotal_usd) AS val_usd,
+                   -- TRM Banrep del dia de ENTREGA (constante por contrato)
+                   MAX(COALESCE(t.trm_cop_per_usd, 0)) AS trm
             FROM silver.vw_rentals_detail d
+            LEFT JOIN silver.dim_trm_diaria t ON t.fecha = d.fecha_handover_real::date
             WHERE d.fecha_handover_real >= DATE '{GOLD_START}'
               AND d.fecha_handover_real::date <= CURRENT_DATE
               AND TRIM(COALESCE(d.placa, '')) <> ''
@@ -2074,12 +2085,14 @@ def build_gold_cargo_dia(engine):
             JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
         ),
         expl AS (
-            SELECT sede_handover, cargo_codigo, (f_ini + gs)::date AS fecha, val_usd / n AS val_dia
+            SELECT sede_handover, cargo_codigo, (f_ini + gs)::date AS fecha,
+                   val_usd / n AS val_dia, (val_usd * trm) / n AS val_cop_dia
             FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
             WHERE (f_ini + gs) <= CURRENT_DATE
         )
         SELECT fecha, sede_handover AS sede, cargo_codigo,
-               ROUND(SUM(val_dia)::numeric, 2) AS subtotal_usd
+               ROUND(SUM(val_dia)::numeric, 2)     AS subtotal_usd,
+               ROUND(SUM(val_cop_dia)::numeric, 0) AS subtotal_cop
         FROM expl GROUP BY fecha, sede_handover, cargo_codigo
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_cargo_dia_fecha ON silver.gold_cargo_dia(fecha)")
