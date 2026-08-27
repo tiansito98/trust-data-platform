@@ -16,7 +16,7 @@ You have full autonomy to execute commands in this repo. The project settings (`
 **Conventions:**
 - Always include `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` in commit messages.
 - Never commit `.env`, `users.yml`, `*.pem`, or any file matched by `.gitignore`.
-- **El repo es PUBLICO.** Nada de datos de personas identificadas (nombres de empleados, comisiones, sueldos), exports con cifras internas, documentos de Sixt bajo el acuerdo del datashare, ni datos de clientes. Todo eso va a **`docs/privado/`**, que esta gitignoreado (ver `docs/privado/LEEME.md`). Ante la duda, ahi.
+- **This repo is PUBLIC.** Never commit personal data of identifiable people (employee names, commissions, salaries), exports with internal figures, Sixt documents covered by the datashare agreement, or customer data. All of that goes in **`docs/private/`**, which is gitignored (see `docs/private/README.md`). When in doubt, put it there.
 - When a task is done, commit + push without asking "should I commit?" — just do it.
 - If you need to run `silver.build` or the pipeline, tell the user it'll take ~13 min and run it.
 

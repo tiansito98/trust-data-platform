@@ -74,14 +74,14 @@ dashboard_v2/config/users.yml
 # Datos de personas identificadas - NO subir: el repo es publico.
 # Los archivos siguen existiendo en local; simplemente no se versionan.
 # =============================================================================
-# docs/privado/ es LA carpeta para documentos que no se publican: datos de
-# personas, exports con cifras internas, material de RRHH, etc. Todo lo que
-# caiga ahi se ignora. Solo se versiona el LEEME que explica la regla, para que
-# la carpeta exista al clonar y nadie se invente otra convencion.
-docs/privado/*
-!docs/privado/LEEME.md
+# docs/private/ is THE folder for anything we don't publish: personal data,
+# exports with internal figures, HR material. Everything in it is ignored; only
+# the README is tracked, so the folder exists on a fresh clone and nobody
+# invents a different convention.
+docs/private/*
+!docs/private/README.md
 
-# Auditoria de comisiones julio 2026 (ya movida a docs/privado/). Se deja la
-# regla por si alguien vuelve a dejar el archivo suelto en docs/.
+# July 2026 commission audit (now under docs/private/). Rule kept in case the
+# file is ever dropped loose into docs/ again.
 docs/auditoria_comisiones_*.xlsx
 scripts/audit/
