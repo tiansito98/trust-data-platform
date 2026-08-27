@@ -68,13 +68,15 @@ def _freshness_lines() -> list[str]:
 
     # (etiqueta, SQL que devuelve max_date, min_date, count). Cada uno es defensivo:
     # si una columna cambia de nombre, se salta esa linea en vez de romper el correo.
+    # Rentas/Cargos: topar el MAX a hoy. Hay contratos con entrega futura
+    # (pre-reservas / leases largos) que si no, dan un lag negativo sin sentido.
     probes = [
         ("Rentas (entrega)",
-         "SELECT MAX(fecha_handover_real)::date, MIN(fecha_handover_real)::date, COUNT(*) "
-         "FROM silver.vw_rentals_full"),
+         "SELECT (MAX(fecha_handover_real) FILTER (WHERE fecha_handover_real <= CURRENT_DATE))::date, "
+         "MIN(fecha_handover_real)::date, COUNT(*) FROM silver.vw_rentals_full"),
         ("Cargos (entrega)",
-         "SELECT MAX(fecha_handover_real)::date, MIN(fecha_handover_real)::date, COUNT(*) "
-         "FROM silver.vw_rentals_detail"),
+         "SELECT (MAX(fecha_handover_real) FILTER (WHERE fecha_handover_real <= CURRENT_DATE))::date, "
+         "MIN(fecha_handover_real)::date, COUNT(*) FROM silver.vw_rentals_detail"),
         ("Reservas",
          "SELECT MAX(rsrv_date)::date, MIN(rsrv_date)::date, COUNT(*) "
          "FROM silver.vw_reservation_enriched"),

@@ -1,19 +1,22 @@
-name: freshness-canary
+name: reporte-diario
 
-# Red de seguridad hosted: verifica que el pipeline (que corre en la VM
-# DigitalOcean) haya refrescado los datos hace poco. Si no, este job FALLA y
-# GitHub manda email automatico (Settings -> Notifications -> Actions).
-# No toca Sixt ni la VM: solo lee bronze.ctrl_extraction_log en Supabase.
+# Reporte diario del pipeline + canary. Corre en el runner hosted de GitHub
+# (que SI llega a Supabase y SI puede mandar SMTP; la VM DigitalOcean no puede
+# porque DO bloquea los puertos SMTP). Lee bronze.ctrl_extraction_log + la
+# frescura en silver y manda un correo: EXITOSO con las fechas disponibles, o
+# ALERTA si el pipeline no refresco. Si esta viejo, el job ademas queda en rojo
+# y GitHub manda su propio email de "workflow failed" como respaldo.
+# No toca Sixt ni la VM.
 
 on:
   schedule:
     # 1h despues de la corrida del pipeline (05:00 UTC). Si el pipeline no corrio,
-    # a esta hora la ultima corrida OK tendria ~25h -> supera el umbral -> falla.
+    # a esta hora la ultima corrida OK tendria ~25h -> supera el umbral -> ALERTA.
     - cron: "0 6 * * *"    # 01:00 COT
   workflow_dispatch: {}     # permite correrlo a mano desde la pestaña Actions
 
 jobs:
-  canary:
+  reporte:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +24,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install "psycopg2-binary>=2.9"
-      - name: Chequear frescura del pipeline
+      - name: Reporte diario + canary
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: python scripts/freshness_canary.py --max-age-hours 20

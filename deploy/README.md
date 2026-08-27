@@ -11,38 +11,39 @@ wrapper hace `git pull` antes de cada corrida.
 | Archivo | Rol |
 |---|---|
 | `scripts/run_vm.sh` | Wrapper: `git pull` + `run_pipeline.py` + logs + copia `last_failure.log` si falla. |
-| `scripts/notify_email.py` | Correo por Gmail SMTP: EXITO (con frescura de datos) o FALLA (con el error). |
-| `scripts/alert_failure.sh` | Se dispara en falla (systemd `OnFailure`). Manda el correo de falla + webhook/Telegram si estan en `.env`; si no, a journald. |
+| `scripts/notify_email.py` | Correo por Gmail SMTP. Usable **solo donde SMTP no este bloqueado** (tu maquina local, corridas manuales). En la VM NO, ver abajo. |
+| `scripts/alert_failure.sh` | Se dispara en falla (systemd `OnFailure`). Manda webhook/Telegram (HTTPS, sirve en la VM) + journald. |
 | `deploy/trust-pipeline.service` | Unit oneshot que corre el wrapper como user `trust`. |
 | `deploy/trust-pipeline.timer` | Dispara **1x/dia: 05:00 UTC (00:00 COT)**, tras el cierre core 04:30 UTC. |
 | `deploy/trust-pipeline-alert@.service` | Unit de alerta que systemd invoca en `OnFailure`. |
-| `scripts/freshness_canary.py` + `.github/workflows/freshness_canary.yml` | Red de seguridad **hosted**: si el pipeline no refresco hace >20h, el job falla y GitHub manda email. Atrapa "VM muerta". |
+| `scripts/freshness_canary.py` + `.github/workflows/freshness_canary.yml` | **Reporte diario + canary**, hosted en GitHub. Manda el correo (EXITOSO con fechas / ALERTA si no refresco) y queda en rojo si esta viejo. |
 
-## Correo (exito + falla)
+## Correo (por que va desde GitHub y no desde la VM)
 
-Un correo por resultado, sin duplicados:
-- **EXITO** -> lo manda `run_pipeline.py` al final, con la frescura de datos
-  (hasta que fecha llegaron rentas / cargos / reservas / TRM y el lag en dias).
-- **FALLA** -> lo manda systemd `OnFailure` -> `alert_failure.sh` -> `notify_email.py`
-  (asi tambien cubre un crash duro donde el pipeline no alcanza a avisar).
+**DigitalOcean bloquea los puertos SMTP salientes (25/465/587)** en el droplet
+(politica anti-spam). Probado: 587 da timeout, 465 y 25 tambien. Por eso **la VM
+no puede mandar correo**. La solucion: el correo lo manda el **runner hosted de
+GitHub** (su red si permite SMTP), reusando la misma Gmail App Password.
 
-Requiere en el `.env` de la VM un **Gmail App Password** (NO la clave normal):
+El workflow `reporte-diario` corre 1x/dia (06:00 UTC, 1h despues del pipeline):
+lee `bronze.ctrl_extraction_log` + la frescura en silver y manda:
+- **EXITOSO** -> con las fechas disponibles (hasta que dia llego cada dominio + lag).
+- **ALERTA** -> si el pipeline no refresco en >20h (VM muerta / timer no disparo /
+  pipeline fallo). Ademas el job queda en rojo -> GitHub manda su email de fallo.
 
-```
-SMTP_USER=sebastiangonzalezarango98@gmail.com
-SMTP_PASSWORD=xxxxxxxxxxxxxxxx        # App Password de 16 chars
-ALERT_EMAIL_TO=sebastiangonzalezarango98@gmail.com
-# SMTP_HOST/SMTP_PORT tienen default smtp.gmail.com:587
-```
+**Secrets de repo que hay que cargar** (Settings -> Secrets and variables -> Actions):
+- `SUPABASE_DB_URL` (ya existe)
+- `SMTP_USER` = el Gmail remitente
+- `SMTP_PASSWORD` = Gmail App Password de 16 chars (Google -> Seguridad -> Verif.
+  en 2 pasos -> Contrasenas de aplicaciones)
+- `ALERT_EMAIL_TO` (opcional; default = `SMTP_USER`)
 
-Como generar el App Password: cuenta de Google -> Seguridad -> Verificacion en 2
-pasos (debe estar activa) -> Contrasenas de aplicaciones -> crear una nueva.
-Si faltan `SMTP_USER`/`SMTP_PASSWORD`, el correo se omite en silencio (no rompe nada).
+Probar sin esperar al cron: pestaña **Actions -> reporte-diario -> Run workflow**.
 
-Probar el correo sin correr todo el pipeline:
+`notify_email.py` (el modulo local) sirve para probar el correo desde tu maquina
+o para que una corrida manual `python scripts/run_pipeline.py` local tambien avise:
 ```bash
-sudo -u trust /home/trust/trust-data-platform/.venv/bin/python \
-     /home/trust/trust-data-platform/scripts/notify_email.py --status success
+python scripts/notify_email.py --status success   # local, red que si permite SMTP
 ```
 
 ## Instalacion (una sola vez, como root en la VM)
@@ -87,18 +88,18 @@ cat /home/trust/trust-data-platform/logs/last_failure.log
 
 ## Alertas
 
-Tres capas, independientes:
+Capas independientes:
 
-1. **Correo Gmail (principal):** exito + falla desde el pipeline (ver seccion
-   "Correo" arriba). El de exito trae la frescura de datos; el de falla, el error.
+1. **Correo Gmail desde GitHub (principal):** el `reporte-diario` (ver seccion
+   "Correo" arriba) manda EXITOSO con las fechas, o ALERTA si el pipeline no
+   refresco. Es tambien la deteccion de falla (llega ~1h despues del run).
 
-2. **VM webhook/Telegram (opcional, extra):** para un ping adicional en el momento,
-   agregar al `.env` de la VM `ALERT_WEBHOOK_URL=` (Slack/Discord) o
-   `ALERT_TELEGRAM_TOKEN=` + `ALERT_TELEGRAM_CHAT=`. Sin esto, la falla igual sale
-   por correo, `journalctl` y `last_failure.log`.
+2. **VM webhook/Telegram (opcional, ping inmediato):** como la VM no puede SMTP
+   pero SI HTTPS, para un aviso al instante con el traceback agregar al `.env` de la
+   VM `ALERT_WEBHOOK_URL=` (Slack/Discord) o `ALERT_TELEGRAM_TOKEN=` +
+   `ALERT_TELEGRAM_CHAT=`. Sin esto, la falla queda en `journalctl` +
+   `last_failure.log` y sale por el correo del reporte-diario.
 
-3. **Canary hosted (respaldo anti "VM muerta"):** el workflow de GitHub Actions
-   corre 1x/dia (06:00 UTC) y **falla + manda email** si el pipeline no refresco en
-   >20h. Cubre el caso que las capas 1 y 2 no pueden (VM apagada no manda nada).
-   Requiere el secret de repo `SUPABASE_DB_URL` (ya existe) y Settings ->
-   Notifications -> Actions ("Send notifications for failed workflows only").
+3. **Email de "workflow failed" de GitHub (respaldo):** si el reporte-diario sale
+   en rojo (pipeline viejo) o el workflow revienta, GitHub manda su propio email.
+   Activar en Settings -> Notifications -> Actions ("failed workflows only").
