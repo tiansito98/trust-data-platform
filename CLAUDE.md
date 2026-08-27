@@ -147,6 +147,42 @@ Implemented in `build_rentals_detail` (CTE `prepay_lookup`). Aggregated in `buil
 
 Sixt corrects contracts by inserting a new "wave" of charges with `konr+1` and **omitting** positions that no longer apply. The valid position set is: `(inty, pos)` whose `MAX(konr)` equals the `MAX(konr)` global of the contract. Implemented in `vw_charges_ra_enriched`, `vw_charges_rs_enriched`, `vw_rentals_detail`, and `vw_rentals_full`.
 
+### Limitacion conocida y aceptada: konr x mser
+
+La regla calcula el `MAX(konr)` por `(mvnr, inty, pos)`, **sin considerar `chra_mser`** (el periodo, ver hard rule 14). Cada periodo lleva su propia historia de correcciones, asi que un periodo puede quedarse en `konr = 1` mientras otro llego a `konr = 2`. La regla mira el maximo global del contrato y **descarta los periodos que no lo alcanzan**.
+
+**Decision (2026-08-26): NO se corrige.** Afecta 3 contratos en todo el historico, ninguno reciente:
+
+| Contrato | Entrega | Dias | Silver | Sixt (`rntl_revenue_rental`) | Pierde |
+|---|---|---|---|---|---|
+| `9482887066` | 2022-02-13 | 56 | 1.301,60 USD | 2.603,20 USD | 1.301,60 USD |
+| `9490719699` | 2023-01-09 | 56 | 1.478,15 USD | 2.189,58 USD | 711,43 USD |
+| `9503654690` | 2024-02-22 | 67 | 1.092,67 USD | 2.879,55 USD | 1.786,88 USD |
+
+Los tres son rentas largas (56-67 dias) que se extendieron. **Cero contratos afectados en 2025 y 2026, cero impacto en comisiones.** Tocar la regla konr implicaria revalidar las 4 vistas que la implementan sobre 13.898 contratos, y el costo supera el beneficio.
+
+Nota: en `9490719699` y `9503654690` parte de la diferencia es el descuento del contrato (213,31 y 474,31 USD), porque la suma de cargos es bruta y `rntl_revenue_rental` es neta. El resto si es periodo perdido.
+
+**El arreglo, si algun dia hace falta:** bajar el grano a `MAX(konr) per (mvnr, inty, pos, mser)`. No debilita la regla — sigue siendo full restatement, solo que evaluado por periodo.
+
+**Como detectar si vuelve a pasar** (ligero, correr si aparece un descuadre con COBRA en un contrato largo):
+
+```sql
+-- Posiciones donde conviven varios periodos Y varias correcciones.
+-- Si devuelve filas con fecha reciente, revisar ese contrato a mano.
+SELECT c.chra_mvnr, c.chra_inty, c.chra_pos,
+       COUNT(DISTINCT c.chra_mser) AS periodos,
+       COUNT(DISTINCT c.chra_konr) AS correcciones,
+       MAX(r.rntl_handover_datm)::date AS entrega
+FROM bronze.rent_shop_ch_fct_ra_charges_franchise c
+JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
+  ON r.rntl_mvnr = c.chra_mvnr AND r.mndt_code = 409
+WHERE c.mndt_code = 409
+GROUP BY 1, 2, 3
+HAVING COUNT(DISTINCT c.chra_mser) > 1 AND COUNT(DISTINCT c.chra_konr) > 1
+ORDER BY entrega DESC;
+```
+
 ## Operating safely — Supabase IO budget awareness
 
 **On Pro plan with Micro compute**, the database has a finite daily IO budget:
@@ -350,6 +386,8 @@ Validated March 2026: 288 contracts overlap (~80%), 71 silver-only (March handov
 ### Konr rule (validated, do not weaken)
 
 Sixt does **full restatement** on konr corrections: every konr+1 wave republishes ALL valid positions. The silver rule (`MAX(konr) per (mvnr, inty, pos) == MAX(konr) global per mvnr`) is correct and loses zero revenue. Verified March 2026: 0 rows flagged as "dropped — partial-restatement candidate", $0 dropped.
+
+Unica excepcion conocida: contratos multi-periodo donde `konr` y `mser` se cruzan (3 contratos, 2022-2024). Documentada y aceptada — ver "Limitacion conocida y aceptada: konr x mser".
 
 ## Useful commands for one-off debugging
 

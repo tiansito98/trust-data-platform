@@ -70,5 +70,11 @@ dashboard_v2/config/users.yml
 # Excel lock files
 ~$*.xlsx
 
-# Salidas intermedias de la auditoria de comisiones
-scripts/audit/out/
+# =============================================================================
+# Datos de personas identificadas - NO subir: el repo es publico.
+# Los archivos siguen existiendo en local; simplemente no se versionan.
+# =============================================================================
+# Auditoria de comisiones julio 2026: nombres de asesores, su compensacion
+# individual, contratos y placas. Se saco del repo el 2026-08-27.
+docs/auditoria_comisiones_*.xlsx
+scripts/audit/

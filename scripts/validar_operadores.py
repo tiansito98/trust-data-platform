@@ -20,14 +20,15 @@ from sqlalchemy import text
 
 from pipelines._common import get_engine
 
-# contrato -> asesor que lo ENTREGO (validado a mano en la auditoria de julio)
+# contrato -> codigo del asesor que lo ENTREGO (validado a mano en la auditoria
+# de julio 2026). Solo codigos: el repo es publico y no versionamos nombres.
 ESPERADO = {
-    9523774314: 7793224,   # Jeimmy Fajardo (Steffany)
-    9523826011: 7792174,   # Natalia Quintero
-    9523848159: 7795534,   # David Bonilla
-    9523897935: 7795534,   # David Bonilla
-    9523923550: 7797448,   # Samantha Castillo
-    9524049080: 7795534,   # David Bonilla
+    9523774314: 7793224,
+    9523826011: 7792174,
+    9523848159: 7795534,
+    9523897935: 7795534,
+    9523923550: 7797448,
+    9524049080: 7795534,
 }
 
 
