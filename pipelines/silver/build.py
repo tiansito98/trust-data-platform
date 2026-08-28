@@ -1984,17 +1984,24 @@ def build_gold_carro_dia(engine):
                 FROM rented GROUP BY placa, sede_rent
             ) t WHERE rn = 1
         ),
+        -- DISTINCT ON (placa): dim_vehicles tiene >1 fila para algunas placas
+        -- (placa re-registrada). Sin dedup, los JOINs multiplican filas y se
+        -- inflan los flota-dias (denominador de la ocupacion).
         acriss_reg AS (
-            SELECT NULLIF(TRIM(vhcl_plate), '') AS placa,
-                   COALESCE(NULLIF(vhgr_crs, ''), vhcl_group) AS acriss
-            FROM silver.dim_vehicles WHERE NULLIF(TRIM(vhcl_plate), '') IS NOT NULL
+            SELECT DISTINCT ON (placa) placa, acriss FROM (
+                SELECT NULLIF(TRIM(vhcl_plate), '') AS placa,
+                       COALESCE(NULLIF(vhgr_crs, ''), vhcl_group) AS acriss
+                FROM silver.dim_vehicles WHERE NULLIF(TRIM(vhcl_plate), '') IS NOT NULL
+            ) x ORDER BY placa
         ),
         -- sede registrada del carro (fallback de home_sede si nunca rento)
         veh_home AS (
-            SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa, b.brnc_name AS reg_sede
-            FROM silver.dim_vehicles v
-            LEFT JOIN silver.dim_branches b ON b.brnc_code = v.brnc_code_first_checkin
-            WHERE NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+            SELECT DISTINCT ON (placa) placa, reg_sede FROM (
+                SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa, b.brnc_name AS reg_sede
+                FROM silver.dim_vehicles v
+                LEFT JOIN silver.dim_branches b ON b.brnc_code = v.brnc_code_first_checkin
+                WHERE NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+            ) x ORDER BY placa
         ),
         lastr AS (
             SELECT vhcl_int_num, MAX(rntl_return_date::date) AS last_dropoff
@@ -2004,19 +2011,23 @@ def build_gold_carro_dia(engine):
             GROUP BY vhcl_int_num
         ),
         veh AS (
-            SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa,
-                   {_sentinel_date('v.vhcl_first_ci_date')} AS in_date,
-                   {_sentinel_date('v.vhcl_grounded_date')} AS out_raw,
-                   ({_sentinel_date('v.vhcl_defleet_checkin_date')} IS NOT NULL
-                    OR {_sentinel_date('v.vhcl_disposal_date')}       IS NOT NULL
-                    OR {_sentinel_date('v.vhcl_final_sale_date')}     IS NOT NULL
-                    OR {_sentinel_date('v.vhcl_deregistration_date')} IS NOT NULL) AS real_exit,
-                   l.last_dropoff
-            FROM silver.dim_vehicles v
-            LEFT JOIN lastr l ON l.vhcl_int_num = v.vhcl_int_num
-            WHERE {_sentinel_date('v.vhcl_first_ci_date')} IS NOT NULL
-              AND v.vhcl_int_num <> 99999999
-              AND NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+            SELECT DISTINCT ON (placa) placa, in_date, out_raw, real_exit, last_dropoff
+            FROM (
+                SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa,
+                       {_sentinel_date('v.vhcl_first_ci_date')} AS in_date,
+                       {_sentinel_date('v.vhcl_grounded_date')} AS out_raw,
+                       ({_sentinel_date('v.vhcl_defleet_checkin_date')} IS NOT NULL
+                        OR {_sentinel_date('v.vhcl_disposal_date')}       IS NOT NULL
+                        OR {_sentinel_date('v.vhcl_final_sale_date')}     IS NOT NULL
+                        OR {_sentinel_date('v.vhcl_deregistration_date')} IS NOT NULL) AS real_exit,
+                       l.last_dropoff
+                FROM silver.dim_vehicles v
+                LEFT JOIN lastr l ON l.vhcl_int_num = v.vhcl_int_num
+                WHERE {_sentinel_date('v.vhcl_first_ci_date')} IS NOT NULL
+                  AND v.vhcl_int_num <> 99999999
+                  AND NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+            ) x
+            ORDER BY placa, in_date DESC NULLS LAST
         ),
         veh2 AS (
             SELECT placa, in_date,
