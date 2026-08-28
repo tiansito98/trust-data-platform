@@ -102,7 +102,7 @@ def _freshness_lines() -> list[str]:
             try:
                 r = c.execute(text(
                     "SELECT MAX(run_datm) FROM bronze.ctrl_extraction_log "
-                    "WHERE status IN ('OK','EMPTY')")).fetchone()
+                    "WHERE status IN ('OK','EMPTY','SUCCESS')")).fetchone()
                 if r and r[0]:
                     lines.append(f"  {'Ultima corrida OK':<18} {r[0]:%Y-%m-%d %H:%M} UTC")
             except Exception:

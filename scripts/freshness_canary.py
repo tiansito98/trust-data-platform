@@ -55,7 +55,7 @@ def gather(conn):
     out = {"last_run": None, "fresh": [], "rentas_ultimo_dia": None}
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(run_datm) FROM bronze.ctrl_extraction_log "
-                    "WHERE status IN ('OK','EMPTY')")
+                    "WHERE status IN ('OK','EMPTY','SUCCESS')")
         out["last_run"] = cur.fetchone()[0]
         for label, sql in FRESHNESS_PROBES:
             try:
