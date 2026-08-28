@@ -48,6 +48,23 @@ if [ "$rc" -ne 0 ]; then
   cp "$LOG" "$REPO/logs/last_failure.log"
 fi
 
+# Disparar el reporte-diario en GitHub (lee Supabase y manda el correo). Se hace
+# SIEMPRE (exito o falla) para que llegue el correo EXITOSO o ALERTA. El cron de
+# GitHub es poco confiable, por eso la VM lo dispara por API (HTTPS, no bloqueado)
+# justo despues de cada corrida -> timing controlado por la VM.
+GH_TOKEN="$(grep -E '^GITHUB_DISPATCH_TOKEN=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+if [ -n "$GH_TOKEN" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+    -H "Authorization: Bearer $GH_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/tiansito98/trust-data-platform/actions/workflows/freshness_canary.yml/dispatches" \
+    -d '{"ref":"main"}')
+  echo "reporte-diario dispatch -> HTTP $code (204 = OK)" >> "$LOG"
+else
+  echo "reporte-diario dispatch: falta GITHUB_DISPATCH_TOKEN en .env, skip" >> "$LOG"
+fi
+
 # Retencion: dejar solo los ultimos 30 logs por-corrida.
 ls -1t "$REPO"/logs/pipeline_*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
 
