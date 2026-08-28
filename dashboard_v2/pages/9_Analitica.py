@@ -187,8 +187,8 @@ cur_c["yoy_rev"] = cur_c.apply(
 cur_c = cur_c.sort_values("revenue", ascending=False)
 
 view = cur_c.copy()
-view["Flota"] = view["placas_distintas"].astype(int)
-view["Flota prom"] = view["flota_prom"].map(lambda v: f"{v:.1f}")
+view["Flota"] = view["flota_prom"].map(lambda v: f"{v:.1f}")
+view["Placas"] = view["placas_distintas"].astype(int)
 view["Util %"] = view["util"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "-")
 view["Dias rentados"] = view["rented_days"].map(fmt_int)
 view["Flota-dias"] = view["fleet_days"].map(fmt_int)
@@ -196,16 +196,19 @@ view["RPD"] = view["rpd"].map(lambda v: fmt_money(v, MON) if pd.notna(v) else "-
 view["Revenue"] = view["revenue"].map(lambda v: fmt_money(v, MON))
 view["YoY revenue"] = view["yoy_rev"].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "nuevo")
 st.dataframe(
-    view[["sede", "Flota", "Flota prom", "Util %", "Dias rentados", "Flota-dias",
+    view[["sede", "Flota", "Placas", "Util %", "Dias rentados", "Flota-dias",
           "RPD", "Revenue", "YoY revenue"]]
     .rename(columns={"sede": "Ciudad"}),
     use_container_width=True, hide_index=True,
 )
 st.caption(
-    "**Flota** = carros que PERTENECEN a la sede (home = donde mas rentan; si nunca "
-    "rentaron, su sede registrada). Cada carro cuenta en UNA sola sede -> la suma es "
-    "la flota total, sin doble-contar traspasos. **Util %** = dias rentados / flota-dias "
-    "de ESA flota. **Flota prom** = flota-dias / dias del periodo (promedio simultaneo)."
+    "La sede de cada carro se determina por su UBICACION REAL dia a dia (timeline de "
+    "contratos: los traslados mueven el carro). Un carro que se traslada a mitad de mes "
+    "aporta sus dias a cada sede por separado. "
+    "**Flota** = flota-dias / dias del periodo (carros promedio realmente basados en la "
+    "sede; suma ~ flota total). **Placas** = carros distintos que estuvieron en la sede "
+    "(un carro en traslado aparece en varias, por eso Placas puede ser > Flota). "
+    "**Util %** = dias rentados / flota-dias de esa sede."
 )
 
 # grafico ocupacion por ciudad

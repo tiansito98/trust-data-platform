@@ -1928,12 +1928,18 @@ def _sentinel_date(col: str) -> str:
 
 
 def build_gold_carro_dia(engine):
-    """gold_carro_dia: ocupacion (rentado vs flota) + revenue/tarifa/adicionales
-    prorrateados por dia efectivo 24h, a grano (placa x dia). Sede = ciudad,
-    ACRISS registrado del carro fisico. Porta la logica del notebook RevPAU:
-    numerador sobre carro fisico, denominador = dias en flota (dim_vehicles
-    in/out) con regla PHANTOM FLEET (dark>180d sin grounded ni salida real ->
-    out = ultimo dropoff). Solo USD. Alimenta 9_Analitica + KPIs acidos.
+    """gold_carro_dia: ocupacion (rentado vs flota) + revenue prorrateado 24h, a
+    grano (placa x dia). UBICACION REAL por timeline de contratos (v3, 2026-08-28):
+    - Flota = roster ACTIVO de bronze.fleet_shop_ve_fct_vehicles_current (defleeted
+      afuera). Sede base = sede de operacion (brnc_code).
+    - Ubicacion diaria = donde dejo el carro el ultimo contrato (renta o TRASLADO,
+      rate_type_level3_aknm='Internal Products'). Antes del 1er contrato: sede del
+      primer handover; fallback: sede de operacion. Cada dia (rentado o parado) se
+      atribuye a donde REALMENTE estuvo el carro.
+    - rented/revenue: solo rentas (no traslados), prorrateado 24h, capado a hoy.
+      USD + COP (TRM Banrep del dia de entrega). tar/adi=0 (el desglose va en gold_cargo_dia).
+    Flota por sede = flota-dias/dias (promedio; el conteo de placas doble-cuenta
+    traspasos). Ver scripts/build_gold_v3.py (validado) y el artefacto de ocupacion.
     """
     log("\n>> Construyendo gold_carro_dia")
     started = time.time()
@@ -1941,133 +1947,81 @@ def build_gold_carro_dia(engine):
     _exec(engine, "DROP VIEW  IF EXISTS silver.gold_carro_dia CASCADE")
     _exec(engine, f"""
         CREATE TABLE silver.gold_carro_dia AS
-        WITH rentas AS (
-            SELECT r.numero_contrato, r.placa, r.sede_handover,
-                   r.fecha_handover_real::date AS f_ini,
-                   rf.hora_handover            AS ts_ini,
-                   LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW()) AS ts_fin,
-                   COALESCE(r.neto_usd, 0) AS neto, COALESCE(r.tarifa_usd, 0) AS tar,
-                   COALESCE(r.adicionales_usd, 0) AS adi,
-                   -- TRM Banrep del dia de ENTREGA (se fija ahi para prorratear COP correcto)
-                   COALESCE(t.trm_cop_per_usd, 0) AS trm
-            FROM silver.vw_rentals_resumen r
-            JOIN silver.vw_rentals_full rf ON rf.numero_contrato = r.numero_contrato
-            LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
-            WHERE r.rental_currency = 'USD'
-              AND r.fecha_handover_real >= DATE '{GOLD_START}'
-              AND r.fecha_handover_real::date <= CURRENT_DATE
-              AND TRIM(COALESCE(r.placa, '')) <> ''
-        ),
-        conteo AS (
-            SELECT *, GREATEST(CEIL(EXTRACT(EPOCH FROM (
-                       ts_fin - COALESCE(ts_ini, f_ini::timestamp))) / 86400.0)::int, 1) AS n
-            FROM rentas
-        ),
-        rented AS (
-            SELECT placa, sede_handover AS sede_rent, (f_ini + gs)::date AS fecha,
-                   neto / n AS rev, tar / n AS tarr, adi / n AS adir,
-                   (neto * trm) / n AS rev_c, (tar * trm) / n AS tar_c, (adi * trm) / n AS adi_c
-            FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
-            WHERE (f_ini + gs) <= CURRENT_DATE
-        ),
-        rented_agg AS (
-            SELECT placa, fecha, MAX(sede_rent) AS sede_rent,
-                   SUM(rev) AS rev_usd, SUM(tarr) AS tar_usd, SUM(adir) AS adi_usd,
-                   SUM(rev_c) AS rev_cop, SUM(tar_c) AS tar_cop, SUM(adi_c) AS adi_cop,
-                   COUNT(*) AS rentas_dia
-            FROM rented GROUP BY placa, fecha
-        ),
-        home AS (
-            SELECT placa, sede_rent AS home_sede FROM (
-                SELECT placa, sede_rent, COUNT(*) d,
-                       ROW_NUMBER() OVER (PARTITION BY placa ORDER BY COUNT(*) DESC) rn
-                FROM rented GROUP BY placa, sede_rent
-            ) t WHERE rn = 1
-        ),
-        -- DISTINCT ON (placa): dim_vehicles tiene >1 fila para algunas placas
-        -- (placa re-registrada). Sin dedup, los JOINs multiplican filas y se
-        -- inflan los flota-dias (denominador de la ocupacion).
-        acriss_reg AS (
-            SELECT DISTINCT ON (placa) placa, acriss FROM (
-                SELECT NULLIF(TRIM(vhcl_plate), '') AS placa,
-                       COALESCE(NULLIF(vhgr_crs, ''), vhcl_group) AS acriss
-                FROM silver.dim_vehicles WHERE NULLIF(TRIM(vhcl_plate), '') IS NOT NULL
-            ) x ORDER BY placa
-        ),
-        -- sede registrada del carro (fallback de home_sede si nunca rento)
-        veh_home AS (
-            SELECT DISTINCT ON (placa) placa, reg_sede FROM (
-                SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa, b.brnc_name AS reg_sede
-                FROM silver.dim_vehicles v
-                LEFT JOIN silver.dim_branches b ON b.brnc_code = v.brnc_code_first_checkin
-                WHERE NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
-            ) x ORDER BY placa
-        ),
-        lastr AS (
-            SELECT vhcl_int_num, MAX(rntl_return_date::date) AS last_dropoff
-            FROM silver.fact_rentals
-            WHERE vhcl_int_num IS NOT NULL AND rntl_return_date IS NOT NULL
-              AND rntl_return_date::date <= CURRENT_DATE
-            GROUP BY vhcl_int_num
-        ),
-        veh AS (
-            SELECT DISTINCT ON (placa) placa, in_date, out_raw, real_exit, last_dropoff
-            FROM (
-                SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa,
-                       {_sentinel_date('v.vhcl_first_ci_date')} AS in_date,
-                       {_sentinel_date('v.vhcl_grounded_date')} AS out_raw,
-                       ({_sentinel_date('v.vhcl_defleet_checkin_date')} IS NOT NULL
-                        OR {_sentinel_date('v.vhcl_disposal_date')}       IS NOT NULL
-                        OR {_sentinel_date('v.vhcl_final_sale_date')}     IS NOT NULL
-                        OR {_sentinel_date('v.vhcl_deregistration_date')} IS NOT NULL) AS real_exit,
-                       l.last_dropoff
-                FROM silver.dim_vehicles v
-                LEFT JOIN lastr l ON l.vhcl_int_num = v.vhcl_int_num
-                WHERE {_sentinel_date('v.vhcl_first_ci_date')} IS NOT NULL
-                  AND v.vhcl_int_num <> 99999999
-                  AND NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
-            ) x
-            ORDER BY placa, in_date DESC NULLS LAST
-        ),
-        veh2 AS (
-            SELECT placa, in_date,
-                   CASE WHEN out_raw IS NULL AND NOT real_exit AND last_dropoff IS NOT NULL
-                             AND (CURRENT_DATE - last_dropoff) > {PHANTOM_DARK_DAYS}
-                        THEN last_dropoff ELSE out_raw END AS out_date
-            FROM veh
-        ),
-        fleet AS (
-            SELECT placa, gs::date AS fecha
-            FROM veh2 CROSS JOIN generate_series(
-                GREATEST(in_date, DATE '{GOLD_START}'),
-                LEAST(COALESCE(out_date, CURRENT_DATE), CURRENT_DATE),
-                INTERVAL '1 day') AS gs
-        ),
-        spine AS (
-            SELECT placa, fecha FROM fleet
-            UNION
-            SELECT placa, fecha FROM rented_agg
-        )
-        -- sede = HOME del carro (donde mas rento; si nunca, la registrada). TODOS
-        -- sus dias (rentados + ociosos + revenue) van a su home -> ocupacion = uso
-        -- de la flota que PERTENECE a cada sede. Cada carro cae en UNA sola sede,
-        -- asi el conteo no doble-cuenta los traspasos.
-        SELECT s.placa, s.fecha,
-               COALESCE(h.home_sede, vh.reg_sede, 'SIN_SEDE') AS sede,
-               COALESCE(ar.acriss, 'NA')                       AS acriss,
-               CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END AS rented_day,
-               COALESCE(ra.rentas_dia, 0) AS rentas_dia,
-               COALESCE(ra.rev_usd, 0) AS rev_usd,
-               COALESCE(ra.tar_usd, 0) AS tar_usd,
-               COALESCE(ra.adi_usd, 0) AS adi_usd,
-               COALESCE(ra.rev_cop, 0) AS rev_cop,
-               COALESCE(ra.tar_cop, 0) AS tar_cop,
-               COALESCE(ra.adi_cop, 0) AS adi_cop
-        FROM spine s
-        LEFT JOIN rented_agg ra ON ra.placa = s.placa AND ra.fecha = s.fecha
-        LEFT JOIN home       h  ON h.placa  = s.placa
-        LEFT JOIN veh_home   vh ON vh.placa = s.placa
-        LEFT JOIN acriss_reg ar ON ar.placa = s.placa
+WITH roster AS (
+    SELECT DISTINCT ON (placa) placa, base_sede, acriss, in_date FROM (
+        SELECT NULLIF(TRIM(dv.vhcl_plate),'') placa,
+               bb.brnc_name base_sede,
+               COALESCE(NULLIF(v.vhcl_group,''), dv.vhcl_group) acriss,
+               CASE WHEN dv.vhcl_first_ci_date::date=DATE '1899-12-31' THEN NULL ELSE dv.vhcl_first_ci_date::date END in_date
+        FROM bronze.fleet_shop_ve_fct_vehicles_current v
+        JOIN silver.dim_vehicles dv ON dv.vhcl_int_num=v.vhcl_int_num
+        LEFT JOIN silver.dim_branches bb ON bb.brnc_code=v.brnc_code
+        WHERE NULLIF(TRIM(dv.vhcl_plate),'') IS NOT NULL
+    ) x WHERE placa IS NOT NULL ORDER BY placa
+),
+contratos AS (
+    SELECT rf.placa, rf.numero_contrato,
+           rf.sede_handover, rf.sede_devolucion,
+           rf.hora_handover ts_ho,
+           LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW())::date ret_date,
+           rf.fecha_handover_real::date ho_date,
+           (r.rate_type_level3_aknm='Internal Products') is_transfer,
+           COALESCE(rs.neto_usd,0) neto,
+           COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm,
+           GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(rf.hora_devolucion,NOW()),NOW())
+                  - COALESCE(rf.hora_handover, rf.fecha_handover_real::timestamp)))/86400.0)::int,1) n
+    FROM silver.vw_rentals_full rf
+    JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r ON r.rntl_mvnr=rf.numero_contrato AND r.mndt_code=409
+    LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
+    WHERE rf.placa IN (SELECT placa FROM roster)
+),
+-- intervalos de ubicacion: el carro esta en sede_devolucion desde ret_date hasta el proximo
+iv AS (
+    SELECT placa, sede_devolucion sede, ret_date loc_from,
+           LEAD(ret_date) OVER (PARTITION BY placa ORDER BY ret_date, ts_ho) loc_to
+    FROM contratos
+),
+-- sede del primer handover (ubicacion antes del primer retorno)
+first_ho AS (
+    SELECT DISTINCT ON (placa) placa, sede_handover FROM contratos ORDER BY placa, ts_ho
+),
+-- rented/revenue: solo rentas (no traslados), expandidas 24h, capadas a hoy
+rented AS (
+    SELECT placa, (ho_date+gs)::date fecha, neto/n rev_usd, (neto*trm)/n rev_cop
+    FROM contratos CROSS JOIN generate_series(0,n-1) gs
+    WHERE NOT is_transfer AND ho_date>=DATE '{GOLD_START}' AND (ho_date+gs)<=CURRENT_DATE
+),
+rented_agg AS (
+    SELECT placa, fecha, SUM(rev_usd) rev_usd, SUM(rev_cop) rev_cop, COUNT(*) rentas_dia
+    FROM rented GROUP BY placa, fecha
+),
+-- dias de flota: cada carro activo desde su in_date (o 2024) hasta hoy
+fleet AS (
+    SELECT r.placa, gs::date fecha
+    FROM roster r CROSS JOIN generate_series(
+        GREATEST(COALESCE(r.in_date,DATE '{GOLD_START}'), DATE '{GOLD_START}'), CURRENT_DATE, INTERVAL '1 day') gs
+),
+spine AS (
+    SELECT placa, fecha FROM fleet
+    UNION
+    SELECT placa, fecha FROM rented_agg
+)
+SELECT s.placa, s.fecha,
+       COALESCE(
+         (SELECT iv.sede FROM iv WHERE iv.placa=s.placa AND iv.loc_from<=s.fecha
+            AND (iv.loc_to IS NULL OR s.fecha<iv.loc_to) ORDER BY iv.loc_from DESC LIMIT 1),
+         (SELECT fh.sede_handover FROM first_ho fh WHERE fh.placa=s.placa),
+         ro.base_sede, 'SIN_SEDE') sede,
+       COALESCE(ro.acriss,'NA') acriss,
+       CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END rented_day,
+       COALESCE(ra.rentas_dia,0) rentas_dia,
+       COALESCE(ra.rev_usd,0) rev_usd, 0::numeric tar_usd, 0::numeric adi_usd,
+       COALESCE(ra.rev_cop,0) rev_cop, 0::numeric tar_cop, 0::numeric adi_cop
+FROM spine s
+JOIN roster ro ON ro.placa=s.placa
+LEFT JOIN rented_agg ra ON ra.placa=s.placa AND ra.fecha=s.fecha;
+
+CREATE INDEX idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)")
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_sede  ON silver.gold_carro_dia(sede, fecha)")
