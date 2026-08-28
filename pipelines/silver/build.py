@@ -1989,6 +1989,13 @@ def build_gold_carro_dia(engine):
                    COALESCE(NULLIF(vhgr_crs, ''), vhcl_group) AS acriss
             FROM silver.dim_vehicles WHERE NULLIF(TRIM(vhcl_plate), '') IS NOT NULL
         ),
+        -- sede registrada del carro (fallback de home_sede si nunca rento)
+        veh_home AS (
+            SELECT NULLIF(TRIM(v.vhcl_plate), '') AS placa, b.brnc_name AS reg_sede
+            FROM silver.dim_vehicles v
+            LEFT JOIN silver.dim_branches b ON b.brnc_code = v.brnc_code_first_checkin
+            WHERE NULLIF(TRIM(v.vhcl_plate), '') IS NOT NULL
+        ),
         lastr AS (
             SELECT vhcl_int_num, MAX(rntl_return_date::date) AS last_dropoff
             FROM silver.fact_rentals
@@ -2030,8 +2037,12 @@ def build_gold_carro_dia(engine):
             UNION
             SELECT placa, fecha FROM rented_agg
         )
+        -- sede = HOME del carro (donde mas rento; si nunca, la registrada). TODOS
+        -- sus dias (rentados + ociosos + revenue) van a su home -> ocupacion = uso
+        -- de la flota que PERTENECE a cada sede. Cada carro cae en UNA sola sede,
+        -- asi el conteo no doble-cuenta los traspasos.
         SELECT s.placa, s.fecha,
-               COALESCE(ra.sede_rent, h.home_sede, 'SIN_SEDE') AS sede,
+               COALESCE(h.home_sede, vh.reg_sede, 'SIN_SEDE') AS sede,
                COALESCE(ar.acriss, 'NA')                       AS acriss,
                CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END AS rented_day,
                COALESCE(ra.rentas_dia, 0) AS rentas_dia,
@@ -2044,6 +2055,7 @@ def build_gold_carro_dia(engine):
         FROM spine s
         LEFT JOIN rented_agg ra ON ra.placa = s.placa AND ra.fecha = s.fecha
         LEFT JOIN home       h  ON h.placa  = s.placa
+        LEFT JOIN veh_home   vh ON vh.placa = s.placa
         LEFT JOIN acriss_reg ar ON ar.placa = s.placa
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)")

@@ -120,7 +120,7 @@ Supabase's Session pooler ignores `-c options` in the libpq connection string. A
 | `vw_charges_ra_enriched` | 1 row / charge (VIEW) | Counter charges with code decode + 3 currencies. |
 | `vw_charges_rs_enriched` | 1 row / charge (VIEW) | Reservation charges with code decode. |
 | `fact_comision_dia` | 1 row / contract × día efectivo | Base comisionable prorrateada por día 24h. Alimenta las comisiones de Cargos Granular. Ver hard rule 13. |
-| `gold_carro_dia` | 1 row / placa × día | **Capa gold.** Ocupación ácida (rentado vs flota), revenue/RPD por ciudad, prorrateado 24h, desde 2024. Denominador con regla phantom-fleet. USD + COP (TRM Banrep del día de entrega). Alimenta `9_Analitica`. |
+| `gold_carro_dia` | 1 row / placa × día | **Capa gold.** Ocupación ácida (rentado vs flota), revenue/RPD por ciudad, prorrateado 24h, desde 2024. Denominador con regla phantom-fleet. **Atribución por sede HOME del carro** (donde más renta; si nunca, la registrada) → todos sus días van a su home, cada carro cae en UNA sola sede (ocupación = uso de la flota que pertenece a la sede, sin doble-contar traspasos). USD + COP (TRM Banrep del día de entrega). Alimenta `9_Analitica`. |
 | `gold_cargo_dia` | 1 row / fecha × sede × código | **Capa gold.** Cargos por código prorrateados 24h (todos los períodos = ingreso completo). USD + COP (TRM del día de entrega). Alimenta el desglose de `9_Analitica`. |
 
 Static seeds (skip rebuild if already populated):

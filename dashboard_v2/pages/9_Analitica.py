@@ -56,19 +56,20 @@ def _minus_year(d: dt.date) -> dt.date:
 
 desde_prev, hasta_prev = _minus_year(desde), _minus_year(hasta)
 
-# ---------- Filtro de ciudad (las sedes vienen del gold; default todas) ----------
-_sedes_all = load_query(
-    "SELECT DISTINCT sede FROM silver.gold_carro_dia "
-    "WHERE fecha BETWEEN :d AND :h ORDER BY 1",
-    {"d": desde.isoformat(), "h": hasta.isoformat()},
-)["sede"].dropna().tolist()
-sedes_sel = st.multiselect("Ciudades", _sedes_all, default=_sedes_all,
-                           key="_analitica_sedes")
-if not sedes_sel:
-    sedes_sel = _sedes_all
+# ---------- Filtro de ciudad: usa el selector de SEDE del sidebar izquierdo ----------
+# (el mismo del resto del dashboard; vacio = todas). El gold atribuye cada carro a
+# su sede HOME, asi que "Bogota" = la flota que PERTENECE a Bogota.
+if filtros.sedes_nombres:
+    sedes_use = list(filtros.sedes_nombres)
+else:
+    sedes_use = load_query(
+        "SELECT DISTINCT sede FROM silver.gold_carro_dia "
+        "WHERE fecha BETWEEN :d AND :h",
+        {"d": desde.isoformat(), "h": hasta.isoformat()},
+    )["sede"].dropna().tolist()
 
-P = {"desde": desde.isoformat(), "hasta": hasta.isoformat(), "sedes": list(sedes_sel)}
-PP = {"desde": desde_prev.isoformat(), "hasta": hasta_prev.isoformat(), "sedes": list(sedes_sel)}
+P = {"desde": desde.isoformat(), "hasta": hasta.isoformat(), "sedes": sedes_use}
+PP = {"desde": desde_prev.isoformat(), "hasta": hasta_prev.isoformat(), "sedes": sedes_use}
 
 st.caption(
     f"Periodo: **{desde} → {hasta}** vs mismo rango {desde.year - 1} "
@@ -186,8 +187,8 @@ cur_c["yoy_rev"] = cur_c.apply(
 cur_c = cur_c.sort_values("revenue", ascending=False)
 
 view = cur_c.copy()
+view["Flota"] = view["placas_distintas"].astype(int)
 view["Flota prom"] = view["flota_prom"].map(lambda v: f"{v:.1f}")
-view["Placas"] = view["placas_distintas"].astype(int)
 view["Util %"] = view["util"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "-")
 view["Dias rentados"] = view["rented_days"].map(fmt_int)
 view["Flota-dias"] = view["fleet_days"].map(fmt_int)
@@ -195,15 +196,16 @@ view["RPD"] = view["rpd"].map(lambda v: fmt_money(v, MON) if pd.notna(v) else "-
 view["Revenue"] = view["revenue"].map(lambda v: fmt_money(v, MON))
 view["YoY revenue"] = view["yoy_rev"].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "nuevo")
 st.dataframe(
-    view[["sede", "Flota prom", "Placas", "Util %", "Dias rentados", "Flota-dias",
+    view[["sede", "Flota", "Flota prom", "Util %", "Dias rentados", "Flota-dias",
           "RPD", "Revenue", "YoY revenue"]]
     .rename(columns={"sede": "Ciudad"}),
     use_container_width=True, hide_index=True,
 )
 st.caption(
-    "**Flota prom** = flota-dias / dias del periodo (suma al total real). "
-    "**Placas** = carros distintos que tocaron la ciudad (un carro en traspaso "
-    "aparece en varias, por eso la suma de Placas > flota total)."
+    "**Flota** = carros que PERTENECEN a la sede (home = donde mas rentan; si nunca "
+    "rentaron, su sede registrada). Cada carro cuenta en UNA sola sede -> la suma es "
+    "la flota total, sin doble-contar traspasos. **Util %** = dias rentados / flota-dias "
+    "de ESA flota. **Flota prom** = flota-dias / dias del periodo (promedio simultaneo)."
 )
 
 # grafico ocupacion por ciudad
