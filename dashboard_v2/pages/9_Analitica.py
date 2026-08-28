@@ -11,6 +11,10 @@ Convencion: dia efectivo = bloque de 24h (CEIL duracion/24h), el conteo mas acid
 Vista REALIZADA: capada a hoy (no proyecta dias futuros de rentas abiertas).
 Moneda: USD a valor normal; COP a la TRM Banrep del dia de ENTREGA (se fija ahi
 para prorratear correctamente), segun el toggle del sidebar.
+
+Nota flota: un carro que hace TRASPASO entre sedes aparece en varias ciudades. Por
+eso "Flota prom" (flota-dias / dias del periodo) reparte bien y suma al total; el
+COUNT(DISTINCT placa) por ciudad NO suma (doble-cuenta los que se mueven).
 """
 import sys
 from pathlib import Path
@@ -52,6 +56,20 @@ def _minus_year(d: dt.date) -> dt.date:
 
 desde_prev, hasta_prev = _minus_year(desde), _minus_year(hasta)
 
+# ---------- Filtro de ciudad (las sedes vienen del gold; default todas) ----------
+_sedes_all = load_query(
+    "SELECT DISTINCT sede FROM silver.gold_carro_dia "
+    "WHERE fecha BETWEEN :d AND :h ORDER BY 1",
+    {"d": desde.isoformat(), "h": hasta.isoformat()},
+)["sede"].dropna().tolist()
+sedes_sel = st.multiselect("Ciudades", _sedes_all, default=_sedes_all,
+                           key="_analitica_sedes")
+if not sedes_sel:
+    sedes_sel = _sedes_all
+
+P = {"desde": desde.isoformat(), "hasta": hasta.isoformat(), "sedes": list(sedes_sel)}
+PP = {"desde": desde_prev.isoformat(), "hasta": hasta_prev.isoformat(), "sedes": list(sedes_sel)}
+
 st.caption(
     f"Periodo: **{desde} → {hasta}** vs mismo rango {desde.year - 1} "
     f"(**{desde_prev} → {hasta_prev}**). Dias en bloques de 24h. Moneda: **{MON}** "
@@ -63,31 +81,47 @@ st.caption(
 # =============================================================================
 CARRO_SQL = """
     SELECT sede,
-           COUNT(DISTINCT placa)  AS flota,
+           COUNT(DISTINCT placa)  AS placas_distintas,
            SUM(rented_day)        AS rented_days,
            COUNT(*)               AS fleet_days,
            SUM(rev_usd) AS rev_usd, SUM(rev_cop) AS rev_cop,
            SUM(tar_usd) AS tar_usd, SUM(tar_cop) AS tar_cop,
            SUM(adi_usd) AS adi_usd, SUM(adi_cop) AS adi_cop
     FROM silver.gold_carro_dia
-    WHERE fecha BETWEEN :desde AND :hasta
+    WHERE fecha BETWEEN :desde AND :hasta AND sede = ANY(:sedes)
     GROUP BY sede
 """
-
-_NUMCOLS = ("flota", "rented_days", "fleet_days",
+_NUMCOLS = ("placas_distintas", "rented_days", "fleet_days",
             "rev_usd", "rev_cop", "tar_usd", "tar_cop", "adi_usd", "adi_cop")
 
 
-def _carro(desde_, hasta_) -> pd.DataFrame:
-    df = load_query(CARRO_SQL, {"desde": desde_.isoformat(), "hasta": hasta_.isoformat()})
+def _carro(params) -> pd.DataFrame:
+    df = load_query(CARRO_SQL, params)
     for c in _NUMCOLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     df["revenue"] = df[f"rev_{SUF}"]      # columna activa segun moneda
     return df
 
 
-cur = _carro(desde, hasta)
-prev = _carro(desde_prev, hasta_prev)
+cur = _carro(P)
+prev = _carro(PP)
+
+
+# Meta del periodo: carros DISTINTOS reales (deduped) + dias del periodo (para flota prom)
+def _meta(params) -> tuple[int, int]:
+    r = load_query(
+        "SELECT COUNT(DISTINCT placa) AS carros, COUNT(DISTINCT fecha) AS dias "
+        "FROM silver.gold_carro_dia "
+        "WHERE fecha BETWEEN :desde AND :hasta AND sede = ANY(:sedes)", params,
+    )
+    if r.empty:
+        return 0, 1
+    return int(r["carros"].iloc[0] or 0), int(r["dias"].iloc[0] or 1)
+
+
+carros_tot, n_dias = _meta(P)
+carros_tot_prev, _ = _meta(PP)
+n_dias = max(n_dias, 1)
 
 
 def _tot(df: pd.DataFrame) -> dict:
@@ -118,11 +152,14 @@ kpi(k1, "Ocupacion acida", f"{tc['util']:.1f}%", _delta_pct(tc["util"], tp["util
 kpi(k2, f"Revenue del periodo ({MON})", fmt_money(tc["revenue"], MON),
     _delta_pct(tc["revenue"], tp["revenue"]))
 kpi(k3, f"RPD ({MON})", fmt_money(tc["rpd"], MON), _delta_pct(tc["rpd"], tp["rpd"]))
-kpi(k4, f"RevPAU ({MON})", fmt_money(tc["revpau"], MON),
-    _delta_pct(tc["revpau"], tp["revpau"]))
+kpi(k4, "Flota total (carros distintos)", fmt_int(carros_tot),
+    _delta_pct(carros_tot, carros_tot_prev))
 st.caption(
     f"Dias rentados: **{fmt_int(tc['rented_days'])}** / flota-dias "
-    f"**{fmt_int(tc['fleet_days'])}**. RevPAU = revenue / carro-dia = Ocupacion × RPD."
+    f"**{fmt_int(tc['fleet_days'])}** ({n_dias} dias del periodo). "
+    f"RevPAU = revenue / carro-dia = **{fmt_money(tc['revpau'], MON)}** "
+    f"({_delta_pct(tc['revpau'], tp['revpau'])}). "
+    f"Flota total dedup = {fmt_int(carros_tot)} carros (los traspasos NO se doble-cuentan)."
 )
 
 # =============================================================================
@@ -135,6 +172,7 @@ def _por_ciudad(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["util"] = (100.0 * d["rented_days"] / d["fleet_days"].replace(0, pd.NA)).astype(float)
     d["rpd"] = (d["revenue"] / d["rented_days"].replace(0, pd.NA)).astype(float)
+    d["flota_prom"] = d["fleet_days"] / n_dias          # suma bien; maneja traspasos
     return d
 
 
@@ -148,7 +186,8 @@ cur_c["yoy_rev"] = cur_c.apply(
 cur_c = cur_c.sort_values("revenue", ascending=False)
 
 view = cur_c.copy()
-view["Flota"] = view["flota"].astype(int)
+view["Flota prom"] = view["flota_prom"].map(lambda v: f"{v:.1f}")
+view["Placas"] = view["placas_distintas"].astype(int)
 view["Util %"] = view["util"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "-")
 view["Dias rentados"] = view["rented_days"].map(fmt_int)
 view["Flota-dias"] = view["fleet_days"].map(fmt_int)
@@ -156,9 +195,15 @@ view["RPD"] = view["rpd"].map(lambda v: fmt_money(v, MON) if pd.notna(v) else "-
 view["Revenue"] = view["revenue"].map(lambda v: fmt_money(v, MON))
 view["YoY revenue"] = view["yoy_rev"].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "nuevo")
 st.dataframe(
-    view[["sede", "Flota", "Util %", "Dias rentados", "Flota-dias", "RPD", "Revenue", "YoY revenue"]]
+    view[["sede", "Flota prom", "Placas", "Util %", "Dias rentados", "Flota-dias",
+          "RPD", "Revenue", "YoY revenue"]]
     .rename(columns={"sede": "Ciudad"}),
     use_container_width=True, hide_index=True,
+)
+st.caption(
+    "**Flota prom** = flota-dias / dias del periodo (suma al total real). "
+    "**Placas** = carros distintos que tocaron la ciudad (un carro en traspaso "
+    "aparece en varias, por eso la suma de Placas > flota total)."
 )
 
 # grafico ocupacion por ciudad
@@ -179,7 +224,7 @@ section("Desglose de cargos (prorrateado) vs año anterior")
 CARGO_SQL = """
     SELECT cargo_codigo, SUM(subtotal_usd) AS val_usd, SUM(subtotal_cop) AS val_cop
     FROM silver.gold_cargo_dia
-    WHERE fecha BETWEEN :desde AND :hasta
+    WHERE fecha BETWEEN :desde AND :hasta AND sede = ANY(:sedes)
     GROUP BY cargo_codigo
 """
 
@@ -198,14 +243,14 @@ def _bucket(code: str) -> str:
     return "ADICIONALES"
 
 
-def _cargos(desde_, hasta_) -> pd.DataFrame:
-    df = load_query(CARGO_SQL, {"desde": desde_.isoformat(), "hasta": hasta_.isoformat()})
+def _cargos(params) -> pd.DataFrame:
+    df = load_query(CARGO_SQL, params)
     df["val"] = pd.to_numeric(df[f"val_{SUF}"], errors="coerce").fillna(0.0)
     df["bucket"] = df["cargo_codigo"].map(_bucket)
     return df
 
 
-cc, cp = _cargos(desde, hasta), _cargos(desde_prev, hasta_prev)
+cc, cp = _cargos(P), _cargos(PP)
 
 # --- por bucket ---
 b_cur = cc.groupby("bucket")["val"].sum()
@@ -222,7 +267,7 @@ for b in ["VENTAS (tarifa)", "COBERTURAS", "ADICIONALES", "TAX (surcharge aeropu
 st.markdown("**Por bucket (COBRA):**")
 st.dataframe(pd.DataFrame(brows), use_container_width=True, hide_index=True)
 
-# --- por codigo ---
+# --- por codigo (total) ---
 code_cur = cc.groupby("cargo_codigo")["val"].sum()
 code_prev = cp.groupby("cargo_codigo")["val"].sum()
 codes = sorted(set(code_cur.index) | set(code_prev.index),
@@ -238,11 +283,41 @@ for k in codes:
         f"Año anterior ({MON})": fmt_money(vp, MON),
         "YoY": f"{(v / vp - 1) * 100:+.1f}%" if vp else "nuevo",
     })
-st.markdown("**Por codigo:**")
+st.markdown("**Por codigo (total del período):**")
 st.dataframe(pd.DataFrame(crows), use_container_width=True, hide_index=True)
 
+# --- por codigo X sede (pivot) ---
+st.markdown("**Por codigo × ciudad** (usa el filtro de Ciudades de arriba para acotar):")
+CARGO_SEDE_SQL = """
+    SELECT sede, cargo_codigo,
+           SUM(subtotal_usd) AS val_usd, SUM(subtotal_cop) AS val_cop
+    FROM silver.gold_cargo_dia
+    WHERE fecha BETWEEN :desde AND :hasta AND sede = ANY(:sedes)
+    GROUP BY sede, cargo_codigo
+"""
+cs = load_query(CARGO_SEDE_SQL, P)
+if cs.empty:
+    st.info("No hay cargos en el período/ciudades seleccionadas.")
+else:
+    cs["val"] = pd.to_numeric(cs[f"val_{SUF}"], errors="coerce").fillna(0.0)
+    pivot = cs.pivot_table(index="cargo_codigo", columns="sede", values="val",
+                           aggfunc="sum", fill_value=0.0)
+    pivot["TOTAL"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("TOTAL", ascending=False)
+    pivot_fmt = pivot.apply(lambda col: col.map(lambda v: fmt_money(v, MON)))
+    pivot_fmt.insert(0, "Bucket", [_bucket(c) for c in pivot.index])
+    pivot_fmt = pivot_fmt.reset_index().rename(columns={"cargo_codigo": "Codigo"})
+    st.dataframe(pivot_fmt, use_container_width=True, hide_index=True)
+    xlsx_download_button(
+        pivot.reset_index(),
+        file_name=f"analitica_cargos_por_sede_{desde}_{hasta}_{MON}",
+        sheet_name="Cargos por sede",
+        key="xlsx_analitica_cargos_sede",
+    )
+
 xlsx_download_button(
-    cur_c[["sede", "flota", "util", "rented_days", "fleet_days", "rpd", "revenue", "yoy_rev"]],
+    cur_c[["sede", "flota_prom", "placas_distintas", "util", "rented_days",
+           "fleet_days", "rpd", "revenue", "yoy_rev"]],
     file_name=f"analitica_ciudad_{desde}_{hasta}_{MON}",
     sheet_name="Por ciudad",
     key="xlsx_analitica_ciudad",
