@@ -1976,9 +1976,15 @@ contratos AS (
     WHERE rf.placa IN (SELECT placa FROM roster)
 ),
 -- intervalos de ubicacion: el carro esta en sede_devolucion desde ret_date hasta el proximo
+-- ubicacion = donde OPERA el carro: sede de APERTURA de la renta (donde se
+-- entrega al cliente). Un TRASLADO (Internal Products) SI reubica -> su destino.
+-- Un one-way de cliente NO reubica (el carro vuelve o se rentea de nuevo desde su
+-- base). Evento a la fecha de apertura del contrato.
 iv AS (
-    SELECT placa, sede_devolucion sede, ret_date loc_from,
-           LEAD(ret_date) OVER (PARTITION BY placa ORDER BY ret_date, ts_ho) loc_to
+    SELECT placa,
+           CASE WHEN is_transfer THEN sede_devolucion ELSE sede_handover END sede,
+           ho_date loc_from,
+           LEAD(ho_date) OVER (PARTITION BY placa ORDER BY ho_date, ts_ho) loc_to
     FROM contratos
 ),
 -- sede del primer handover (ubicacion antes del primer retorno)
