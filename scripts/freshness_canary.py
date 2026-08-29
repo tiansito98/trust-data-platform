@@ -73,6 +73,13 @@ def gather(conn):
             out["rentas_ultimo_dia"] = cur.fetchone()
         except Exception:
             pass
+        # Ultima corrida que registro la VM (status + tail del error si fallo).
+        try:
+            cur.execute("SELECT status, run_datm, log_tail FROM operational.pipeline_runs "
+                        "ORDER BY id DESC LIMIT 1")
+            out["last_run_row"] = cur.fetchone()
+        except Exception:
+            out["last_run_row"] = None
     return out
 
 
@@ -121,10 +128,19 @@ def build_email(fresh_ok: bool, age_h, data, max_age_h):
         L.append(f"Supera el umbral de {max_age_h} h sin una corrida OK. Probables causas:")
         L.append("  - la VM (138.197.12.62) esta apagada o sin red,")
         L.append("  - el timer systemd no disparo, o")
-        L.append("  - el pipeline fallo (revisar el correo de falla / journald).")
+        L.append("  - el pipeline fallo (ver el error abajo).")
+        lrr = data.get("last_run_row")
+        if lrr is not None and lrr[0] == "FAILED":
+            L.append("")
+            L.append(f"La ultima corrida en la VM FALLO ({lrr[1]:%Y-%m-%d %H:%M} UTC).")
+            if lrr[2]:
+                L.append("")
+                L.append("=== ULTIMAS LINEAS DEL ERROR (log de la VM) ===")
+                L.append(lrr[2])
         L.append("")
-        L.append("Diagnostico en la VM:")
-        L.append("  systemctl list-timers trust-pipeline.timer")
+        L.append("Diagnostico en la VM (solo si el error de arriba no basta):")
+        L.append("  ssh root@138.197.12.62")
+        L.append("  cat /home/trust/trust-data-platform/logs/last_failure.log")
         L.append("  journalctl -u trust-pipeline.service -n 80 --no-pager")
     return subject, "\n".join(L)
 
@@ -181,6 +197,12 @@ def main() -> int:
             last = last.replace(tzinfo=timezone.utc)
         age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600.0
         fresh_ok = age_h <= args.max_age_hours
+
+    # Si la ultima corrida que registro la VM fallo, es ALERTA aunque el ultimo OK
+    # aun no supere el umbral de frescura.
+    lrr = data.get("last_run_row")
+    if lrr is not None and lrr[0] == "FAILED":
+        fresh_ok = False
 
     subject, body = build_email(fresh_ok, age_h, data, args.max_age_hours)
     print(subject)

@@ -65,6 +65,10 @@ else
   echo "reporte-diario dispatch: falta GITHUB_DISPATCH_TOKEN en .env, skip" >> "$LOG"
 fi
 
+# Registrar el resultado en Supabase (operational.pipeline_runs) para que el correo
+# de ALERTA incluya el error sin que nadie tenga que hacer SSH a la VM.
+"$REPO/.venv/bin/python" "$REPO/scripts/record_run.py" "$rc" >> "$LOG" 2>&1
+
 # Retencion: dejar solo los ultimos 30 logs por-corrida.
 ls -1t "$REPO"/logs/pipeline_*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
 
