@@ -123,12 +123,12 @@ tables:
 
   - source: rent_shop.ra_fct_rental_vehicles_franchise
     target: rent_shop_ra_fct_rental_vehicles_franchise
-    order_by: "rntl_mvnr, vhcl_int_num"
+    order_by: "rntl_mvnr, vhcl_int_num, rvnc_hser"
     filter_mandant: true
     mode: incremental_watermark
     watermark_col: "sys_upd_datm"
-    pk: ["rntl_mvnr", "vhcl_int_num"]
-    notes: "Historia de vehículos asignados a un rental (puede haber upgrades)."
+    pk: ["rntl_mvnr", "vhcl_int_num", "rvnc_hser"]
+    notes: "Historia de vehiculos asignados a un rental. Grano real = (mvnr, vhcl_int_num, rvnc_hser): un contrato puede cambiar de carro a mitad de renta (segmentos hser 0,1,2...) y una MISMA placa puede reasignarse dos veces. Sin rvnc_hser en la PK el DELETE-INSERT del upsert colapsaba los segmentos de una placa repetida y perdia filas (misma familia del bug de PK de charges; fix 2026-08-30, 38 filas historicas recuperadas). order_by incluye rvnc_hser para paginacion determinista."
 
   - source: rent_shop.ra_dim_scd_channels_franchise
     target: rent_shop_ra_dim_scd_channels_franchise
