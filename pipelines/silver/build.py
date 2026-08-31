@@ -1929,17 +1929,26 @@ def _sentinel_date(col: str) -> str:
 
 def build_gold_carro_dia(engine):
     """gold_carro_dia: ocupacion (rentado vs flota) + revenue prorrateado 24h, a
-    grano (placa x dia). UBICACION REAL por timeline de contratos (v3, 2026-08-28):
+    grano (placa x dia). UBICACION REAL por timeline de SEGMENTOS (v4, 2026-08-30):
     - Flota = roster ACTIVO de bronze.fleet_shop_ve_fct_vehicles_current (defleeted
       afuera). Sede base = sede de operacion (brnc_code).
-    - Ubicacion diaria = donde dejo el carro el ultimo contrato (renta o TRASLADO,
-      rate_type_level3_aknm='Internal Products'). Antes del 1er contrato: sede del
-      primer handover; fallback: sede de operacion. Cada dia (rentado o parado) se
-      atribuye a donde REALMENTE estuvo el carro.
+    - GRANO SEGMENTO (v4): los dias rentados y el revenue se atribuyen a la placa
+      REAL de cada tramo (silver.fact_rental_vehicles, contrato x rvnc_hser), NO a
+      la placa del header del contrato. Un contrato puede cambiar de carro a mitad
+      de renta; antes (v3) el carro inicial se llevaba TODOS los dias y los de
+      reemplazo salian vacios (ver reference_datashare_completitud). Requiere el fix
+      de PK de ra_fct_rental_vehicles (rvnc_hser) para no perder segmentos.
+    - Revenue por dia = neto_contrato / N_contrato, con N_contrato = SUM(dias 24h de
+      TODOS los segmentos del contrato). Se emiten dias solo para segmentos cuya
+      placa esta en el roster activo. Total de revenue estable vs v3 (~+0,05%).
+    - Ubicacion diaria por segmento: cada tramo es un evento en la sede de su
+      handover (brnc_code_handover); un TRASLADO (rate_type_level3_aknm='Internal
+      Products') mueve el carro a su sede de retorno. Antes del 1er segmento: sede
+      del primer handover; fallback: sede de operacion.
     - rented/revenue: solo rentas (no traslados), prorrateado 24h, capado a hoy.
       USD + COP (TRM Banrep del dia de entrega). tar/adi=0 (el desglose va en gold_cargo_dia).
     Flota por sede = flota-dias/dias (promedio; el conteo de placas doble-cuenta
-    traspasos). Ver scripts/build_gold_v3.py (validado) y el artefacto de ocupacion.
+    traspasos). Ver scripts/gold_v4_compare.py (antes/despues validado) y el artefacto.
     """
     log("\n>> Construyendo gold_carro_dia")
     started = time.time()
@@ -1959,43 +1968,70 @@ WITH roster AS (
         WHERE NULLIF(TRIM(dv.vhcl_plate),'') IS NOT NULL
     ) x WHERE placa IS NOT NULL ORDER BY placa
 ),
-contratos AS (
-    SELECT rf.placa, rf.numero_contrato,
-           rf.sede_handover, rf.sede_devolucion,
-           rf.hora_handover ts_ho,
-           LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW())::date ret_date,
-           rf.fecha_handover_real::date ho_date,
-           (r.rate_type_level3_aknm='Internal Products') is_transfer,
-           COALESCE(rs.neto_usd,0) neto,
-           COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm,
-           GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(rf.hora_devolucion,NOW()),NOW())
-                  - COALESCE(rf.hora_handover, rf.fecha_handover_real::timestamp)))/86400.0)::int,1) n
-    FROM silver.vw_rentals_full rf
-    JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r ON r.rntl_mvnr=rf.numero_contrato AND r.mndt_code=409
-    LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
-    WHERE rf.placa IN (SELECT placa FROM roster)
+plate AS (
+    SELECT DISTINCT ON (vhcl_int_num) vhcl_int_num, NULLIF(TRIM(vhcl_plate),'') placa
+    FROM silver.dim_vehicles ORDER BY vhcl_int_num
 ),
--- intervalos de ubicacion: el carro esta en sede_devolucion desde ret_date hasta el proximo
--- ubicacion = donde OPERA el carro: sede de APERTURA de la renta (donde se
--- entrega al cliente). Un TRASLADO (Internal Products) SI reubica -> su destino.
--- Un one-way de cliente NO reubica (el carro vuelve o se rentea de nuevo desde su
--- base). Evento a la fecha de apertura del contrato.
+-- segmentos reales por (contrato, hser): placa, fechas y sede de CADA tramo.
+-- Esta es la correccion v4: el grano del vehiculo es el segmento, no el header.
+seg AS (
+    SELECT p.placa,
+           v.rntl_mvnr numero_contrato,
+           v.rvnc_hser,
+           v.rvnc_handover_datm ts_ho,
+           v.rvnc_handover_datm::date ho_date,
+           LEAST(COALESCE(v.rvnc_return_datm, NOW()), NOW())::date ret_date,
+           bh.brnc_name sede_ho,
+           br.brnc_name sede_ret,
+           (r.rate_type_level3_aknm='Internal Products') is_transfer,
+           GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(v.rvnc_return_datm,NOW()),NOW())
+                  - v.rvnc_handover_datm))/86400.0)::int, 1) seg_days
+    FROM silver.fact_rental_vehicles v
+    JOIN plate p ON p.vhcl_int_num=v.vhcl_int_num
+    JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
+      ON r.rntl_mvnr=v.rntl_mvnr AND r.mndt_code=409
+    LEFT JOIN silver.dim_branches bh ON bh.brnc_code=v.brnc_code_handover
+    LEFT JOIN silver.dim_branches br ON br.brnc_code=v.brnc_code_return
+    WHERE v.mndt_code=409 AND p.placa IN (SELECT placa FROM roster)
+),
+-- N por contrato = suma de dias 24h de TODOS los segmentos (roster o no) -> el
+-- neto se reparte exacto y no se infla si una placa de reemplazo esta defleeted
+ctr AS (
+    SELECT rntl_mvnr numero_contrato,
+           SUM(GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(rvnc_return_datm,NOW()),NOW())
+                  - rvnc_handover_datm))/86400.0)::int,1)) n_contract
+    FROM silver.fact_rental_vehicles WHERE mndt_code=409 GROUP BY 1
+),
+resumen AS (
+    SELECT rf.numero_contrato,
+           COALESCE(rs.neto_usd,0) neto,
+           COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm
+    FROM silver.vw_rentals_full rf
+    LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
+),
+-- ubicacion por placa: cada segmento es un evento en su sede de handover; un
+-- TRASLADO (Internal Products) reubica el carro a su sede de retorno.
 iv AS (
     SELECT placa,
-           CASE WHEN is_transfer THEN sede_devolucion ELSE sede_handover END sede,
+           CASE WHEN is_transfer THEN sede_ret ELSE sede_ho END sede,
            ho_date loc_from,
            LEAD(ho_date) OVER (PARTITION BY placa ORDER BY ho_date, ts_ho) loc_to
-    FROM contratos
+    FROM seg
 ),
 -- sede del primer handover (ubicacion antes del primer retorno)
 first_ho AS (
-    SELECT DISTINCT ON (placa) placa, sede_handover FROM contratos ORDER BY placa, ts_ho
+    SELECT DISTINCT ON (placa) placa, sede_ho FROM seg ORDER BY placa, ts_ho
 ),
--- rented/revenue: solo rentas (no traslados), expandidas 24h, capadas a hoy
+-- rented/revenue: solo rentas (no traslados), 24h por SEGMENTO, capado a hoy
 rented AS (
-    SELECT placa, (ho_date+gs)::date fecha, neto/n rev_usd, (neto*trm)/n rev_cop
-    FROM contratos CROSS JOIN generate_series(0,n-1) gs
-    WHERE NOT is_transfer AND ho_date>=DATE '{GOLD_START}' AND (ho_date+gs)<=CURRENT_DATE
+    SELECT s.placa, (s.ho_date+gs)::date fecha,
+           res.neto/NULLIF(ctr.n_contract,0) rev_usd,
+           (res.neto*res.trm)/NULLIF(ctr.n_contract,0) rev_cop
+    FROM seg s
+    JOIN ctr ON ctr.numero_contrato=s.numero_contrato
+    JOIN resumen res ON res.numero_contrato=s.numero_contrato
+    CROSS JOIN generate_series(0, s.seg_days-1) gs
+    WHERE NOT s.is_transfer AND s.ho_date>=DATE '{GOLD_START}' AND (s.ho_date+gs)<=CURRENT_DATE
 ),
 rented_agg AS (
     SELECT placa, fecha, SUM(rev_usd) rev_usd, SUM(rev_cop) rev_cop, COUNT(*) rentas_dia
@@ -2016,7 +2052,7 @@ SELECT s.placa, s.fecha,
        COALESCE(
          (SELECT iv.sede FROM iv WHERE iv.placa=s.placa AND iv.loc_from<=s.fecha
             AND (iv.loc_to IS NULL OR s.fecha<iv.loc_to) ORDER BY iv.loc_from DESC LIMIT 1),
-         (SELECT fh.sede_handover FROM first_ho fh WHERE fh.placa=s.placa),
+         (SELECT fh.sede_ho FROM first_ho fh WHERE fh.placa=s.placa),
          ro.base_sede, 'SIN_SEDE') sede,
        COALESCE(ro.acriss,'NA') acriss,
        CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END rented_day,
