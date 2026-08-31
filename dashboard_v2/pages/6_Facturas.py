@@ -44,6 +44,21 @@ def _parse_aprobaciones(valores) -> list:
             if tok:
                 out.append(tok)
     return list(dict.fromkeys(out))
+
+
+def _clean_optional_text(v):
+    """Normaliza un texto opcional a str limpio o None.
+
+    NaN (prefill de pandas), None, '' y los literales 'nan'/'none'/'null'
+    (case-insensitive) -> None. Evita el bug donde un numero_factura vacio se
+    guardaba como el texto 'nan' y luego el sistema lo tomaba como 'lleno'.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    return None if s.lower() in ("", "nan", "none", "null") else s
+
+
 from components.filters import render_sidebar_filters
 
 IVA_PORCENTAJE = 19.0
@@ -220,7 +235,7 @@ with st.form(f"invoice_form_{st.session_state['_form_nonce']}", clear_on_submit=
 
     numero_factura = st.text_input(
         "Numero de factura (DIAN)",
-        value=editing_data.get("numero_factura", "") or "",
+        value=_clean_optional_text(editing_data.get("numero_factura")) or "",
         placeholder="ej. FAC-12345",
         help="Numero consecutivo de la factura DIAN.",
     )
@@ -283,7 +298,7 @@ with st.form(f"invoice_form_{st.session_state['_form_nonce']}", clear_on_submit=
 
     observaciones = st.text_area(
         "Observaciones", height=80, placeholder="Notas adicionales (opcional)",
-        value=editing_data.get("observaciones", "") or "",
+        value=_clean_optional_text(editing_data.get("observaciones")) or "",
         help="Notas adicionales (opcional).",
     )
 
@@ -369,7 +384,7 @@ if submitted:
                 "sede_nombre": sede_nombre,
                 "fecha_emision": fecha_emision,
                 "moneda": "COP",
-                "numero_factura": numero_factura.strip() or None,
+                "numero_factura": _clean_optional_text(numero_factura),
                 "monto_base": monto_base,
                 "iva": iva,
                 "monto_total": monto_total,
@@ -377,7 +392,7 @@ if submitted:
                 "monto_prepagado_usd": monto_prepagado_usd if monto_prepagado_usd > 0 else None,
                 "monto_counter": monto_counter,
                 "prepaid": prepaid,
-                "observaciones": observaciones.strip() or None,
+                "observaciones": _clean_optional_text(observaciones),
                 "capturado_por": username,
             }
             try:
@@ -513,7 +528,9 @@ else:
     # Cuentan como "no finalizables" las que cobran counter (!=0) y les falta
     # numero de factura o algun numero de aprobacion.
     _counter_num = pd.to_numeric(df_open["monto_counter"], errors="coerce").fillna(0)
-    _num_fact_empty = df_open["numero_factura"].fillna("").astype(str).str.strip().eq("")
+    _num_fact_empty = df_open["numero_factura"].map(
+        lambda v: _clean_optional_text(v) is None
+    )
     _n_appr = pd.to_numeric(df_open["n_aprobaciones"], errors="coerce").fillna(0)
     n_faltan_finalizar = int(((_counter_num != 0) &
                               (_num_fact_empty | (_n_appr == 0))).sum())
@@ -552,7 +569,7 @@ else:
         # Requisito para finalizar: si cobra algo en counter (monto_counter != 0),
         # la factura DEBE tener numero de factura DIAN + >= 1 numero de aprobacion.
         monto_counter_val = float(row["monto_counter"] or 0)
-        num_factura_val = str(row["numero_factura"] or "").strip()
+        num_factura_val = _clean_optional_text(row["numero_factura"]) or ""
         n_aprob_val = int(row["n_aprobaciones"] or 0)
         faltan_finalizar = []
         if monto_counter_val != 0:
