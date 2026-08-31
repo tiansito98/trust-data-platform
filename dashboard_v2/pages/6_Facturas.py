@@ -446,7 +446,9 @@ section("Facturas abiertas (pendientes de finalizar)")
 st.caption(
     f"Cada factura muestra TRM Banrep del dia de entrega, monto calculado por el "
     f"sistema y diferencia. Tolerancia: {fmt_money(VALIDATION_TOLERANCE_COP, 'COP')}. "
-    f"Si el vehiculo ya fue devuelto pero la factura sigue abierta, sale marcada como 'Vencida'."
+    f"Si el vehiculo ya fue devuelto pero la factura sigue abierta, sale marcada como 'Vencida'. "
+    f"Si cobra algo en counter (monto counter != 0), para poder finalizarla debe tener "
+    f"numero de factura DIAN y al menos un numero de aprobacion."
 )
 
 open_sql = f"""
@@ -461,6 +463,7 @@ open_sql = f"""
            i.numero_factura, i.numero_recibo,
            i.monto_total, i.monto_prepagado, i.monto_counter,
            i.observaciones, i.capturado_por, i.capturado_at,
+           COALESCE(ap.n_aprobaciones, 0)  AS n_aprobaciones,
            r.fecha_handover_real::date   AS fecha_entrega,
            r.fecha_devolucion_real::date AS fecha_devolucion,
            r.total_con_iva_usd           AS total_usd,
@@ -478,6 +481,10 @@ open_sql = f"""
     LEFT JOIN silver.vw_rentals_resumen r ON r.numero_contrato = i.rntl_mvnr
     LEFT JOIN silver.dim_trm_diaria t ON t.fecha = r.fecha_handover_real::date
     LEFT JOIN dups d ON d.rntl_mvnr = i.rntl_mvnr
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS n_aprobaciones
+        FROM operational.invoice_approvals ap WHERE ap.invoice_id = i.invoice_id
+    ) ap ON TRUE
     WHERE i.finalizada = FALSE {sede_where}
     ORDER BY r.fecha_handover_real DESC NULLS LAST, i.capturado_at DESC
 """
@@ -503,11 +510,21 @@ else:
     n_sobre_tol = int(((diff_abs > VALIDATION_TOLERANCE_COP) &
                        ~df_open["pendiente_silver"]).sum())
 
+    # Cuentan como "no finalizables" las que cobran counter (!=0) y les falta
+    # numero de factura o algun numero de aprobacion.
+    _counter_num = pd.to_numeric(df_open["monto_counter"], errors="coerce").fillna(0)
+    _num_fact_empty = df_open["numero_factura"].fillna("").astype(str).str.strip().eq("")
+    _n_appr = pd.to_numeric(df_open["n_aprobaciones"], errors="coerce").fillna(0)
+    n_faltan_finalizar = int(((_counter_num != 0) &
+                              (_num_fact_empty | (_n_appr == 0))).sum())
+
     summary_parts = [f"{len(df_open)} factura(s) abierta(s)"]
     if n_vencidas > 0:
         summary_parts.append(f"{n_vencidas} vencida(s)")
     if n_sobre_tol > 0:
         summary_parts.append(f"{n_sobre_tol} sobre tolerancia")
+    if n_faltan_finalizar > 0:
+        summary_parts.append(f"{n_faltan_finalizar} sin factura/aprobacion (no finalizables)")
     if n_pendientes > 0:
         summary_parts.append(f"{n_pendientes} pendiente(s) silver")
     st.caption(" · ".join(summary_parts))
@@ -532,6 +549,18 @@ else:
         devol_display = str(devol_raw) if pd.notna(devol_raw) else "pendiente"
         es_vencida = bool(row["es_vencida"])
 
+        # Requisito para finalizar: si cobra algo en counter (monto_counter != 0),
+        # la factura DEBE tener numero de factura DIAN + >= 1 numero de aprobacion.
+        monto_counter_val = float(row["monto_counter"] or 0)
+        num_factura_val = str(row["numero_factura"] or "").strip()
+        n_aprob_val = int(row["n_aprobaciones"] or 0)
+        faltan_finalizar = []
+        if monto_counter_val != 0:
+            if not num_factura_val:
+                faltan_finalizar.append("numero de factura (DIAN)")
+            if n_aprob_val == 0:
+                faltan_finalizar.append("al menos un numero de aprobacion")
+
         # --- Fila principal ---
         cols = st.columns(open_w)
         cols[0].write(f"**#{inv_id}**")
@@ -554,14 +583,22 @@ else:
             st.rerun()
 
         if cols[7].button("Finalizar", key=f"fin_{inv_id}"):
-            execute_write("""
-                UPDATE operational.invoices
-                SET finalizada = TRUE, finalizada_at = NOW(), finalizada_por = :user
-                WHERE invoice_id = :id
-            """, {"id": inv_id, "user": username})
-            st.success(f"Factura #{inv_id} finalizada.")
-            load_query.clear()
-            st.rerun()
+            if faltan_finalizar:
+                st.error(
+                    f"No se puede finalizar la factura #{inv_id}: como cobra en counter "
+                    f"({fmt_money(monto_counter_val, 'COP')}), debe tener "
+                    f"{' y '.join(faltan_finalizar)}. Usa 'Editar' para agregarlo(s) "
+                    f"y vuelve a finalizar."
+                )
+            else:
+                execute_write("""
+                    UPDATE operational.invoices
+                    SET finalizada = TRUE, finalizada_at = NOW(), finalizada_por = :user
+                    WHERE invoice_id = :id
+                """, {"id": inv_id, "user": username})
+                st.success(f"Factura #{inv_id} finalizada.")
+                load_query.clear()
+                st.rerun()
 
         # --- Sub-linea con TRM + sistema esperado + diferencia + estado ---
         # El signo $ activa LaTeX en Streamlit; escapamos a &#36; para que
@@ -618,6 +655,18 @@ else:
                     f"<span style='color:#d32f2f;font-weight:bold;'>"
                     f"DUPLICADO con {others_str}</span>"
                 )
+
+        # Aviso proactivo: cobra en counter pero le falta num factura / aprobacion.
+        # No se podra finalizar hasta completarlos.
+        if faltan_finalizar:
+            faltan_corto = " + ".join(
+                "num factura" if "factura" in f else "aprobacion"
+                for f in faltan_finalizar
+            )
+            sub_parts.append(
+                f"<span style='color:#d32f2f;font-weight:bold;'>"
+                f"Falta {faltan_corto} para poder finalizar</span>"
+            )
 
         st.markdown(
             f"<div style='font-size:0.82rem;color:#666;margin-left:0.5rem;"

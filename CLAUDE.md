@@ -346,7 +346,7 @@ Facturas have a lifecycle: **abierta (draft) → finalizada (cerrada)**. Each fa
 
 2. **Asesor edits** (while rental is open): clicks "Editar" on an open factura → form pre-fills (montos + aprobaciones existentes) → edits montos/aprobaciones → "Guardar cambios" (UPDATE + replace de las aprobaciones: delete+insert en la tabla hija). Can edit as many times as needed.
 
-3. **Vehicle returned → asesor finalizes**: clicks "Finalizar" → sets `finalizada = TRUE`, `finalizada_at = NOW()`, `finalizada_por = username`.
+3. **Vehicle returned → asesor finalizes**: clicks "Finalizar" → sets `finalizada = TRUE`, `finalizada_at = NOW()`, `finalizada_por = username`. **Guard (31-ago-2026):** si `monto_counter != 0` (se cobró algo en counter), la factura DEBE tener `numero_factura` (DIAN) **y** ≥1 `numero_aprobacion` para poder finalizar; si falta alguno, el botón muestra error y no cierra. Aviso proactivo en la sub-línea de cada abierta ("Falta num factura / aprobacion") + contador en el resumen.
 
 4. **Validation runs automatically**: for every finalized factura, the page compares `monto_total` (what asesor typed) vs `total_con_iva_usd * TRM_Banrep(handover_date)` (what silver computed from Sixt charges). Tolerance: $500 COP for rounding.
    - **Green**: amounts match within tolerance → all good.
