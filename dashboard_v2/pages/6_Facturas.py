@@ -87,7 +87,10 @@ def _ensure_revisada_columns():
             ALTER TABLE operational.invoices
                 ADD COLUMN IF NOT EXISTS revisada     BOOLEAN NOT NULL DEFAULT FALSE,
                 ADD COLUMN IF NOT EXISTS revisada_at  TIMESTAMPTZ,
-                ADD COLUMN IF NOT EXISTS revisada_por TEXT
+                ADD COLUMN IF NOT EXISTS revisada_por TEXT,
+                ADD COLUMN IF NOT EXISTS observacion_diferencia     TEXT,
+                ADD COLUMN IF NOT EXISTS observacion_diferencia_at  TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS observacion_diferencia_por TEXT
         """, {})
     except Exception:
         # Si falla (permisos, etc.), no bloqueamos la pagina. El SELECT con
@@ -104,6 +107,9 @@ user_branches = get_user_branches()
 user_is_admin = is_admin()
 current_user = get_current_user()
 username = current_user["username"] if current_user else "unknown"
+# La observacion de diferencia SOLO la puede escribir el perfil trust_admin
+# (no cualquier admin). Los demas la ven pero no la editan.
+is_trust_admin = (username == "trust_admin")
 
 # Build sede WHERE clause for all queries
 if user_is_admin or "*" in user_branches:
@@ -640,7 +646,10 @@ st.caption(
     "Muestra que se cobro, que decia el contrato segun silver, la "
     "diferencia, la TRM oficial Banrep del dia de entrega y la TRM "
     "efectivamente usada (deducida del monto cobrado). El checkbox "
-    "'Revisada' solo aplica a facturas finalizadas."
+    "'Revisada' solo aplica a facturas finalizadas. La columna "
+    "'Observacion diferencia' explica por que hubo un descuadre legitimo "
+    "(no todo descuadre es un error); se edita en la misma tabla y "
+    "**solo el perfil trust_admin** puede escribirla."
 )
 
 # Rango de fechas viene del sidebar unificado — consistente con el resto
@@ -676,6 +685,7 @@ fin_sql = f"""
            i.finalizada_por, i.finalizada_at,
            COALESCE(i.revisada, FALSE) AS revisada,
            i.revisada_at, i.revisada_por,
+           i.observacion_diferencia,
            r.fecha_handover_real::date AS fecha_entrega,
            r.total_con_iva_usd         AS total_usd,
            t.trm_cop_per_usd           AS trm_oficial,
@@ -754,6 +764,7 @@ else:
         "rntl_mvnr", "duplicados", "numero_factura", "aprobaciones",
         "fecha_entrega",
         "monto_total", "monto_prepagado_usd", "sistema_cop", "diferencia",
+        "observacion_diferencia",
         "trm_oficial", "trm_usada_calculada", "diff_trm",
         "finalizada_por", "finalizada_at",
         "revisada_por", "revisada_at",
@@ -761,6 +772,8 @@ else:
 
     # revisada: asegurar bool (viene de Postgres, podria ser None si columna nueva)
     view["revisada"] = view["revisada"].fillna(False).astype(bool)
+    # observacion_diferencia: None -> "" (data_editor no acepta None en TextColumn)
+    view["observacion_diferencia"] = view["observacion_diferencia"].fillna("")
     # aprobaciones: None (factura sin aprobaciones) -> "-"
     view["aprobaciones"] = view["aprobaciones"].fillna("-").replace("", "-")
 
@@ -802,6 +815,7 @@ else:
         "monto_prepagado_usd": "Prepagado (USD)",
         "sistema_cop": "Sistema (COP)",
         "diferencia": "Diferencia (COP)",
+        "observacion_diferencia": "Observacion diferencia",
         "trm_oficial": "TRM oficial",
         "trm_usada_calculada": "TRM usada",
         "diff_trm": "Δ TRM",
@@ -811,12 +825,21 @@ else:
         "revisada_at": "Revisada en",
     })
 
-    # data_editor: solo 'Revisada' es editable; el resto disabled.
-    # Cuando el usuario marca/desmarca el checkbox, detectamos el cambio,
+    # data_editor: 'Revisada' es editable (checkbox). 'Observacion diferencia'
+    # es editable SOLO para el perfil trust_admin (los demas la ven read-only).
+    # Cuando el usuario cambia una celda editable, detectamos el cambio,
     # persistimos en DB con audit trail, invalidamos cache y hacemos rerun.
     editable_cols = ["Revisada"]
+    if is_trust_admin:
+        editable_cols.append("Observacion diferencia")
     disabled_cols = [c for c in view.columns if c not in editable_cols]
 
+    _obs_help = (
+        "Explica por que hubo una diferencia legitima (no todo descuadre es un error). "
+        "Editable solo por trust_admin."
+        if is_trust_admin else
+        "Motivo de la diferencia. Solo el perfil trust_admin puede editarlo."
+    )
     edited_view = st.data_editor(
         view,
         column_config={
@@ -825,6 +848,12 @@ else:
                 help="Marca cuando hayas contrastado el contrato fisico contra la factura",
                 default=False,
             ),
+            "Observacion diferencia": st.column_config.TextColumn(
+                "Observacion diferencia",
+                help=_obs_help,
+                max_chars=500,
+                width="large",
+            ),
         },
         disabled=disabled_cols,
         hide_index=True,
@@ -832,41 +861,60 @@ else:
         key="_fin_editor",
     )
 
-    # Detectar cambios en la columna 'Revisada' y persistir.
-    # SOLO se aceptan cambios en filas cuyo Estado = 'Finalizada'.
-    # (Las abiertas no pueden marcarse como revisadas — la factura aun no cerro.)
-    if not edited_view["Revisada"].equals(view["Revisada"]):
+    # Detectar cambios en columnas editables y persistir.
+    #  - 'Revisada' (checkbox): SOLO en filas Finalizadas (las abiertas aun no cerraron).
+    #  - 'Observacion diferencia' (texto): SOLO el perfil trust_admin puede escribirla.
+    revisada_changed = not edited_view["Revisada"].equals(view["Revisada"])
+    obs_changed = not edited_view["Observacion diferencia"].equals(
+        view["Observacion diferencia"]
+    )
+    if revisada_changed or obs_changed:
         cambios_rechazados = 0
         for i in range(len(view)):
-            orig = bool(view.iloc[i]["Revisada"])
-            new = bool(edited_view.iloc[i]["Revisada"])
-            if orig == new:
-                continue
-            estado_row = view.iloc[i]["Estado"]
-            if estado_row != "Finalizada":
-                cambios_rechazados += 1
-                continue  # ignoramos edicion en abiertas
             invoice_id = int(edited_view.iloc[i]["ID"])
-            if new:
-                execute_write("""
-                    UPDATE operational.invoices
-                    SET revisada     = TRUE,
-                        revisada_at  = NOW(),
-                        revisada_por = :user
-                    WHERE invoice_id = :id
-                """, {"id": invoice_id, "user": username})
-            else:
-                execute_write("""
-                    UPDATE operational.invoices
-                    SET revisada     = FALSE,
-                        revisada_at  = NULL,
-                        revisada_por = NULL
-                    WHERE invoice_id = :id
-                """, {"id": invoice_id})
+
+            # --- Revisada (solo finalizadas) ---
+            orig_r = bool(view.iloc[i]["Revisada"])
+            new_r = bool(edited_view.iloc[i]["Revisada"])
+            if orig_r != new_r:
+                if view.iloc[i]["Estado"] != "Finalizada":
+                    cambios_rechazados += 1
+                elif new_r:
+                    execute_write("""
+                        UPDATE operational.invoices
+                        SET revisada     = TRUE,
+                            revisada_at  = NOW(),
+                            revisada_por = :user
+                        WHERE invoice_id = :id
+                    """, {"id": invoice_id, "user": username})
+                else:
+                    execute_write("""
+                        UPDATE operational.invoices
+                        SET revisada     = FALSE,
+                            revisada_at  = NULL,
+                            revisada_por = NULL
+                        WHERE invoice_id = :id
+                    """, {"id": invoice_id})
+
+            # --- Observacion diferencia (solo trust_admin) ---
+            orig_o = str(view.iloc[i]["Observacion diferencia"] or "").strip()
+            new_o = str(edited_view.iloc[i]["Observacion diferencia"] or "").strip()
+            if orig_o != new_o:
+                if not is_trust_admin:
+                    cambios_rechazados += 1
+                else:
+                    execute_write("""
+                        UPDATE operational.invoices
+                        SET observacion_diferencia     = :obs,
+                            observacion_diferencia_at  = NOW(),
+                            observacion_diferencia_por = :user
+                        WHERE invoice_id = :id
+                    """, {"id": invoice_id, "obs": (new_o or None), "user": username})
+
         if cambios_rechazados > 0:
             st.warning(
-                f"{cambios_rechazados} cambio(s) ignorado(s) — solo se puede "
-                f"marcar como Revisada una factura Finalizada."
+                f"{cambios_rechazados} cambio(s) ignorado(s): 'Revisada' solo aplica "
+                f"a facturas Finalizadas, y 'Observacion diferencia' solo la edita trust_admin."
             )
         load_query.clear()
         st.rerun()
