@@ -1997,7 +1997,13 @@ seg0 AS (
            v.rvnc_handover_datm ts_ho, v.rvnc_handover_datm::date ho_date,
            bh.brnc_name sede_ho, br.brnc_name sede_ret,
            (r.rate_type_level3_aknm='Internal Products') is_transfer,
-           EXTRACT(EPOCH FROM (LEAST(COALESCE(v.rvnc_return_datm,NOW()),NOW()) - v.rvnc_handover_datm)) dur_s
+           -- OJO: rvnc_return_datm trae el centinela 1899-12-31 en rentas ABIERTAS
+           -- (largas aun sin devolver). Sin tratarlo, la duracion sale NEGATIVA y la
+           -- renta colapsa a 1 dia (caso NIZ571: contrato mar->sep con 0 ocupacion).
+           -- Se trata como NULL -> abierta -> capada a hoy.
+           EXTRACT(EPOCH FROM (LEAST(COALESCE(
+               CASE WHEN v.rvnc_return_datm < TIMESTAMP '1900-01-01' THEN NULL
+                    ELSE v.rvnc_return_datm END, NOW()), NOW()) - v.rvnc_handover_datm)) dur_s
     FROM silver.fact_rental_vehicles v
     JOIN plate p ON p.vhcl_int_num=v.vhcl_int_num
     JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
