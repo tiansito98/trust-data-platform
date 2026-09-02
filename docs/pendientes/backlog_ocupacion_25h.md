@@ -21,6 +21,15 @@ Análisis y fixes: 2026-09-01.
    Un traslado espurio durante una renta larga corrompía la ubicación. Caso
    `QIV456`: la renta larga (5-jul→31-ago, Bogotá) aparecía con 21 días en Medellín
    Poblado por un traslado del 11-jul; ahora los 27 días están en Bogotá.
+4. **Rentas largas ABIERTAS contaban 0 días (centinela `1899-12-31`).**
+   `fact_rental_vehicles` trae `rvnc_return_datm = 1899-12-31` (placeholder de Sixt)
+   en rentas aún sin devolver. El `COALESCE(return, NOW())` no lo capturaba → duración
+   NEGATIVA → la renta colapsaba a 1 día. Caso `NIZ571` (contrato mar→sep): 0 → 31
+   días en julio. Fix: tratar `return < 1900-01-01` como NULL (abierta) → capada a hoy.
+   Recupera ~883 días de renta en 2026 (ocupación 58,7% → **62,4%**). Revenue conservado.
+   `vw_rentals_full` ya resolvía bien la devolución, así que comisiones no estaban afectadas.
+
+Ocupación julio final: **73,6%** (2.468 días rentados), revenue US$ 201.444.
 
 Validación julio (día rentado por placa, real = número de tu manager):
 
@@ -61,8 +70,6 @@ Requiere separar el timeline ocioso: usar la **sede de retorno** de la última r
 (Ojo: revertir esto con cuidado — un cambio anterior con sede_devolución metió carros
 en la sede equivocada; hay que hacerlo solo para días ociosos, no rentados.)
 
-**C. Contratos largos sin fila en `fact_rental_vehicles`.**
-`NIZ571` tiene un contrato mar→sep pero **cero segmentos** en `ra_fct_rental_vehicles`
-(la asignación del vehículo vive solo en el header). Sale con 0 ocupación. Es la misma
-familia del **hard rule 16** (completitud del datashare). Alcance por medir; fix
-probable: fallback al header cuando un contrato no tiene segmentos.
+**C. ~~Contratos largos sin fila / con 0 ocupación~~ — RESUELTO (punto 4 arriba).**
+`NIZ571` SÍ tenía su fila en `fact_rental_vehicles`; el problema era el centinela
+`1899-12-31` en la devolución (renta abierta), no un segmento faltante. Corregido.
