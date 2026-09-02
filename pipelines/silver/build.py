@@ -1883,12 +1883,15 @@ def build_comision_dia(engine):
                 -- sigue abierto). hora_devolucion trae la devolucion agendada, que
                 -- para abiertas es una fecha futura real. NO capar a NOW(): eso metia
                 -- toda la base en los dias transcurridos y sobre-contaba el mes actual.
+                -- Dia = bloque de 24h CON 1 HORA DE GRACIA (2026-09-01): el sistema
+                -- no cobra dia extra si se devuelve dentro de la hora siguiente al
+                -- bloque, asi que 25h = 1 dia, 49h = 2 dias. Se resta 3600s antes del CEIL.
                 GREATEST(
                     CEIL(
-                        EXTRACT(EPOCH FROM (
+                        (EXTRACT(EPOCH FROM (
                             COALESCE(rf.hora_devolucion, NOW())
                             - COALESCE(rf.hora_handover, c.f_handover_date::timestamp)
-                        )) / 86400.0
+                        )) - 3600) / 86400.0
                     )::int, 1
                 ) AS n_dias
             FROM cargos c
@@ -1929,7 +1932,14 @@ def _sentinel_date(col: str) -> str:
 
 def build_gold_carro_dia(engine):
     """gold_carro_dia: ocupacion (rentado vs flota) + revenue prorrateado 24h, a
-    grano (placa x dia). UBICACION REAL por timeline de SEGMENTOS (v4, 2026-08-30):
+    grano (placa x dia). UBICACION REAL por timeline de SEGMENTOS (v6, 2026-09-01):
+    - v6: (a) DIA = bloque 24h CON 1 HORA DE GRACIA (25h=1 dia); (b) se excluyen
+      segmentos ADMINISTRATIVOS sub-hora (check-in/out de cambios de vehiculo) que
+      inflaban ocupacion sin generar revenue -- solo si el contrato tiene otro
+      segmento real o no facturo (rentas cortas legitimas se conservan); (c) el dia
+      RENTADO se atribuye a la sede de SU renta (no al timeline global, que un
+      traslado espurio durante una renta larga podia corromper -> caso QIV456).
+      Revenue total sin cambios. Ver docs/pendientes/backlog_ocupacion_25h.md.
     - Flota = roster ACTIVO de bronze.fleet_shop_ve_fct_vehicles_current (defleeted
       afuera). Sede base = sede de operacion (brnc_code).
     - GRANO SEGMENTO (v4): los dias rentados y el revenue se atribuyen a la placa
@@ -1972,20 +1982,22 @@ plate AS (
     SELECT DISTINCT ON (vhcl_int_num) vhcl_int_num, NULLIF(TRIM(vhcl_plate),'') placa
     FROM silver.dim_vehicles ORDER BY vhcl_int_num
 ),
--- segmentos reales por (contrato, hser): placa, fechas y sede de CADA tramo.
--- Esta es la correccion v4: el grano del vehiculo es el segmento, no el header.
-seg AS (
-    SELECT p.placa,
-           v.rntl_mvnr numero_contrato,
-           v.rvnc_hser,
-           v.rvnc_handover_datm ts_ho,
-           v.rvnc_handover_datm::date ho_date,
-           LEAST(COALESCE(v.rvnc_return_datm, NOW()), NOW())::date ret_date,
-           bh.brnc_name sede_ho,
-           br.brnc_name sede_ret,
+resumen AS (
+    SELECT rf.numero_contrato,
+           COALESCE(rs.neto_usd,0) neto,
+           COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm
+    FROM silver.vw_rentals_full rf
+    LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
+),
+-- segmentos por (contrato, hser): placa, fechas, sede y DURACION real de cada tramo.
+-- v6 (2026-09-01): dia = bloque de 24h CON 1 HORA DE GRACIA (el sistema no cobra
+-- dia extra si se devuelve dentro de la hora siguiente al bloque). dur_s = segundos.
+seg0 AS (
+    SELECT p.placa, v.rntl_mvnr numero_contrato, v.rvnc_hser,
+           v.rvnc_handover_datm ts_ho, v.rvnc_handover_datm::date ho_date,
+           bh.brnc_name sede_ho, br.brnc_name sede_ret,
            (r.rate_type_level3_aknm='Internal Products') is_transfer,
-           GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(v.rvnc_return_datm,NOW()),NOW())
-                  - v.rvnc_handover_datm))/86400.0)::int, 1) seg_days
+           EXTRACT(EPOCH FROM (LEAST(COALESCE(v.rvnc_return_datm,NOW()),NOW()) - v.rvnc_handover_datm)) dur_s
     FROM silver.fact_rental_vehicles v
     JOIN plate p ON p.vhcl_int_num=v.vhcl_int_num
     JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
@@ -1994,50 +2006,67 @@ seg AS (
     LEFT JOIN silver.dim_branches br ON br.brnc_code=v.brnc_code_return
     WHERE v.mndt_code=409 AND p.placa IN (SELECT placa FROM roster)
 ),
--- N por contrato = suma de dias 24h de TODOS los segmentos (roster o no) -> el
--- neto se reparte exacto y no se infla si una placa de reemplazo esta defleeted
+-- Flags por contrato para el filtro de segmentos ADMINISTRATIVOS (sub-hora):
+-- un segmento < 1h (check-in/out de cambio de vehiculo / paperwork) NO es ocupacion
+-- real. Se excluye SOLO si el contrato tiene otro segmento real (la renta vive ahi)
+-- o si el contrato no facturo (neto ~ 0). Asi NO se pierde revenue de rentas cortas
+-- legitimas (cuyo unico tramo es sub-hora pero SI facturaron).
+ctrflag AS (
+    SELECT s.numero_contrato,
+           BOOL_OR(NOT s.is_transfer AND s.dur_s >= 3600) has_real,
+           MAX(COALESCE(res.neto,0)) neto
+    FROM seg0 s LEFT JOIN resumen res ON res.numero_contrato=s.numero_contrato
+    GROUP BY 1
+),
+seg AS (
+    SELECT s.*,
+           (NOT s.is_transfer AND s.dur_s < 3600 AND (cf.has_real OR cf.neto < 1)) is_admin,
+           GREATEST(CEIL((s.dur_s - 3600)/86400.0)::int, 1) seg_days  -- 24h con hora de gracia
+    FROM seg0 s JOIN ctrflag cf ON cf.numero_contrato=s.numero_contrato
+),
+-- N por contrato = suma de dias 24h(gracia) de los segmentos REALES (no transfer,
+-- no admin). El neto se reparte exacto entre esos dias -> revenue total conservado.
 ctr AS (
-    SELECT rntl_mvnr numero_contrato,
-           SUM(GREATEST(CEIL(EXTRACT(EPOCH FROM (LEAST(COALESCE(rvnc_return_datm,NOW()),NOW())
-                  - rvnc_handover_datm))/86400.0)::int,1)) n_contract
-    FROM silver.fact_rental_vehicles WHERE mndt_code=409 GROUP BY 1
+    SELECT numero_contrato,
+           SUM(seg_days) FILTER (WHERE NOT is_transfer AND NOT is_admin) n_contract
+    FROM seg GROUP BY 1
 ),
-resumen AS (
-    SELECT rf.numero_contrato,
-           COALESCE(rs.neto_usd,0) neto,
-           COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm
-    FROM silver.vw_rentals_full rf
-    LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
-),
--- ubicacion por placa: cada segmento es un evento en su sede de handover; un
--- TRASLADO (Internal Products) reubica el carro a su sede de retorno.
+-- ubicacion por placa: cada segmento (renta real o TRASLADO) es un evento; el
+-- traslado (Internal Products) reubica al carro a su sede de retorno. Los admin
+-- sub-hora NO reubican.
 iv AS (
     SELECT placa,
            CASE WHEN is_transfer THEN sede_ret ELSE sede_ho END sede,
            ho_date loc_from,
            LEAD(ho_date) OVER (PARTITION BY placa ORDER BY ho_date, ts_ho) loc_to
-    FROM seg
+    FROM seg WHERE NOT is_admin
 ),
--- sede del primer handover (ubicacion antes del primer retorno)
 first_ho AS (
-    SELECT DISTINCT ON (placa) placa, sede_ho FROM seg ORDER BY placa, ts_ho
+    SELECT DISTINCT ON (placa) placa, sede_ho FROM seg WHERE NOT is_admin ORDER BY placa, ts_ho
 ),
--- rented/revenue: solo rentas (no traslados), 24h por SEGMENTO, capado a hoy
+-- rented/revenue: solo rentas reales (no traslados, no admin), 24h(gracia) por
+-- SEGMENTO, capado a hoy. Lleva sede_ho: el dia rentado se atribuye a la sede de
+-- SU renta (no al timeline global, que un traslado espurio puede corromper).
 rented AS (
-    SELECT s.placa, (s.ho_date+gs)::date fecha,
+    SELECT s.placa, (s.ho_date+gs)::date fecha, s.sede_ho sede_r, s.ts_ho,
            res.neto/NULLIF(ctr.n_contract,0) rev_usd,
            (res.neto*res.trm)/NULLIF(ctr.n_contract,0) rev_cop
     FROM seg s
     JOIN ctr ON ctr.numero_contrato=s.numero_contrato
     JOIN resumen res ON res.numero_contrato=s.numero_contrato
     CROSS JOIN generate_series(0, s.seg_days-1) gs
-    WHERE NOT s.is_transfer AND s.ho_date>=DATE '{GOLD_START}' AND (s.ho_date+gs)<=CURRENT_DATE
+    WHERE NOT s.is_transfer AND NOT s.is_admin
+      AND s.ho_date>=DATE '{GOLD_START}' AND (s.ho_date+gs)<=CURRENT_DATE
+),
+-- sede del dia rentado = sede de la renta (si hay varias el mismo dia, gana la ultima)
+rented_sede AS (
+    SELECT DISTINCT ON (placa, fecha) placa, fecha, sede_r
+    FROM rented ORDER BY placa, fecha, ts_ho DESC
 ),
 rented_agg AS (
     SELECT placa, fecha, SUM(rev_usd) rev_usd, SUM(rev_cop) rev_cop, COUNT(*) rentas_dia
     FROM rented GROUP BY placa, fecha
 ),
--- dias de flota: cada carro activo desde su in_date (o 2024) hasta hoy
 fleet AS (
     SELECT r.placa, gs::date fecha
     FROM roster r CROSS JOIN generate_series(
@@ -2050,6 +2079,7 @@ spine AS (
 )
 SELECT s.placa, s.fecha,
        COALESCE(
+         rs.sede_r,  -- dia rentado -> sede de su propia renta
          (SELECT iv.sede FROM iv WHERE iv.placa=s.placa AND iv.loc_from<=s.fecha
             AND (iv.loc_to IS NULL OR s.fecha<iv.loc_to) ORDER BY iv.loc_from DESC LIMIT 1),
          (SELECT fh.sede_ho FROM first_ho fh WHERE fh.placa=s.placa),
@@ -2061,7 +2091,8 @@ SELECT s.placa, s.fecha,
        COALESCE(ra.rev_cop,0) rev_cop, 0::numeric tar_cop, 0::numeric adi_cop
 FROM spine s
 JOIN roster ro ON ro.placa=s.placa
-LEFT JOIN rented_agg ra ON ra.placa=s.placa AND ra.fecha=s.fecha;
+LEFT JOIN rented_agg ra ON ra.placa=s.placa AND ra.fecha=s.fecha
+LEFT JOIN rented_sede rs ON rs.placa=s.placa AND rs.fecha=s.fecha;
 
 CREATE INDEX idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)
     """)
@@ -2097,9 +2128,10 @@ def build_gold_cargo_dia(engine):
             GROUP BY 1, 2, 3, 4
         ),
         conteo AS (
-            SELECT c.*, GREATEST(CEIL(EXTRACT(EPOCH FROM (
+            -- Dia = bloque de 24h con 1 HORA DE GRACIA (resta 3600s antes del CEIL).
+            SELECT c.*, GREATEST(CEIL((EXTRACT(EPOCH FROM (
                        LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW())
-                       - COALESCE(rf.hora_handover, c.f_ini::timestamp))) / 86400.0)::int, 1) AS n
+                       - COALESCE(rf.hora_handover, c.f_ini::timestamp))) - 3600) / 86400.0)::int, 1) AS n
             FROM cargos c
             JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
         ),
