@@ -2131,6 +2131,14 @@ def build_gold_cargo_dia(engine):
             WHERE d.fecha_handover_real >= DATE '{GOLD_START}'
               AND d.fecha_handover_real::date <= CURRENT_DATE
               AND TRIM(COALESCE(d.placa, '')) <> ''
+              -- SOLO el lado ra (RENTAL_COUNTER) = la facturacion real del contrato.
+              -- vw_rentals_detail es un UNION ALL: para contratos PREPAGADOS el mismo
+              -- cargo aparece tambien como RESERVA_ONLINE (el lado rs, la reserva).
+              -- En COP casi no se nota (el arm de reserva trae chrs_value_local~0) pero
+              -- en USD (chra_value_rental) esta completo -> sin este filtro el desglose
+              -- en dolares se duplicaba ~2x (2026-09-02). El KPI de revenue (neto) no
+              -- se ve afectado; ya cuadra con RENTAL_COUNTER dentro del ~2%.
+              AND d.fuente_cargo = 'RENTAL_COUNTER'
             GROUP BY 1, 2, 3, 4
         ),
         conteo AS (
