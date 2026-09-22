@@ -169,10 +169,14 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
     factor = float(occ_t / occ_w) if occ_t and occ_w else 1.0
     factor = max(0.5, min(1.5, factor))       # clamp defensivo
 
-    # ensamblar por (sede, cat): occ base (estacional), rpd_t, flota
-    m["occ"] = m["rented"] / m["fleet_days"].replace(0, pd.NA)
-    m["rpd"] = m["t_val"] / m["rented"].replace(0, pd.NA)
-    sc = m.set_index(["g", "acriss"])[["rented", "occ", "rpd"]].to_dict("index")
+    # ensamblar por (GRUPO-sede, cat): agregar las sub-sedes fisicas que mapean al
+    # mismo grupo (Medellin = JMC + Poblado) ANTES de calcular occ/rpd, para que el
+    # indice (grupo, acriss) sea unico.
+    mg = m.groupby(["g", "acriss"], as_index=False).agg(
+        rented=("rented", "sum"), fleet_days=("fleet_days", "sum"), t_val=("t_val", "sum"))
+    mg["occ"] = mg["rented"] / mg["fleet_days"].replace(0, pd.NA)
+    mg["rpd"] = mg["t_val"] / mg["rented"].replace(0, pd.NA)
+    sc = mg.set_index(["g", "acriss"])[["rented", "occ", "rpd"]].to_dict("index")
 
     rows = []
     for _, fr in fleet.iterrows():
