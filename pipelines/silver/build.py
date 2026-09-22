@@ -1982,12 +1982,23 @@ plate AS (
     SELECT DISTINCT ON (vhcl_int_num) vhcl_int_num, NULLIF(TRIM(vhcl_plate),'') placa
     FROM silver.dim_vehicles ORDER BY vhcl_int_num
 ),
+-- T-revenue por contrato: solo el cargo de TARIFA (codigo 'T'), lado RENTAL_COUNTER
+-- (la facturacion real, sin doble-conteo del arm de reserva). Es lo que alimenta el
+-- PRESUPUESTO: rentas de carro puras, sin adicionales ni coberturas ni tax.
+tarifa AS (
+    SELECT numero_contrato, SUM(subtotal_usd) t_usd
+    FROM silver.vw_rentals_detail
+    WHERE cargo_codigo = 'T' AND fuente_cargo = 'RENTAL_COUNTER'
+    GROUP BY 1
+),
 resumen AS (
     SELECT rf.numero_contrato,
            COALESCE(rs.neto_usd,0) neto,
+           COALESCE(tf.t_usd,0) t_rev,
            COALESCE((SELECT trm_cop_per_usd FROM silver.dim_trm_diaria t WHERE t.fecha=rf.fecha_handover_real::date),0) trm
     FROM silver.vw_rentals_full rf
     LEFT JOIN silver.vw_rentals_resumen rs ON rs.numero_contrato=rf.numero_contrato
+    LEFT JOIN tarifa tf ON tf.numero_contrato=rf.numero_contrato
 ),
 -- segmentos por (contrato, hser): placa, fechas, sede y DURACION real de cada tramo.
 -- v6 (2026-09-01): dia = bloque de 24h CON 1 HORA DE GRACIA (el sistema no cobra
@@ -2056,7 +2067,9 @@ first_ho AS (
 rented AS (
     SELECT s.placa, (s.ho_date+gs)::date fecha, s.sede_ho sede_r, s.ts_ho,
            res.neto/NULLIF(ctr.n_contract,0) rev_usd,
-           (res.neto*res.trm)/NULLIF(ctr.n_contract,0) rev_cop
+           (res.neto*res.trm)/NULLIF(ctr.n_contract,0) rev_cop,
+           res.t_rev/NULLIF(ctr.n_contract,0) tar_usd,
+           (res.t_rev*res.trm)/NULLIF(ctr.n_contract,0) tar_cop
     FROM seg s
     JOIN ctr ON ctr.numero_contrato=s.numero_contrato
     JOIN resumen res ON res.numero_contrato=s.numero_contrato
@@ -2070,7 +2083,8 @@ rented_sede AS (
     FROM rented ORDER BY placa, fecha, ts_ho DESC
 ),
 rented_agg AS (
-    SELECT placa, fecha, SUM(rev_usd) rev_usd, SUM(rev_cop) rev_cop, COUNT(*) rentas_dia
+    SELECT placa, fecha, SUM(rev_usd) rev_usd, SUM(rev_cop) rev_cop,
+           SUM(tar_usd) tar_usd, SUM(tar_cop) tar_cop, COUNT(*) rentas_dia
     FROM rented GROUP BY placa, fecha
 ),
 fleet AS (
@@ -2093,8 +2107,8 @@ SELECT s.placa, s.fecha,
        COALESCE(ro.acriss,'NA') acriss,
        CASE WHEN ra.placa IS NOT NULL THEN 1 ELSE 0 END rented_day,
        COALESCE(ra.rentas_dia,0) rentas_dia,
-       COALESCE(ra.rev_usd,0) rev_usd, 0::numeric tar_usd, 0::numeric adi_usd,
-       COALESCE(ra.rev_cop,0) rev_cop, 0::numeric tar_cop, 0::numeric adi_cop
+       COALESCE(ra.rev_usd,0) rev_usd, COALESCE(ra.tar_usd,0) tar_usd, 0::numeric adi_usd,
+       COALESCE(ra.rev_cop,0) rev_cop, COALESCE(ra.tar_cop,0) tar_cop, 0::numeric adi_cop
 FROM spine s
 JOIN roster ro ON ro.placa=s.placa
 LEFT JOIN rented_agg ra ON ra.placa=s.placa AND ra.fecha=s.fecha
