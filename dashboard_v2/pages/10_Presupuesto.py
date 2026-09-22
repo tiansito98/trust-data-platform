@@ -2,21 +2,19 @@
 Presupuesto de ventas (SOLO tarifa, codigo T) — solo trust_admin.
 
 El presupuesto se calcula UNICAMENTE sobre las rentas de carro (cargo T), sin
-adicionales, coberturas ni tax. Fuente: silver.gold_carro_dia (columna tar_usd/
-tar_cop = tarifa T prorrateada por dia 24h+gracia, lado RENTAL_COUNTER).
+adicionales, coberturas ni tax. Fuente: silver.gold_carro_dia (tar_usd/tar_cop =
+tarifa T prorrateada por dia 24h+gracia, lado RENTAL_COUNTER).
 
 Modelo bottom-up por (sede x categoria ACRISS):
-    presupuesto = flota x dias_mes x ocupacion_esperada x RPD_tarifa
+    presupuesto = flota x dias_mes x ocupacion_final x RPD_tarifa
+    ocupacion_final = ocupacion_base x factor_sede x factor_categoria
 
-- Ocupacion base: run-rate de los ultimos 3 meses completos, ajustado por
-  estacionalidad (mes objetivo vs ese mismo mes el anio anterior).
-- RPD tarifa: tarifa T por dia rentado (ultimos 3 meses), con fallback al promedio
-  de la categoria si la celda sede x categoria tiene pocos datos.
-
-Interactivo:
-  1. Editar la ocupacion esperada por sede -> recalcula en vivo (escenarios).
-  2. Guardar cambios (operational.presupuesto_ocupacion) / Volver a lo pre-calculado.
-  3. Comparacion contra el mismo mes del anio anterior (delta).
+- Ocupacion base: run-rate 3 meses completos x factor estacional (mes objetivo vs
+  ese mismo mes el ano anterior).
+- La ocupacion esperada se puede editar POR SEDE y POR CATEGORIA; ambos ajustes se
+  combinan (multiplican) sobre la base.
+- Guardar (operational.presupuesto_ocupacion) / Volver a lo pre-calculado.
+- Comparacion contra el mismo mes del ano anterior (delta).
 """
 import sys
 import calendar
@@ -49,18 +47,18 @@ if not _u or _u.get("username") != "trust_admin":
 
 render_header("Presupuesto de ventas — tarifa (T)")
 
-# --- Tabla de overrides (self-healing) ---
 @st.cache_resource
 def _ensure_table():
     try:
         execute_write("""
             CREATE TABLE IF NOT EXISTS operational.presupuesto_ocupacion (
                 mes           date NOT NULL,
-                sede          text NOT NULL,
+                dimension     text NOT NULL,
+                clave         text NOT NULL,
                 ocupacion_pct numeric,
                 updated_by    text,
                 updated_at    timestamptz DEFAULT now(),
-                PRIMARY KEY (mes, sede)
+                PRIMARY KEY (mes, dimension, clave)
             )
         """, {})
     except Exception:
@@ -68,7 +66,7 @@ def _ensure_table():
 _ensure_table()
 
 filtros = render_sidebar_filters(default_days=30)
-MON = filtros.moneda                          # "USD" o "COP"
+MON = filtros.moneda
 SUF = "cop" if MON == "COP" else "usd"
 
 # =============================================================================
@@ -79,28 +77,28 @@ def _add_month(d: dt.date, k: int) -> dt.date:
     m = d.month - 1 + k
     return dt.date(d.year + m // 12, m % 12 + 1, 1)
 
-# opciones: este mes, proximo, +2  (default = proximo)
 _opts = [_add_month(dt.date(today.year, today.month, 1), k) for k in (0, 1, 2)]
-_labels = {d: d.strftime("%B %Y").capitalize() for d in _opts}
-target = st.selectbox("Mes a presupuestar", options=_opts,
-                      index=1, format_func=lambda d: _labels[d])
+_MES_ES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+           "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+def _mes_label(d): return f"{_MES_ES[d.month].capitalize()} {d.year}"
+target = st.selectbox("Mes a presupuestar", options=_opts, index=1, format_func=_mes_label)
 DAYS = calendar.monthrange(target.year, target.month)[1]
 
-# ventana reciente = 3 meses completos terminando en el ultimo mes COMPLETO
-_last_complete = dt.date(today.year, today.month, 1) - dt.timedelta(days=1)   # ultimo dia mes pasado
+_last_complete = dt.date(today.year, today.month, 1) - dt.timedelta(days=1)
 win_end = dt.date(_last_complete.year, _last_complete.month,
                   calendar.monthrange(_last_complete.year, _last_complete.month)[1])
 win_start = _add_month(dt.date(win_end.year, win_end.month, 1), -2)
 
 st.caption(
-    f"Presupuestando **{_labels[target]}** ({DAYS} dias). Base: run-rate "
-    f"**{win_start:%b %Y} – {win_end:%b %Y}** (3 meses completos). Moneda: **{MON}**. "
-    f"Solo tarifa (cargo T), sin adicionales ni coberturas."
-)
+    f"Presupuestando **{_mes_label(target)}** ({DAYS} días). Base: run-rate "
+    f"**{_MES_ES[win_start.month]} – {_MES_ES[win_end.month]} {win_end.year}** "
+    f"(3 meses completos). Moneda: **{MON}**. Solo tarifa (cargo T), sin adicionales "
+    f"ni coberturas ni tax.")
 
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
-SEDE_NICE = {"BOGOTA": "Bogota", "MEDELLIN": "Medellin",
+SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
              "BUCARAMANGA": "Bucaramanga", "PEREIRA": "Pereira"}
+NICE_TO_GRP = {v: k for k, v in SEDE_NICE.items()}
 def _grp(sede: str) -> str:
     u = (sede or "").upper()
     for k in SEDE_ORDER:
@@ -114,21 +112,16 @@ def _grp(sede: str) -> str:
 # =============================================================================
 @st.cache_data(ttl=600)
 def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
-    # metricas por (sede, acriss) en la ventana
     m = load_query(f"""
-        SELECT sede, acriss,
-               SUM(rented_day)  AS rented,
-               COUNT(*)         AS fleet_days,
-               SUM(tar_{suf})   AS t_val
-        FROM silver.gold_carro_dia
-        WHERE fecha BETWEEN :a AND :b
+        SELECT sede, acriss, SUM(rented_day) AS rented, COUNT(*) AS fleet_days,
+               SUM(tar_{suf}) AS t_val
+        FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
         GROUP BY sede, acriss
     """, {"a": win_start, "b": win_end})
     m["g"] = m["sede"].map(_grp)
     for c in ("rented", "fleet_days", "t_val"):
         m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0.0)
 
-    # fallback categoria-nivel (rpd + occ) para celdas con pocos datos
     cat = m.groupby("acriss").agg(rented=("rented", "sum"),
                                   fleet_days=("fleet_days", "sum"),
                                   t_val=("t_val", "sum")).reset_index()
@@ -136,20 +129,18 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
     cat["rpd_c"] = cat["t_val"] / cat["rented"].replace(0, pd.NA)
     catm = cat.set_index("acriss")[["occ_c", "rpd_c"]].to_dict("index")
 
-    # flota por (sede, cat): cada placa a su sede+cat dominante en la ventana
     fl = load_query("""
         WITH j AS (
             SELECT placa, acriss, sede, COUNT(*) d,
                    ROW_NUMBER() OVER (PARTITION BY placa ORDER BY COUNT(*) DESC) rn
-            FROM silver.gold_carro_dia
-            WHERE fecha BETWEEN :a AND :b
+            FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
             GROUP BY placa, acriss, sede)
         SELECT sede, acriss, COUNT(*) n FROM j WHERE rn = 1 GROUP BY sede, acriss
     """, {"a": win_start, "b": win_end})
     fl["g"] = fl["sede"].map(_grp)
-    fleet = fl.groupby(["g", "acriss"])["n"].sum().reset_index()
+    fleet = fl.groupby(["g", "acriss"], as_index=False)["n"].sum()
 
-    # factor estacional del mes objetivo (anio anterior): occ(mes) / occ(ventana)
+    # factor estacional del mes objetivo (ano anterior): occ(mes) / occ(ventana)
     ty, tm = int(target_iso[:4]), int(target_iso[5:7])
     py = ty - 1
     ws_prev = f"{py}-{win_start[5:7]}-01"
@@ -162,127 +153,97 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
             / NULLIF(COUNT(*) FILTER (WHERE fecha BETWEEN :ta AND :tb),0) AS occ_tgt,
           SUM(rented_day) FILTER (WHERE fecha BETWEEN :wa AND :wb)::float
             / NULLIF(COUNT(*) FILTER (WHERE fecha BETWEEN :wa AND :wb),0) AS occ_win
-        FROM silver.gold_carro_dia
-        WHERE fecha BETWEEN :wa AND :tb
+        FROM silver.gold_carro_dia WHERE fecha BETWEEN :wa AND :tb
     """, {"ta": tgt_prev_a, "tb": tgt_prev_b, "wa": ws_prev, "wb": we_prev})
     occ_t = sf.iloc[0]["occ_tgt"]; occ_w = sf.iloc[0]["occ_win"]
     factor = float(occ_t / occ_w) if occ_t and occ_w else 1.0
-    factor = max(0.5, min(1.5, factor))       # clamp defensivo
+    factor = max(0.5, min(1.5, factor))
 
-    # ensamblar por (GRUPO-sede, cat): agregar las sub-sedes fisicas que mapean al
-    # mismo grupo (Medellin = JMC + Poblado) ANTES de calcular occ/rpd, para que el
-    # indice (grupo, acriss) sea unico.
     mg = m.groupby(["g", "acriss"], as_index=False).agg(
         rented=("rented", "sum"), fleet_days=("fleet_days", "sum"), t_val=("t_val", "sum"))
     mg["occ"] = mg["rented"] / mg["fleet_days"].replace(0, pd.NA)
     mg["rpd"] = mg["t_val"] / mg["rented"].replace(0, pd.NA)
-    sc = mg.set_index(["g", "acriss"])[["rented", "occ", "rpd"]].to_dict("index")
+    scd = mg.set_index(["g", "acriss"])[["rented", "occ", "rpd"]].to_dict("index")
 
     rows = []
     for _, fr in fleet.iterrows():
         g, a, n = fr["g"], fr["acriss"], int(fr["n"])
-        cell = sc.get((g, a), {})
-        occ = cell.get("occ"); rpd = cell.get("rpd"); rented = cell.get("rented", 0)
-        src = "sede"
-        if pd.isna(occ) or rented is None or rented < 20:
-            occ = catm.get(a, {}).get("occ_c"); src = "cat"
-        if pd.isna(rpd) or rented is None or rented < 20:
-            rpd = catm.get(a, {}).get("rpd_c"); src = "cat"
+        cell = scd.get((g, a), {})
+        occ = cell.get("occ"); rpd = cell.get("rpd"); rented = cell.get("rented", 0) or 0
+        if pd.isna(occ) or rented < 20:
+            occ = catm.get(a, {}).get("occ_c")
+        if pd.isna(rpd) or rented < 20:
+            rpd = catm.get(a, {}).get("rpd_c")
         occ = float(occ) if pd.notna(occ) else 0.0
         rpd = float(rpd) if pd.notna(rpd) else 0.0
         rows.append({"sede": g, "acriss": a, "n": n,
-                     "occ_season": min(occ * factor, 0.98), "rpd": rpd, "src": src})
+                     "occ_base": min(occ * factor, 0.98), "rpd": rpd})
     return pd.DataFrame(rows), factor
 
 base_df, factor = _base_inputs(win_start.isoformat(), win_end.isoformat(),
                                target.isoformat(), SUF)
-
 if base_df.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
     st.stop()
 
-# ocupacion base ponderada por sede (para el editor)
-def _sede_occ(df, col):
-    g = df.groupby("sede").apply(
-        lambda x: (x["n"] * x[col]).sum() / x["n"].sum() if x["n"].sum() else 0.0)
-    return g
-base_sede_occ = _sede_occ(base_df, "occ_season")   # ocupacion pre-calculada por sede
-
-
-# =============================================================================
-# Overrides guardados + editor de ocupacion esperada
-# =============================================================================
-saved = load_query(
-    "SELECT sede, ocupacion_pct FROM operational.presupuesto_ocupacion WHERE mes = :m",
-    {"m": target.isoformat()})
-saved_map = dict(zip(saved["sede"], pd.to_numeric(saved["ocupacion_pct"], errors="coerce")))
+# ocupaciones base ponderadas por flota (defaults del editor)
+def _wocc(df, by):
+    num = (df["n"] * df["occ_base"]).groupby(df[by]).sum()
+    den = df.groupby(by)["n"].sum()
+    return (num / den.replace(0, pd.NA)).fillna(0.0)
+base_sede_occ = _wocc(base_df, "sede")     # grupo -> frac
+base_cat_occ = _wocc(base_df, "acriss")    # acriss -> frac
+fleet_sede = base_df.groupby("sede")["n"].sum()
+fleet_cat = base_df.groupby("acriss")["n"].sum()
 
 sedes_present = [s for s in SEDE_ORDER if s in set(base_df["sede"])]
-editor_rows = []
-for s in sedes_present:
-    pre = round(float(base_sede_occ.get(s, 0)) * 100, 1)
-    val = float(saved_map[s]) if s in saved_map and pd.notna(saved_map[s]) else pre
-    editor_rows.append({"Sede": SEDE_NICE.get(s, s),
-                        "Ocupacion pre-calculada (%)": pre,
-                        "Ocupacion esperada (%)": round(val, 1)})
-editor_df = pd.DataFrame(editor_rows)
-
-section("Ocupacion esperada por sede")
-st.caption(
-    "La ocupacion **pre-calculada** = run-rate reciente ajustado por estacionalidad "
-    f"(factor {factor:.2f} vs {target.strftime('%B')} del anio pasado). Edita la "
-    "columna **esperada** para tus escenarios; el presupuesto recalcula al instante.")
-
-edited = st.data_editor(
-    editor_df,
-    hide_index=True, use_container_width=True,
-    disabled=["Sede", "Ocupacion pre-calculada (%)"],
-    column_config={
-        "Ocupacion esperada (%)": st.column_config.NumberColumn(
-            "Ocupacion esperada (%)", min_value=0.0, max_value=100.0,
-            step=0.5, format="%.1f"),
-    },
-    key=f"occ_editor_{target.isoformat()}",
-)
-exp_occ = {}   # sede (grupo) -> ocupacion esperada (fraccion)
-for _, r in edited.iterrows():
-    g = next((k for k, v in SEDE_NICE.items() if v == r["Sede"]), r["Sede"].upper())
-    exp_occ[g] = float(r["Ocupacion esperada (%)"]) / 100.0
-
-c1, c2, _ = st.columns([1.2, 1.5, 3])
-if c1.button("Guardar cambios", type="primary"):
-    for _, r in edited.iterrows():
-        g = next((k for k, v in SEDE_NICE.items() if v == r["Sede"]), r["Sede"].upper())
-        execute_write("""
-            INSERT INTO operational.presupuesto_ocupacion (mes, sede, ocupacion_pct, updated_by, updated_at)
-            VALUES (:m, :s, :o, :u, NOW())
-            ON CONFLICT (mes, sede) DO UPDATE
-              SET ocupacion_pct = EXCLUDED.ocupacion_pct, updated_by = EXCLUDED.updated_by, updated_at = NOW()
-        """, {"m": target.isoformat(), "s": g,
-              "o": float(r["Ocupacion esperada (%)"]), "u": _u.get("username")})
-    load_query.clear()
-    st.success("Escenario guardado.")
-    st.rerun()
-if c2.button("Volver a lo pre-calculado"):
-    execute_write("DELETE FROM operational.presupuesto_ocupacion WHERE mes = :m",
-                  {"m": target.isoformat()})
-    st.session_state.pop(f"occ_editor_{target.isoformat()}", None)
-    load_query.clear()
-    st.info("Escenario borrado — se muestra lo pre-calculado.")
-    st.rerun()
-
-_hay_override = any(s in saved_map for s in sedes_present)
-
+cats_present = list(base_df.groupby("acriss")["n"].sum().sort_values(ascending=False).index)
 
 # =============================================================================
-# Calculo del presupuesto (con la ocupacion editada)
+# Overrides guardados (sede + categoria)
+# =============================================================================
+_ov = load_query(
+    "SELECT dimension, clave, ocupacion_pct FROM operational.presupuesto_ocupacion WHERE mes = :m",
+    {"m": target.isoformat()})
+saved_sede = {r["clave"]: float(r["ocupacion_pct"]) for _, r in _ov.iterrows()
+              if r["dimension"] == "sede" and pd.notna(r["ocupacion_pct"])}
+saved_cat = {r["clave"]: float(r["ocupacion_pct"]) for _, r in _ov.iterrows()
+             if r["dimension"] == "cat" and pd.notna(r["ocupacion_pct"])}
+_hay_override = bool(saved_sede or saved_cat)
+
+def_sede_pct = {s: round(saved_sede.get(s, base_sede_occ.get(s, 0) * 100), 1) for s in sedes_present}
+def_cat_pct = {a: round(saved_cat.get(a, base_cat_occ.get(a, 0) * 100), 1) for a in cats_present}
+
+KEY_SEDE = f"occ_sede_{target.isoformat()}"
+KEY_CAT = f"occ_cat_{target.isoformat()}"
+
+def _live_occ(key, claves, defaults_pct):
+    """Lee las ediciones del data_editor desde session_state y devuelve {clave: frac}."""
+    out = dict(defaults_pct)
+    stt = st.session_state.get(key)
+    if isinstance(stt, dict):
+        for ridx, ch in stt.get("edited_rows", {}).items():
+            if "Ocupación esperada (%)" in ch:
+                try:
+                    out[claves[int(ridx)]] = float(ch["Ocupación esperada (%)"])
+                except Exception:
+                    pass
+    return {c: (v or 0) / 100.0 for c, v in out.items()}
+
+occ_sede = _live_occ(KEY_SEDE, sedes_present, def_sede_pct)
+occ_cat = _live_occ(KEY_CAT, cats_present, def_cat_pct)
+factor_sede = {s: (occ_sede[s] / base_sede_occ[s]) if base_sede_occ.get(s, 0) else 1.0
+               for s in sedes_present}
+factor_cat = {a: (occ_cat[a] / base_cat_occ[a]) if base_cat_occ.get(a, 0) else 1.0
+              for a in cats_present}
+
+# =============================================================================
+# Calculo del presupuesto
 # =============================================================================
 df = base_df.copy()
-# factor por sede = ocupacion esperada / ocupacion pre-calculada
-df["factor_sede"] = df["sede"].map(
-    lambda s: (exp_occ.get(s, base_sede_occ.get(s, 0)) / base_sede_occ.get(s, 1))
-    if base_sede_occ.get(s, 0) else 1.0)
-df["occ_final"] = (df["occ_season"] * df["factor_sede"]).clip(upper=0.98)
+df["fs"] = df["sede"].map(factor_sede).fillna(1.0)
+df["fc"] = df["acriss"].map(factor_cat).fillna(1.0)
+df["occ_final"] = (df["occ_base"] * df["fs"] * df["fc"]).clip(upper=0.98)
 df["rented"] = df["n"] * DAYS * df["occ_final"]
 df["rev"] = df["rented"] * df["rpd"]
 
@@ -295,100 +256,136 @@ occ_glob = tot_rented / tot_cardays if tot_cardays else 0
 k1, k2, k3, k4 = st.columns(4)
 kpi(k1, f"Presupuesto tarifa ({MON})", fmt_money(tot_rev, MON),
     "escenario editado" if _hay_override else "pre-calculado")
-kpi(k2, "Flota", fmt_int(tot_fleet), f"{fmt_int(tot_cardays)} carro-dias")
-kpi(k3, "Ocupacion", f"{occ_glob*100:.1f}%", f"{fmt_int(round(tot_rented))} dias rentados")
+kpi(k2, "Flota", fmt_int(tot_fleet), f"{fmt_int(tot_cardays)} carro-días")
+kpi(k3, "Ocupación", f"{occ_glob*100:.1f}%", f"{fmt_int(round(tot_rented))} días rentados")
 kpi(k4, f"RPD tarifa ({MON})", fmt_money(tot_rev / tot_rented if tot_rented else 0, MON),
-    "tarifa por dia rentado")
+    "tarifa por día rentado")
 
-# --- rango de escenarios alrededor del editado ---
 def _rev_at(mult):
-    occ = (df["occ_season"] * df["factor_sede"] * mult).clip(upper=0.98)
+    occ = (df["occ_base"] * df["fs"] * df["fc"] * mult).clip(upper=0.98)
     return (df["n"] * DAYS * occ * df["rpd"]).sum()
-section("Escenarios")
+section("Escenarios (± ocupación)")
 sc1, sc2, sc3 = st.columns(3)
-kpi(sc1, "Conservador (-10% ocup)", fmt_money(_rev_at(0.90), MON))
+kpi(sc1, "Conservador (−10%)", fmt_money(_rev_at(0.90), MON))
 kpi(sc2, "Base (editado)", fmt_money(tot_rev, MON))
-kpi(sc3, "Optimista (+10% ocup)", fmt_money(_rev_at(1.10), MON))
+kpi(sc3, "Optimista (+10%)", fmt_money(_rev_at(1.10), MON))
+
+st.info("Editá la columna **Ocupación esperada (%)** en cualquiera de las dos tablas "
+        "(por sede y por categoría). Los ajustes se **combinan** y el presupuesto "
+        "recalcula al instante. Luego **Guardar** para fijar el escenario.")
 
 
 # =============================================================================
-# Por sede
+# Por sede (editable)
 # =============================================================================
 section("Por sede")
-by_sede = df.groupby("sede").agg(
-    n=("n", "sum"), rented=("rented", "sum"), rev=("rev", "sum")).reindex(sedes_present)
-by_sede["cardays"] = by_sede["n"] * DAYS
-by_sede["ocup"] = (by_sede["rented"] / by_sede["cardays"] * 100).round(1)
-by_sede["rpd"] = (by_sede["rev"] / by_sede["rented"]).round(1)
-vs = by_sede.reset_index()
-vs["Sede"] = vs["sede"].map(SEDE_NICE)
-vs["Presupuesto"] = vs["rev"].map(lambda v: fmt_money(v, MON))
-vs["RPD"] = vs["rpd"].map(lambda v: fmt_money(v, MON))
-vs["Ocupacion"] = vs["ocup"].map(lambda v: f"{v:.1f}%")
-vs["Flota"] = vs["n"].astype(int)
-vs["Dias rent."] = vs["rented"].round(0).astype(int)
-st.dataframe(vs[["Sede", "Flota", "Ocupacion", "RPD", "Dias rent.", "Presupuesto"]],
-             hide_index=True, use_container_width=True)
-
-
-# =============================================================================
-# Por categoria
-# =============================================================================
-section("Por categoria (ACRISS)")
-st.caption("El RPD de tarifa manda: una camioneta rinde mucho mas por dia que un economico.")
-by_cat = df.groupby("acriss").agg(
-    n=("n", "sum"), rented=("rented", "sum"), rev=("rev", "sum")).reset_index()
-by_cat["cardays"] = by_cat["n"] * DAYS
-by_cat["ocup"] = (by_cat["rented"] / by_cat["cardays"] * 100).round(1)
-by_cat["rpd"] = (by_cat["rev"] / by_cat["rented"]).round(1)
-by_cat["revpau"] = (by_cat["rev"] / by_cat["cardays"]).round(1)
-by_cat = by_cat.sort_values("revpau", ascending=False)
-cv = pd.DataFrame({
-    "Categoria": by_cat["acriss"],
-    "Flota": by_cat["n"].astype(int),
-    "Ocupacion": by_cat["ocup"].map(lambda v: f"{v:.1f}%"),
-    "RPD tarifa": by_cat["rpd"].map(lambda v: fmt_money(v, MON)),
-    "RevPAU": by_cat["revpau"].map(lambda v: fmt_money(v, MON)),
-    "Presupuesto": by_cat["rev"].map(lambda v: fmt_money(v, MON)),
+bs = df.groupby("sede").agg(n=("n", "sum"), rented=("rented", "sum"), rev=("rev", "sum"))
+sede_ed_df = pd.DataFrame({
+    "Sede": [SEDE_NICE[s] for s in sedes_present],
+    "Flota": [int(fleet_sede.get(s, 0)) for s in sedes_present],
+    "Ocupación esperada (%)": [def_sede_pct[s] for s in sedes_present],
+    "RPD": [fmt_money(bs.loc[s, "rev"] / bs.loc[s, "rented"] if bs.loc[s, "rented"] else 0, MON)
+            for s in sedes_present],
+    "Presupuesto": [fmt_money(bs.loc[s, "rev"], MON) for s in sedes_present],
 })
-st.dataframe(cv, hide_index=True, use_container_width=True)
+st.data_editor(
+    sede_ed_df, hide_index=True, use_container_width=True, key=KEY_SEDE,
+    disabled=["Sede", "Flota", "RPD", "Presupuesto"],
+    column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
+        min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
+)
+
+# =============================================================================
+# Por categoria (editable)
+# =============================================================================
+section("Por categoría (ACRISS)")
+st.caption("El RPD de tarifa manda: una camioneta rinde mucho más por día que un económico.")
+bc = df.groupby("acriss").agg(n=("n", "sum"), rented=("rented", "sum"), rev=("rev", "sum"))
+bc["revpau"] = bc["rev"] / (bc["n"] * DAYS)
+# El editor usa el orden ESTABLE cats_present (por flota), para que el mapeo
+# fila->categoria en _live_occ no cambie al editar.
+cat_ed_df = pd.DataFrame({
+    "Categoría": cats_present,
+    "Flota": [int(fleet_cat.get(a, 0)) for a in cats_present],
+    "Ocupación esperada (%)": [def_cat_pct.get(a, 0) for a in cats_present],
+    "RPD tarifa": [fmt_money(bc.loc[a, "rev"] / bc.loc[a, "rented"] if bc.loc[a, "rented"] else 0, MON)
+                   for a in cats_present],
+    "RevPAU": [fmt_money(bc.loc[a, "revpau"], MON) for a in cats_present],
+    "Presupuesto": [fmt_money(bc.loc[a, "rev"], MON) for a in cats_present],
+})
+st.data_editor(
+    cat_ed_df, hide_index=True, use_container_width=True, key=KEY_CAT,
+    disabled=["Categoría", "Flota", "RPD tarifa", "RevPAU", "Presupuesto"],
+    column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
+        min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
+)
 
 
 # =============================================================================
-# Comparacion vs el mismo mes del anio anterior (delta)
+# Guardar / Volver a lo pre-calculado
 # =============================================================================
-section(f"Comparacion vs {target.strftime('%B %Y')} — 1 anio")
+c1, c2, _ = st.columns([1.3, 1.6, 3])
+if c1.button("Guardar cambios", type="primary"):
+    for s in sedes_present:
+        execute_write("""
+            INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
+            VALUES (:m,'sede',:k,:o,:u,NOW())
+            ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct, updated_by=EXCLUDED.updated_by, updated_at=NOW()
+        """, {"m": target.isoformat(), "k": s, "o": round(occ_sede[s] * 100, 2), "u": _u.get("username")})
+    for a in cats_present:
+        execute_write("""
+            INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
+            VALUES (:m,'cat',:k,:o,:u,NOW())
+            ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct, updated_by=EXCLUDED.updated_by, updated_at=NOW()
+        """, {"m": target.isoformat(), "k": a, "o": round(occ_cat[a] * 100, 2), "u": _u.get("username")})
+    load_query.clear()
+    st.success("Escenario guardado.")
+    st.rerun()
+if c2.button("Volver a lo pre-calculado"):
+    execute_write("DELETE FROM operational.presupuesto_ocupacion WHERE mes = :m", {"m": target.isoformat()})
+    st.session_state.pop(KEY_SEDE, None)
+    st.session_state.pop(KEY_CAT, None)
+    load_query.clear()
+    st.info("Escenario borrado — se muestra lo pre-calculado.")
+    st.rerun()
+
+
+# =============================================================================
+# Comparacion vs el mismo mes del ano anterior (delta)
+# =============================================================================
 py = target.year - 1
+section(f"Comparación vs {_MES_ES[target.month]} {py}")
 prev_a = dt.date(py, target.month, 1)
 prev_b = dt.date(py, target.month, calendar.monthrange(py, target.month)[1])
 prev = load_query(f"""
-    SELECT sede, SUM(tar_{SUF}) AS t_val, SUM(rented_day) AS rented, COUNT(*) AS cardays
-    FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b GROUP BY sede
+    SELECT sede, SUM(tar_{SUF}) AS t_val FROM silver.gold_carro_dia
+    WHERE fecha BETWEEN :a AND :b GROUP BY sede
 """, {"a": prev_a.isoformat(), "b": prev_b.isoformat()})
-if prev.empty or pd.to_numeric(prev["t_val"], errors="coerce").fillna(0).sum() == 0:
-    st.info(f"No hay datos de {target.strftime('%B %Y')} del anio pasado para comparar.")
+prev["t_val"] = pd.to_numeric(prev["t_val"], errors="coerce").fillna(0.0)
+if prev["t_val"].sum() == 0:
+    st.info(f"No hay datos de {_MES_ES[target.month]} {py} para comparar.")
 else:
     prev["g"] = prev["sede"].map(_grp)
-    prev_rev = pd.to_numeric(prev.groupby("g")["t_val"].sum(), errors="coerce")
+    prev_rev = prev.groupby("g")["t_val"].sum()
     prev_tot = float(prev_rev.sum())
-    dcol1, dcol2, dcol3 = st.columns(3)
-    kpi(dcol1, f"Presupuesto {target.strftime('%b %Y')}", fmt_money(tot_rev, MON))
-    kpi(dcol2, f"Real {prev_a.strftime('%b %Y')}", fmt_money(prev_tot, MON))
+    d1, d2, d3 = st.columns(3)
+    kpi(d1, f"Presupuesto {_MES_ES[target.month]} {target.year}", fmt_money(tot_rev, MON))
+    kpi(d2, f"Real {_MES_ES[target.month]} {py}", fmt_money(prev_tot, MON))
     _delta = (tot_rev / prev_tot - 1) * 100 if prev_tot else 0
-    kpi(dcol3, "Delta", f"{_delta:+.1f}%",
-        "presupuesto vs mismo mes anio pasado")
-    # tabla por sede
-    comp = by_sede.reset_index()[["sede", "rev"]].rename(columns={"rev": "presup"})
+    kpi(d3, "Delta", f"{_delta:+.1f}%", "presupuesto vs mismo mes año pasado")
+    comp = bs.reset_index()[["sede", "rev"]].rename(columns={"rev": "presup"})
     comp["real_prev"] = comp["sede"].map(prev_rev.to_dict()).fillna(0.0)
-    comp["delta_%"] = ((comp["presup"] / comp["real_prev"].replace(0, pd.NA) - 1) * 100).round(1)
-    comp["Sede"] = comp["sede"].map(SEDE_NICE)
-    comp["Presupuesto"] = comp["presup"].map(lambda v: fmt_money(v, MON))
-    comp[f"Real {py}"] = comp["real_prev"].map(lambda v: fmt_money(v, MON))
-    comp["Delta"] = comp["delta_%"].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "nuevo")
-    st.dataframe(comp[["Sede", "Presupuesto", f"Real {py}", "Delta"]],
-                 hide_index=True, use_container_width=True)
+    comp["delta"] = comp["presup"] / comp["real_prev"].replace(0, pd.NA) - 1
+    comp = comp.set_index("sede").reindex(sedes_present).reset_index()
+    st.dataframe(pd.DataFrame({
+        "Sede": [SEDE_NICE[s] for s in comp["sede"]],
+        "Presupuesto": comp["presup"].map(lambda v: fmt_money(v, MON)),
+        f"Real {py}": comp["real_prev"].map(lambda v: fmt_money(v, MON)),
+        "Delta": comp["delta"].map(lambda v: f"{v*100:+.1f}%" if pd.notna(v) else "nuevo"),
+    }), hide_index=True, use_container_width=True)
 
 st.caption(
-    "Presupuesto = flota x dias x ocupacion esperada x RPD de tarifa (solo cargo T, "
-    "sin adicionales/coberturas/tax). Fuente: silver.gold_carro_dia. "
+    "Presupuesto = flota × días × ocupación esperada × RPD de tarifa (solo cargo T). "
+    f"Factor estacional {factor:.2f} vs {_MES_ES[target.month]} {py}. Fuente: "
+    "silver.gold_carro_dia. "
     + ("**Escenario guardado activo.**" if _hay_override else "Estado pre-calculado."))
