@@ -198,7 +198,12 @@ else:
 # falla (ej. falta el prepagado USD), el asesor no pierde lo que ya escribio —
 # solo corrige y vuelve a guardar. En factura nueva exitosa se limpia con el
 # boton "Nueva factura / Limpiar" (abajo).
-with st.form(f"invoice_form_{st.session_state['_form_nonce']}", clear_on_submit=False):
+# El key del form incluye _editing_id: al cambiar de factura (o de "nueva" a editar
+# otra), el form y TODOS sus widgets se recrean, tomando el `value=` de la factura
+# actual. Sin esto, los number_input keyless conservaban el estado de la edicion
+# anterior y "pegaban" montos de otra factura (bug del prepagado USD, 2026-09-21).
+_form_key = f"invoice_form_{st.session_state['_editing_id'] or 'new'}_{st.session_state['_form_nonce']}"
+with st.form(_form_key, clear_on_submit=False):
     c1, c2, c3 = st.columns(3)
     fecha_emision = c1.date_input(
         "Fecha emision",
@@ -219,9 +224,9 @@ with st.form(f"invoice_form_{st.session_state['_form_nonce']}", clear_on_submit=
         sede_nombre = locked_sede
 
     # Prefill: al editar, el contrato de la factura; si no, un contrato que el
-    # asesor eligio desde el recordatorio de pendientes (Seccion 0). Como el
-    # widget no tiene key, cambiar `value` lo re-inicializa (asi funciona el
-    # prefill de edicion), por eso el prefill del recordatorio tambien aplica.
+    # asesor eligio desde el recordatorio de pendientes (Seccion 0). El `value=` de
+    # cada widget se respeta porque el key del form incluye _editing_id (ver arriba):
+    # al cambiar de factura el form se recrea y los widgets se re-inicializan.
     if editing and editing_data.get("rntl_mvnr"):
         _default_contrato = str(int(editing_data["rntl_mvnr"]))
     else:
@@ -476,7 +481,7 @@ open_sql = f"""
     )
     SELECT i.invoice_id, i.fecha_emision, i.sede_nombre, i.rntl_mvnr,
            i.numero_factura, i.numero_recibo,
-           i.monto_total, i.monto_prepagado, i.monto_counter,
+           i.monto_total, i.monto_prepagado, i.monto_prepagado_usd, i.monto_counter,
            i.observaciones, i.capturado_por, i.capturado_at,
            COALESCE(ap.n_aprobaciones, 0)  AS n_aprobaciones,
            r.fecha_handover_real::date   AS fecha_entrega,
