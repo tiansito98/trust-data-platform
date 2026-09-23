@@ -12,6 +12,8 @@ Modelo bottom-up por (sede x categoria ACRISS):
 - FLOTA: foto del padron ACTIVO al ultimo dia de gold_carro_dia, NO un conteo de la
   ventana de 3 meses (fix 2026-09-22). Antes, un carro que ingresaba despues del
   cierre de la ventana contaba 0 y la flota solo crecia con ~2 meses de retraso.
+  La sede de cada placa sale de su ULTIMO DIA LIBRE, asi que un TRASLADO entre
+  ciudades mueve la flota el mismo dia (la sede modal de 30 dias tardaba ~15).
 - Ocupacion base y RPD: run-rate 3 meses completos x factor estacional (mes objetivo
   vs ese mismo mes el ano anterior). Son tasas; lo que multiplica es la flota de hoy.
 - La ocupacion esperada se puede editar POR SEDE y POR CATEGORIA; ambos ajustes se
@@ -143,22 +145,26 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
     # (La baja si era inmediata: el roster de gold_carro_dia es el activo actual, asi
     # que un defleeteado desaparece retroactivamente de la ventana.) Ocupacion y RPD
     # siguen saliendo de la ventana de 3 meses -- son tasas; lo que multiplica es la
-    # flota de hoy. La sede se toma como la sede MODAL de los ultimos 30 dias (mas
-    # estable que la del dia exacto, que para un carro en renta es la de su contrato).
+    # flota de hoy. SEDE de cada placa = la de su ULTIMO DIA LIBRE (rented_day=0): un
+    # carro quieto esta parado en su sede real, y en gold esa sede solo se mueve con un
+    # TRASLADO ('Internal Products'), asi que un traslado se refleja el MISMO dia. Se
+    # ignoran los dias rentados (ruido de one-way / entregas en otra sede) y se cae al
+    # dia del snapshot si la placa lleva toda la ventana en renta. Ojo: NO usar la sede
+    # modal de los ultimos 30 dias -- promedia y tarda ~15 dias en registrar un traslado
+    # (validado: NPM554 Medellin->Bucaramanga el 20-sep seguia contando en Medellin).
     fl = load_query("""
         WITH last AS (SELECT MAX(fecha) AS f FROM silver.gold_carro_dia),
         act AS (
-            SELECT DISTINCT g.placa, g.acriss
+            SELECT DISTINCT g.placa, g.acriss, g.sede AS sede_snap
             FROM silver.gold_carro_dia g, last WHERE g.fecha = last.f),
-        loc AS (
-            SELECT g.placa, g.sede,
-                   ROW_NUMBER() OVER (PARTITION BY g.placa
-                                      ORDER BY COUNT(*) DESC, MAX(g.fecha) DESC) rn
+        idle AS (
+            SELECT DISTINCT ON (g.placa) g.placa, g.sede
             FROM silver.gold_carro_dia g, last
-            WHERE g.fecha > last.f - 30 GROUP BY g.placa, g.sede)
-        SELECT l.sede, a.acriss, COUNT(*) AS n
-        FROM act a JOIN loc l ON l.placa = a.placa AND l.rn = 1
-        GROUP BY l.sede, a.acriss
+            WHERE g.rented_day = 0 AND g.fecha > last.f - 120
+            ORDER BY g.placa, g.fecha DESC)
+        SELECT COALESCE(i.sede, a.sede_snap) AS sede, a.acriss, COUNT(*) AS n
+        FROM act a LEFT JOIN idle i ON i.placa = a.placa
+        GROUP BY 1, a.acriss
     """, {})
     fl["g"] = fl["sede"].map(_grp)
     fleet = fl.groupby(["g", "acriss"], as_index=False)["n"].sum()
@@ -511,7 +517,7 @@ else:
 st.caption(
     "Presupuesto = flota × días × ocupación esperada × RPD de tarifa (solo cargo T). "
     f"Factor estacional {factor:.2f} vs {_MES_ES[target.month]} {py}. La **flota** es "
-    f"el padrón activo al {snap_date} (un carro que ingresa hoy entra al presupuesto "
-    "tras el próximo refresh del pipeline); la **ocupación** y el **RPD** son tasas "
-    "de la ventana de 3 meses. Fuente: silver.gold_carro_dia. "
+    f"el padrón activo al {snap_date}: un carro que ingresa, sale o se **traslada** de "
+    "ciudad entra al presupuesto tras el próximo refresh del pipeline. La **ocupación** "
+    "y el **RPD** son tasas de la ventana de 3 meses. Fuente: silver.gold_carro_dia. "
     + ("**Escenario guardado activo.**" if _hay_override else "Estado pre-calculado."))
