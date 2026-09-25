@@ -52,6 +52,16 @@ def _ensure_pg() -> str:
             "SUPABASE_DB_URL no esta configurado. "
             "Ponlo en .env o como GitHub secret."
         )
+    # Forzar el driver psycopg2 (el unico que trae requirements.txt). Un
+    # SUPABASE_DB_URL con esquema 'postgresql+psycopg://' (psycopg3) o el legacy
+    # 'postgres://' rompia en el runner de GitHub (solo tiene psycopg2-binary):
+    #   ModuleNotFoundError: No module named 'psycopg'
+    # Normalizamos aqui para no depender de como este escrito el secret.
+    for pref in ("postgresql+psycopg://", "postgresql+psycopg3://",
+                 "postgresql://", "postgres://"):
+        if url.startswith(pref):
+            url = "postgresql+psycopg2://" + url[len(pref):]
+            break
     return url
 
 
