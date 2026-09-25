@@ -443,23 +443,44 @@ st.data_editor(
 # =============================================================================
 # Guardar / Volver a lo pre-calculado
 # =============================================================================
+_msg = st.session_state.pop("_presup_msg", None)
+if _msg:
+    st.success(_msg)
+
 c1, c2, _ = st.columns([1.3, 1.6, 3])
+_UPSERT_OCC = """
+    INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
+    VALUES (:m,:d,:k,:o,:u,NOW())
+    ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct,
+        updated_by=EXCLUDED.updated_by, updated_at=NOW()
+"""
+
 if c1.button("Guardar cambios", type="primary"):
-    for s in sedes_present:
-        execute_write("""
-            INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
-            VALUES (:m,'sede',:k,:o,:u,NOW())
-            ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct, updated_by=EXCLUDED.updated_by, updated_at=NOW()
-        """, {"m": target.isoformat(), "k": s, "o": round(occ_sede[s] * 100, 2), "u": _u.get("username")})
-    for a in cats_present:
-        execute_write(f"""
-            INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
-            VALUES (:m,'{CAT_DIM}',:k,:o,:u,NOW())
-            ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct, updated_by=EXCLUDED.updated_by, updated_at=NOW()
-        """, {"m": target.isoformat(), "k": _catkey(a), "o": round(occ_cat[a] * 100, 2),
-              "u": _u.get("username")})
+    # UNA sola transaccion (lista de dicts -> executemany): o entra el escenario
+    # completo o no entra nada. Antes era un execute_write por fila y un fallo a
+    # mitad de camino dejaba la mitad del escenario guardado.
+    # float() explicito: los valores vienen de Series de pandas (np.float64) y
+    # psycopg2 los serializa con repr() -> 'np.float64(65.4)' en numpy 2.x, que
+    # Postgres lee como funcion del schema 'np'. common.to_py() ya lo cubre, esto
+    # lo deja evidente en el call site.
+    _usr = _u.get("username")
+    rows = [{"m": target.isoformat(), "d": "sede", "k": s,
+             "o": round(float(occ_sede[s]) * 100, 2), "u": _usr} for s in sedes_present]
+    rows += [{"m": target.isoformat(), "d": CAT_DIM, "k": _catkey(a),
+              "o": round(float(occ_cat[a]) * 100, 2), "u": _usr} for a in cats_present]
+    try:
+        execute_write(_UPSERT_OCC, rows)
+    except Exception as ex:
+        st.error(f"No se pudo guardar el escenario: {type(ex).__name__}. "
+                 "No se guardo nada (la escritura es atomica).")
+        st.exception(ex)
+        st.stop()
     load_query.clear()
-    st.success(f"Escenario guardado ({SEDE_NICE[SCOPE_G]})." if SINGLE else "Escenario guardado.")
+    # El mensaje va a session_state: st.success() antes de un st.rerun() se pierde
+    # (la pagina se vuelve a pintar de cero y el usuario no ve ninguna confirmacion).
+    st.session_state["_presup_msg"] = (
+        f"Escenario guardado ({SEDE_NICE[SCOPE_G]}): {len(rows)} filas."
+        if SINGLE else f"Escenario guardado: {len(rows)} filas.")
     st.rerun()
 if c2.button("Volver a lo pre-calculado"):
     # Con una sede en alcance se borra SOLO lo de esa sede; en consolidado, todo el mes.
@@ -475,7 +496,9 @@ if c2.button("Volver a lo pre-calculado"):
     st.session_state.pop(KEY_SEDE, None)
     st.session_state.pop(KEY_CAT, None)
     load_query.clear()
-    st.info("Escenario borrado — se muestra lo pre-calculado.")
+    st.session_state["_presup_msg"] = (
+        f"Escenario de {SEDE_NICE[SCOPE_G]} borrado — se muestra lo pre-calculado."
+        if SINGLE else "Escenario borrado — se muestra lo pre-calculado.")
     st.rerun()
 
 

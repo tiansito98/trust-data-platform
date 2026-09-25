@@ -11,6 +11,7 @@ Diferencias frente al v1:
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, event, text
@@ -94,6 +95,7 @@ def load_query(sql: str, params: tuple | dict = (),
                 out_sql.append(ch)
         sql = "".join(out_sql)
         params = named
+    params = _clean_params(params)
     with engine.connect() as conn:
         # Set search_path explicitly en ESTA conexion antes de la query.
         # El pooler de Supabase no honora el event-listener ni connect_args
@@ -106,12 +108,64 @@ def load_query(sql: str, params: tuple | dict = (),
         return pd.read_sql_query(text(sql), conn, params=params)
 
 
+def to_py(v):
+    """Convierte un escalar de numpy/pandas al tipo nativo de Python equivalente.
+
+    OBLIGATORIO antes de pasar cualquier valor derivado de un DataFrame o Serie a
+    psycopg2. `numpy.float64` HEREDA de `float`, asi que psycopg2 lo acepta sin
+    quejarse y lo serializa con `repr()` -- y en numpy 2.x `repr(np.float64(65.4))`
+    devuelve la cadena `np.float64(65.4)`, que termina embebida en el SQL. Postgres
+    la lee como una llamada a funcion y revienta con
+    `InvalidSchemaName: schema "np" does not exist`.
+
+    Con numpy 1.x el repr era `65.4` y esto pasaba desapercibido; se rompio al
+    actualizar a numpy 2.x. Mismo problema con `np.int64` (repr `np.int64(3)`) y
+    `np.bool_`. Ademas normaliza NaN/NaT/pd.NA a None (-> NULL en SQL).
+    """
+    if v is None:
+        return None
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        f = float(v)
+        return None if pd.isna(f) else f
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    if isinstance(v, np.datetime64):
+        ts = pd.Timestamp(v)
+        return None if pd.isna(ts) else ts.to_pydatetime()
+    if isinstance(v, pd.Timestamp):
+        return None if pd.isna(v) else v.to_pydatetime()
+    if v is pd.NaT or v is pd.NA:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    return v
+
+
+def _clean_params(params):
+    """Aplica to_py() a cada valor de un dict de params (o de una lista de dicts)."""
+    if isinstance(params, dict):
+        return {k: to_py(v) for k, v in params.items()}
+    if isinstance(params, (list, tuple)):
+        if params and isinstance(params[0], dict):
+            return [{k: to_py(v) for k, v in p.items()} for p in params]
+        return type(params)(to_py(v) for v in params)
+    return params
+
+
 def execute_write(sql: str, params: dict) -> None:
-    """Para forms del dashboard (invoice entry). Escribe y commit."""
+    """Para forms del dashboard (invoice entry). Escribe y commit.
+
+    `params` puede ser un dict (1 fila) o una LISTA de dicts: en ese caso corre
+    executemany dentro de UNA sola transaccion, asi que o entran todas las filas o
+    ninguna. Preferir eso a un for con varios execute_write, que deja estado a medio
+    guardar si una fila falla.
+    """
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text("SET LOCAL search_path TO silver, operational, public"))
-        conn.execute(text(sql), params)
+        conn.execute(text(sql), _clean_params(params))
 
 
 def execute_write_returning(sql: str, params: dict):
@@ -119,7 +173,7 @@ def execute_write_returning(sql: str, params: dict):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text("SET LOCAL search_path TO silver, operational, public"))
-        row = conn.execute(text(sql), params).first()
+        row = conn.execute(text(sql), _clean_params(params)).first()
         return row[0] if row else None
 
 
