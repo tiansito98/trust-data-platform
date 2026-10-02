@@ -53,7 +53,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 2
+P_API_REQUERIDA = 3
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -116,8 +116,11 @@ _cap_base = (
     f"{win_end.year}** (los 3 meses cerrados anteriores al mes). Moneda: **{MON}**. Solo "
     "tarifa (cargo T), sin adicionales ni coberturas ni tax.")
 
+# Placas que el presupuesto trata como si no existieran desde cierto mes (se gestionan
+# al final de la pagina). Salen de la flota Y de las tasas; el real no se toca.
+EXCL = P.excluded_plates(target.isoformat())
 base_df_all, factor, plates_all, _rates = P.base_inputs(
-    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat())
+    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat(), EXCL)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
     st.stop()
@@ -163,7 +166,9 @@ st.caption(
     + (" (cierre del mes anterior)." if snap_date == target - dt.timedelta(days=1)
        else " (la más reciente disponible).")
     + (" Mes ya cerrado: el presupuesto se reconstruye con la información que había "
-       "al inicio del mes." if _es_pasado else ""))
+       "al inicio del mes." if _es_pasado else "")
+    + (f" **{len(EXCL)} placas excluidas** para este mes (ver *Placas excluidas del "
+       "presupuesto* al final)." if EXCL else ""))
 try:
     st.page_link("pages/11_Presupuesto_Traslados.py",
                  label="Ver este mes con traslados (carros que cambian de ciudad dentro del mes)")
@@ -445,6 +450,72 @@ with st.expander(f"Ver listado ({len(_pl)} placas)", expanded=False):
                  height=min(600, 38 + 35 * len(_out)))
     xlsx_download_button(_out, file_name=f"presupuesto_placas_{target.isoformat()}",
                          sheet_name="Placas", key="presup_placas_xlsx")
+
+
+# =============================================================================
+# Placas excluidas del presupuesto (gestion)
+# =============================================================================
+section("Placas excluidas del presupuesto")
+st.caption(
+    "Placas que el presupuesto trata **como si no existieran** desde el mes indicado: "
+    "salen de la flota y también de la ocupación y el RPD con que se calcula, en esta "
+    "página y en la de traslados. Es lo mismo que pasa solo cuando Sixt da de baja un "
+    "carro, así que cuando salgan de la flota no cambia nada más. El **real** no se "
+    "toca: lo que hayan rentado sigue contando en el cumplimiento.")
+_ex = P.exclusions_all()
+if len(_ex):
+    _en_flota = set(P.fleet_snapshot(_last_day.isoformat(), win_start.isoformat(),
+                                     win_end.isoformat())["placa"])
+    st.dataframe(pd.DataFrame({
+        "Placa": _ex["placa"].values,
+        "Excluida desde": pd.to_datetime(_ex["desde_mes"]).map(
+            lambda d: P.mes_label(d.date())).values,
+        "Motivo": _ex["motivo"].fillna("").values,
+        "Cargada por": _ex["created_by"].fillna("").values,
+        "Estado": ["En la flota" if p_ in _en_flota else "Ya salió de la flota (baja en Sixt)"
+                   for p_ in _ex["placa"]],
+        "Aplica a este mes": ["Sí" if p_ in EXCL else "No (empieza después)" for p_ in _ex["placa"]],
+    }), hide_index=True, use_container_width=True)
+else:
+    st.caption("No hay placas excluidas.")
+
+with st.expander("Agregar o quitar placas excluidas"):
+    _todas = sorted(P.fleet_snapshot(_last_day.isoformat(), win_start.isoformat(),
+                                     win_end.isoformat())["placa"])
+    _ya = set(_ex["placa"]) if len(_ex) else set()
+    _mopts = P.month_options(today)
+    with st.form("presup_excl_form"):
+        _add = st.multiselect("Placas a excluir", options=[p_ for p_ in _todas if p_ not in _ya])
+        _desde = st.selectbox("Desde el mes", options=_mopts, format_func=P.mes_label,
+                              index=_mopts.index(target) if target in _mopts else 0)
+        _motivo = st.text_input("Motivo", placeholder="p. ej. sale de la flota en noviembre")
+        _quitar = st.multiselect("Placas a volver a contar", options=sorted(_ya))
+        _ok = st.form_submit_button("Guardar exclusiones", type="primary")
+    if _ok:
+        if not _add and not _quitar:
+            st.warning("No elegiste ninguna placa.")
+        else:
+            try:
+                if _add:
+                    execute_write(f"""
+                        INSERT INTO {P.EXCL_TABLE} (placa, desde_mes, motivo, created_by)
+                        VALUES (:p, :d, :m, :u)
+                        ON CONFLICT (placa) DO UPDATE SET desde_mes = EXCLUDED.desde_mes,
+                            motivo = EXCLUDED.motivo, created_by = EXCLUDED.created_by,
+                            created_at = NOW()
+                    """, [{"p": p_, "d": _desde.isoformat(), "m": _motivo.strip() or None,
+                           "u": _u.get("username")} for p_ in _add])
+                if _quitar:
+                    execute_write(f"DELETE FROM {P.EXCL_TABLE} WHERE placa = ANY(:q)",
+                                  {"q": list(_quitar)})
+            except Exception as ex:
+                st.error(f"No se pudieron guardar las exclusiones: {type(ex).__name__}.")
+                st.exception(ex)
+                st.stop()
+            load_query.clear()
+            st.session_state["_presup_msg"] = (
+                f"Exclusiones actualizadas: {len(_add)} agregadas, {len(_quitar)} quitadas.")
+            st.rerun()
 
 
 # =============================================================================

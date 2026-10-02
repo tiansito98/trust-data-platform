@@ -19,6 +19,14 @@ factor estacional = valor del mes objetivo el ano anterior / valor de la misma v
 el ano anterior (tope 0,5-1,5). El de RPD se agrego el 2026-10-02: antes solo se
 ajustaba la ocupacion y la tarifa de temporada baja quedaba sobreestimada (sep-2026:
 factor RPD 0,894 sin aplicar; cumplimiento real 93,5%).
+
+Exclusiones (operational.presupuesto_exclusion_placa): placas que el presupuesto
+trata como si NO HUBIERAN EXISTIDO desde `desde_mes` (decision de negocio
+2026-10-02: carros por salir de la flota o casi sin uso). Para todo mes >=
+desde_mes se sacan de la flota, de la ventana de tasas, del factor estacional y de
+los carro-dias de la pagina de traslados. Es lo mismo que hace gold solo cuando
+Sixt los da de baja (borra su historia), asi que al salir no cambia nada mas. El
+REAL (gold_cargo_dia) no se toca.
 """
 import calendar
 import datetime as dt
@@ -26,7 +34,7 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from .common import load_query
+from .common import load_query, execute_write
 
 # Version del API de este modulo. SUBIRLA cada vez que cambie lo que las paginas
 # esperan (nuevas funciones, nuevas claves en `rates`, etc.) y subir tambien
@@ -34,7 +42,7 @@ from .common import load_query
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 2
+API_VERSION = 3
 
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
@@ -53,6 +61,38 @@ ACRISS_CANON = {"SDAH": "EDAH", "CDMR": "EDMR"}
 MIN_RENTED_CELL = 20
 
 MES_KEY = "presup_mes"   # selector de mes compartido entre las dos paginas
+
+
+EXCL_TABLE = "operational.presupuesto_exclusion_placa"
+
+
+@st.cache_resource
+def ensure_exclusion_table() -> None:
+    execute_write(f"""
+        CREATE TABLE IF NOT EXISTS {EXCL_TABLE} (
+            placa       text PRIMARY KEY,
+            desde_mes   date NOT NULL,
+            motivo      text,
+            created_by  text,
+            created_at  timestamptz DEFAULT now()
+        )
+    """, {})
+
+
+def excluded_plates(target_iso: str) -> tuple:
+    """Placas excluidas para el mes `target_iso` (desde_mes <= mes). Tupla ordenada:
+    se pasa a las funciones cacheadas, asi el cache se invalida si cambia la lista."""
+    ensure_exclusion_table()
+    d = load_query(f"SELECT placa FROM {EXCL_TABLE} WHERE desde_mes <= :m",
+                   {"m": target_iso})
+    return tuple(sorted(d["placa"].astype(str).str.strip().unique())) if len(d) else ()
+
+
+def exclusions_all() -> pd.DataFrame:
+    ensure_exclusion_table()
+    return load_query(f"""
+        SELECT placa, desde_mes, motivo, created_by, created_at
+        FROM {EXCL_TABLE} ORDER BY desde_mes, placa""", {})
 
 
 def grp(sede: str) -> str:
@@ -117,7 +157,7 @@ def snapshot_date(target: dt.date, last_day: dt.date) -> dt.date:
 
 
 @st.cache_data(ttl=600)
-def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str) -> pd.DataFrame:
+def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = ()) -> pd.DataFrame:
     """UNA FILA POR PLACA activa en `as_of` (no conteos): el listado auditable y el
     conteo de flota salen del mismo DataFrame, asi que no pueden diferir.
 
@@ -135,6 +175,7 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str) -> pd.DataFrame
         WITH act AS (
             SELECT DISTINCT ON (g.placa) g.placa, g.acriss, g.sede AS sede_snap
             FROM silver.gold_carro_dia g WHERE g.fecha = CAST(:asof AS date)
+              AND NOT (g.placa = ANY(:ex))
             ORDER BY g.placa, g.rented_day DESC),
         idle AS (
             SELECT DISTINCT ON (g.placa) g.placa, g.sede, g.fecha
@@ -158,7 +199,7 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str) -> pd.DataFrame
         LEFT JOIN idle i ON i.placa = a.placa
         LEFT JOIN rec  r ON r.placa = a.placa
         LEFT JOIN win  w ON w.placa = a.placa
-    """, {"asof": as_of_iso, "a": win_start, "b": win_end})
+    """, {"asof": as_of_iso, "a": win_start, "b": win_end, "ex": list(excl)})
     plates["g"] = plates["sede"].map(grp)
     plates["acriss"] = plates["acriss_sixt"].map(canon)
     return plates
@@ -185,7 +226,8 @@ def cell_rpd(rates: dict, g: str, a: str) -> float:
 
 
 @st.cache_data(ttl=600)
-def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_iso: str):
+def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_iso: str,
+                excl: tuple = ()):
     """Tasas de la ventana + flota de la foto. Devuelve
     (base_df, factor_estacional_ocupacion, plates, rates); base_df = 1 fila por celda
     de la foto con n (placas), occ_base (con factor estacional, tope 98%) y rpd (con
@@ -194,8 +236,9 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
         SELECT sede, acriss, SUM(rented_day) AS rented, COUNT(*) AS fleet_days,
                SUM(tar_{suf}) AS t_val
         FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
+          AND NOT (placa = ANY(:ex))
         GROUP BY sede, acriss
-    """, {"a": win_start, "b": win_end})
+    """, {"a": win_start, "b": win_end, "ex": list(excl)})
     m["g"] = m["sede"].map(grp)
     m["acriss"] = m["acriss"].map(canon)   # los groupby de abajo suman las unidas
     for c in ("rented", "fleet_days", "t_val"):
@@ -241,7 +284,8 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
         FROM silver.gold_carro_dia
         WHERE fecha BETWEEN LEAST(CAST(:wa AS date), CAST(:ta AS date))
                         AND GREATEST(CAST(:wb AS date), CAST(:tb AS date))
-    """, {"ta": tgt_prev_a, "tb": tgt_prev_b, "wa": ws_prev, "wb": we_prev})
+          AND NOT (placa = ANY(:ex))
+    """, {"ta": tgt_prev_a, "tb": tgt_prev_b, "wa": ws_prev, "wb": we_prev, "ex": list(excl)})
     occ_t, occ_w = sf.iloc[0]["occ_tgt"], sf.iloc[0]["occ_win"]
     factor = float(occ_t / occ_w) if pd.notna(occ_t) and pd.notna(occ_w) and occ_w else 1.0
     factor = max(0.5, min(1.5, factor))
@@ -250,7 +294,7 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
     f_rpd = max(0.5, min(1.5, f_rpd))
     rates["f_occ"], rates["f_rpd"] = factor, f_rpd
 
-    plates = fleet_snapshot(as_of_iso, win_start, win_end)
+    plates = fleet_snapshot(as_of_iso, win_start, win_end, excl)
     fleet = plates.groupby(["g", "acriss"], as_index=False).size().rename(columns={"size": "n"})
     rows = []
     for _, fr in fleet.iterrows():
@@ -307,7 +351,7 @@ def scenario_occ(base_df_all, rates, factor, saved_sede, saved_cat, saved_cell):
 
 
 @st.cache_data(ttl=600)
-def daily_rows(desde_iso: str, hasta_iso: str) -> pd.DataFrame:
+def daily_rows(desde_iso: str, hasta_iso: str, excl: tuple = ()) -> pd.DataFrame:
     """gold_carro_dia crudo (placa x dia) en el rango, con ciudad y ACRISS unificado.
     La ciudad del dia es la de gold (`sede`): en un dia rentado es la sede que entrego
     el carro. Es la MISMA atribucion con la que se miden la ocupacion y el RPD, asi que
@@ -315,7 +359,8 @@ def daily_rows(desde_iso: str, hasta_iso: str) -> pd.DataFrame:
     d = load_query("""
         SELECT placa, fecha, sede, acriss, rented_day
         FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
-    """, {"a": desde_iso, "b": hasta_iso})
+          AND NOT (placa = ANY(:ex))
+    """, {"a": desde_iso, "b": hasta_iso, "ex": list(excl)})
     d["fecha"] = pd.to_datetime(d["fecha"]).dt.date
     d["g"] = d["sede"].map(grp)
     d["acriss_sixt"] = d["acriss"]
