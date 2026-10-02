@@ -42,7 +42,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 3
+P_API_REQUERIDA = 4
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -187,8 +187,13 @@ bc = base.groupby("sede").agg(n=("n", "sum"), cd_base=("carro_dias", "sum"), rev
 dc = daily.groupby("g").agg(cd=("placa", "size"), rev=("val", "sum"))
 city = pd.DataFrame(index=ciudades).join(bc).join(dc).fillna(0.0)
 city["delta"] = city["rev"] - city["rev_base"]
+# Ocupacion esperada por ciudad: el MISMO numero que muestra la tabla "Por sede" de
+# Presupuesto (lo guardado, o lo pre-calculado si nadie lo edito).
+_bso = P.wocc(base_df, "sede")
+_occ_city = [saved_sede.get(g, _bso.get(g, 0.0) * 100) for g in city.index]
 out_city = pd.DataFrame({
     "Ciudad": [NICE[g] for g in city.index],
+    "Ocupación esperada (%)": [round(float(v), 1) for v in _occ_city],
     "Flota foto": city["n"].astype(int).values,
     "Carro-días foto": city["cd_base"].astype(int).values,
     "Carro-días con traslados": city["cd"].astype(int).values,
@@ -213,6 +218,8 @@ if len(real_rev) and parcial:
         "sale inflado. Se corrige solo a medida que los contratos cierran; el "
         "cumplimiento aparece cuando el mes termina.")
 st.caption(
+    "**Ocupación esperada** = la misma de la página Presupuesto (lo editado o lo "
+    "pre-calculado); los ajustes por categoría se ven en *Por ciudad × categoría*. "
     "**Flota promedio** = carro-días / días del mes: un carro que estuvo medio mes "
     "suma 0,5. Si un carro pasa a una ciudad con otra ocupación o RPD, el total "
     "cambia, no solo se reparte. **Real** = cargo T de `silver.gold_cargo_dia` hasta el "

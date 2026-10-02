@@ -42,7 +42,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 3
+API_VERSION = 4
 
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
@@ -315,6 +315,42 @@ def saved_overrides(target_iso: str) -> tuple:
         if r["dimension"] in out and pd.notna(r["ocupacion_pct"]):
             out[r["dimension"]][r["clave"]] = float(r["ocupacion_pct"])
     return out["sede"], out["cat"], out["sede_cat"]
+
+
+OCC_COL = "Ocupación esperada (%)"
+_UPSERT_OCC = """
+    INSERT INTO operational.presupuesto_ocupacion
+        (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
+    VALUES (:m, :d, :k, :o, :u, NOW())
+    ON CONFLICT (mes, dimension, clave) DO UPDATE SET ocupacion_pct = EXCLUDED.ocupacion_pct,
+        updated_by = EXCLUDED.updated_by, updated_at = NOW()
+"""
+
+
+def override_rows(edited_rows: dict, claves: list, mes_iso: str, dimension: str,
+                  user: str, keyfn=lambda c: c) -> list:
+    """Filas a guardar a partir del `edited_rows` de un st.data_editor de ocupacion.
+    Solo las filas EDITADAS: lo que nadie toco sigue siendo pre-calculado y acompana
+    los datos de cada refresh. Celda vaciada -> se ignora."""
+    rows = []
+    for ridx, ch in (edited_rows or {}).items():
+        v = ch.get(OCC_COL) if isinstance(ch, dict) else None
+        i = int(ridx)
+        if v is None or i >= len(claves):
+            continue
+        rows.append({"m": mes_iso, "d": dimension, "k": keyfn(claves[i]),
+                     "o": round(float(v), 2), "u": user})
+    return rows
+
+
+def save_overrides(rows: list) -> None:
+    """Guarda la ocupacion esperada editada (una transaccion). La lee la pagina con
+    traslados via saved_overrides()."""
+    if rows:
+        execute_write(_UPSERT_OCC, rows)
+        # load_query esta cacheado y el cache es GLOBAL (todas las sesiones): sin esto
+        # la otra pagina (o otro usuario) seguiria viendo el escenario anterior.
+        load_query.clear()
 
 
 def wocc(df: pd.DataFrame, by: str) -> pd.Series:

@@ -23,7 +23,9 @@ Modelo bottom-up por (sede x categoria ACRISS):
   sola ciudad en alcance, la tabla de categorias es por (sede x ACRISS) y se guarda
   con dimension 'sede_cat' / clave 'GRUPO|ACRISS'; ese override por celda manda
   sobre el ajuste global de la categoria en cualquier alcance.
-- Guardar (operational.presupuesto_ocupacion) / Volver a lo pre-calculado.
+- Cada edicion de ocupacion se GUARDA SOLA (on_change del editor ->
+  operational.presupuesto_ocupacion), asi la pagina con traslados la ve siempre.
+  Volver a lo pre-calculado borra lo guardado.
 - ACRISS unificados SOLO para el presupuesto: SDAH -> EDAH, CDMR -> EDMR (ACRISS_CANON).
 - Listado auditable de las placas que entran al calculo (mismo DataFrame que el
   conteo de flota), con descarga a Excel.
@@ -53,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 3
+P_API_REQUERIDA = 4
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -278,8 +280,31 @@ kpi(sc2, "Base (editado)", fmt_money(tot_rev, MON))
 kpi(sc3, "Optimista (+10%)", fmt_money(_rev_at(1.10), MON))
 
 st.info("Editá la columna **Ocupación esperada (%)** en cualquiera de las dos tablas "
-        "(por sede y por categoría). Los ajustes se **combinan** y el presupuesto "
-        "recalcula al instante. Luego **Guardar** para fijar el escenario.")
+        "(por sede y por categoría). Los ajustes se **combinan**, el presupuesto recalcula "
+        "al instante y **cada cambio se guarda solo**: la página *Presupuesto con "
+        "traslados* usa la misma ocupación. Para deshacer, *Volver a lo pre-calculado*.")
+
+
+def _autosave(key, claves, dimension, keyfn):
+    """on_change de los editores: guarda en la base cada fila editada, en el momento.
+    Antes habia que apretar "Guardar cambios"; si se cambiaba de pagina sin guardar,
+    la edicion se perdia y la pagina con traslados nunca la veia (2026-10-02: tabla
+    de escenarios vacia con ediciones hechas)."""
+    stt = st.session_state.get(key) or {}
+    rows = P.override_rows(stt.get("edited_rows", {}), claves, target.isoformat(),
+                           dimension, _u.get("username"), keyfn)
+    if not rows:
+        return
+    try:
+        P.save_overrides(rows)
+    except Exception as ex:
+        st.session_state["_presup_err"] = f"No se pudo guardar la ocupación: {type(ex).__name__}: {ex}"
+        return
+    load_query.clear()
+    st.session_state["_presup_msg"] = (
+        "Guardado: " + ", ".join(f"{r['k'].replace('|', ' ')} {r['o']:.1f}%".replace(".", ",")
+                                 for r in rows)
+        + ". La página con traslados ya usa estos valores.")
 
 
 # =============================================================================
@@ -298,6 +323,7 @@ sede_ed_df = pd.DataFrame({
 st.data_editor(
     sede_ed_df, hide_index=True, use_container_width=True, key=KEY_SEDE,
     disabled=["Sede", "Flota", "RPD", "Presupuesto"],
+    on_change=_autosave, args=(KEY_SEDE, sedes_present, "sede", lambda c: c),
     column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
         min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
 )
@@ -308,8 +334,8 @@ st.data_editor(
 if SINGLE:
     section(f"Por categoría (ACRISS) — {SEDE_NICE[SCOPE_G]}")
     st.caption(
-        f"Flota, ocupación y RPD **solo de {SEDE_NICE[SCOPE_G]}**. Lo que edites y "
-        "guardes acá queda como la ocupación esperada de esa sede × categoría, y "
+        f"Flota, ocupación y RPD **solo de {SEDE_NICE[SCOPE_G]}**. Lo que edites "
+        "acá queda guardado como la ocupación esperada de esa sede × categoría, y "
         "manda sobre el ajuste global de la categoría. Para volver a la vista "
         "consolidada, limpiá el filtro de sedes del sidebar.")
 else:
@@ -320,7 +346,7 @@ else:
         "más por día que un económico.")
     if sel_grupos:
         st.warning(
-            "Con varias sedes seleccionadas, lo que guardes en esta tabla queda como "
+            "Con varias sedes seleccionadas, lo que edites en esta tabla queda guardado como "
             "ajuste **global** de la categoría (aplica también a las sedes fuera del "
             "filtro). Para guardar una ocupación propia de una sede, seleccioná esa "
             "sola sede en el sidebar.")
@@ -340,53 +366,23 @@ cat_ed_df = pd.DataFrame({
 st.data_editor(
     cat_ed_df, hide_index=True, use_container_width=True, key=KEY_CAT,
     disabled=["Categoría", "Flota", "RPD tarifa", "RevPAU", "Presupuesto"],
+    on_change=_autosave, args=(KEY_CAT, cats_present, CAT_DIM, _catkey),
     column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
         min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
 )
 
 
 # =============================================================================
-# Guardar / Volver a lo pre-calculado
+# Mensajes del guardado automatico / Volver a lo pre-calculado
 # =============================================================================
 _msg = st.session_state.pop("_presup_msg", None)
 if _msg:
     st.success(_msg)
+_err = st.session_state.pop("_presup_err", None)
+if _err:
+    st.error(_err)
 
-c1, c2, _ = st.columns([1.3, 1.6, 3])
-_UPSERT_OCC = """
-    INSERT INTO operational.presupuesto_ocupacion (mes, dimension, clave, ocupacion_pct, updated_by, updated_at)
-    VALUES (:m,:d,:k,:o,:u,NOW())
-    ON CONFLICT (mes,dimension,clave) DO UPDATE SET ocupacion_pct=EXCLUDED.ocupacion_pct,
-        updated_by=EXCLUDED.updated_by, updated_at=NOW()
-"""
-
-if c1.button("Guardar cambios", type="primary"):
-    # UNA sola transaccion (lista de dicts -> executemany): o entra el escenario
-    # completo o no entra nada. Antes era un execute_write por fila y un fallo a
-    # mitad de camino dejaba la mitad del escenario guardado.
-    # float() explicito: los valores vienen de Series de pandas (np.float64) y
-    # psycopg2 los serializa con repr() -> 'np.float64(65.4)' en numpy 2.x, que
-    # Postgres lee como funcion del schema 'np'. common.to_py() ya lo cubre, esto
-    # lo deja evidente en el call site.
-    _usr = _u.get("username")
-    rows = [{"m": target.isoformat(), "d": "sede", "k": s,
-             "o": round(float(occ_sede[s]) * 100, 2), "u": _usr} for s in sedes_present]
-    rows += [{"m": target.isoformat(), "d": CAT_DIM, "k": _catkey(a),
-              "o": round(float(occ_cat[a]) * 100, 2), "u": _usr} for a in cats_present]
-    try:
-        execute_write(_UPSERT_OCC, rows)
-    except Exception as ex:
-        st.error(f"No se pudo guardar el escenario: {type(ex).__name__}. "
-                 "No se guardo nada (la escritura es atomica).")
-        st.exception(ex)
-        st.stop()
-    load_query.clear()
-    # El mensaje va a session_state: st.success() antes de un st.rerun() se pierde
-    # (la pagina se vuelve a pintar de cero y el usuario no ve ninguna confirmacion).
-    st.session_state["_presup_msg"] = (
-        f"Escenario guardado ({SEDE_NICE[SCOPE_G]}): {len(rows)} filas."
-        if SINGLE else f"Escenario guardado: {len(rows)} filas.")
-    st.rerun()
+c2, _ = st.columns([1.6, 4.3])
 if c2.button("Volver a lo pre-calculado"):
     # Con una sede en alcance se borra SOLO lo de esa sede; en consolidado, todo el mes.
     if SINGLE:
