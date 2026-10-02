@@ -39,6 +39,14 @@ from components.filters import render_sidebar_filters
 from components.auth import require_auth, require_page, logout_button, get_current_user
 from components import presupuesto as P
 
+# Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
+# despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
+# modulo cargado es anterior a lo que esta pagina necesita, se recarga.
+P_API_REQUERIDA = 2
+if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
+    import importlib
+    P = importlib.reload(P)
+
 st.set_page_config(page_title="TRUST - Presupuesto con traslados", layout="wide")
 require_auth()
 require_page("11_Presupuesto_Traslados")

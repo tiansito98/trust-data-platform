@@ -53,6 +53,8 @@ streamlit run dashboard_v2/app.py
 
 Production dashboard: hosted on Streamlit Community Cloud, auto-deploys from `main` on push. Data lives in Supabase — no local files needed in prod.
 
+**Gotcha de deploy (2026-10-02):** tras un push, Streamlit Cloud recarga las páginas pero puede seguir sirviendo la versión VIEJA de un módulo de `components/` ya importado (queda en `sys.modules`). Página nueva + módulo viejo = `KeyError`/`AttributeError` que en local no se reproduce. Arreglo inmediato: *Manage app → Reboot app*. Prevención: `components/presupuesto.py` tiene `API_VERSION` y las páginas 10/11 lo recargan si es menor a `P_API_REQUERIDA` — **subir ambos números** cuando cambie lo que las páginas esperan del módulo.
+
 ## Architecture
 
 ```

@@ -28,6 +28,14 @@ import streamlit as st
 
 from .common import load_query
 
+# Version del API de este modulo. SUBIRLA cada vez que cambie lo que las paginas
+# esperan (nuevas funciones, nuevas claves en `rates`, etc.) y subir tambien
+# P_API_REQUERIDA en las paginas. Motivo: tras un push, Streamlit Cloud recarga la
+# pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
+# nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
+# la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
+API_VERSION = 2
+
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
              "BUCARAMANGA": "Bucaramanga", "PEREIRA": "Pereira"}
