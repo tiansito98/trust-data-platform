@@ -23,7 +23,11 @@ Modelo bottom-up por (sede x categoria ACRISS):
   con dimension 'sede_cat' / clave 'GRUPO|ACRISS'; ese override por celda manda
   sobre el ajuste global de la categoria en cualquier alcance.
 - Guardar (operational.presupuesto_ocupacion) / Volver a lo pre-calculado.
-- Comparacion contra el mismo mes del ano anterior (delta).
+- ACRISS unificados SOLO para el presupuesto: SDAH -> EDAH, CDMR -> EDMR (ACRISS_CANON).
+- Listado auditable de las placas que entran al calculo (mismo DataFrame que el
+  conteo de flota), con descarga a Excel.
+- Comparacion contra el mismo mes del ano anterior (delta). El "Real" sale de
+  gold_cargo_dia codigo T (no de gold_carro_dia, que pierde los carros defleeteados).
 """
 import sys
 import calendar
@@ -36,7 +40,7 @@ import streamlit as st
 
 from components.common import (
     inject_styles, render_header, section, kpi, fmt_money, fmt_int,
-    load_query, execute_write,
+    load_query, execute_write, xlsx_download_button,
 )
 from components.filters import render_sidebar_filters
 from components.auth import require_auth, require_page, logout_button, get_current_user
@@ -108,6 +112,14 @@ SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
              "BUCARAMANGA": "Bucaramanga", "PEREIRA": "Pereira"}
 NICE_TO_GRP = {v: k for k, v in SEDE_NICE.items()}
+# Categorias que el presupuesto trata como UNA sola (decision de negocio 2026-10-02):
+# en la operacion son el mismo producto y por separado partian la flota en celdas
+# demasiado chicas para tener ocupacion/RPD estables. Aplica SOLO al presupuesto;
+# el resto del dashboard sigue mostrando el ACRISS de Sixt. SDMR queda aparte.
+ACRISS_CANON = {"SDAH": "EDAH", "CDMR": "EDMR"}
+def _canon(a: str) -> str:
+    return ACRISS_CANON.get(a, a)
+
 def _grp(sede: str) -> str:
     u = (sede or "").upper()
     for k in SEDE_ORDER:
@@ -128,6 +140,7 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
         GROUP BY sede, acriss
     """, {"a": win_start, "b": win_end})
     m["g"] = m["sede"].map(_grp)
+    m["acriss"] = m["acriss"].map(_canon)   # los groupby de abajo suman las unidas
     for c in ("rented", "fleet_days", "t_val"):
         m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0.0)
 
@@ -152,22 +165,41 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
     # dia del snapshot si la placa lleva toda la ventana en renta. Ojo: NO usar la sede
     # modal de los ultimos 30 dias -- promedia y tarda ~15 dias en registrar un traslado
     # (validado: NPM554 Medellin->Bucaramanga el 20-sep seguia contando en Medellin).
-    fl = load_query("""
+    #
+    # La query devuelve UNA FILA POR PLACA (no conteos): el listado auditable de la
+    # pagina y el conteo de flota salen del mismo DataFrame, asi que no pueden
+    # diferir. DISTINCT ON (placa) es una proteccion: hoy gold_carro_dia es unico por
+    # (placa, fecha), pero si algun dia no lo fuera la placa seguiria contando 1.
+    plates = load_query("""
         WITH last AS (SELECT MAX(fecha) AS f FROM silver.gold_carro_dia),
         act AS (
-            SELECT DISTINCT g.placa, g.acriss, g.sede AS sede_snap
-            FROM silver.gold_carro_dia g, last WHERE g.fecha = last.f),
+            SELECT DISTINCT ON (g.placa) g.placa, g.acriss, g.sede AS sede_snap
+            FROM silver.gold_carro_dia g, last WHERE g.fecha = last.f
+            ORDER BY g.placa, g.rented_day DESC),
         idle AS (
-            SELECT DISTINCT ON (g.placa) g.placa, g.sede
+            SELECT DISTINCT ON (g.placa) g.placa, g.sede, g.fecha
             FROM silver.gold_carro_dia g, last
             WHERE g.rented_day = 0 AND g.fecha > last.f - 120
-            ORDER BY g.placa, g.fecha DESC)
-        SELECT COALESCE(i.sede, a.sede_snap) AS sede, a.acriss, COUNT(*) AS n
-        FROM act a LEFT JOIN idle i ON i.placa = a.placa
-        GROUP BY 1, a.acriss
-    """, {})
-    fl["g"] = fl["sede"].map(_grp)
-    fleet = fl.groupby(["g", "acriss"], as_index=False)["n"].sum()
+            ORDER BY g.placa, g.fecha DESC),
+        rec AS (
+            SELECT g.placa, MAX(g.fecha) FILTER (WHERE g.rented_day = 1) AS ult_renta
+            FROM silver.gold_carro_dia g, last
+            WHERE g.fecha > last.f - 120 GROUP BY g.placa),
+        win AS (
+            SELECT placa, SUM(rented_day) AS dias_rentados, COUNT(*) AS dias_flota
+            FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b GROUP BY placa)
+        SELECT a.placa, COALESCE(i.sede, a.sede_snap) AS sede, a.acriss AS acriss_sixt,
+               i.fecha AS ult_dia_libre, r.ult_renta,
+               COALESCE(w.dias_rentados, 0) AS dias_rentados,
+               COALESCE(w.dias_flota, 0) AS dias_flota
+        FROM act a
+        LEFT JOIN idle i ON i.placa = a.placa
+        LEFT JOIN rec  r ON r.placa = a.placa
+        LEFT JOIN win  w ON w.placa = a.placa
+    """, {"a": win_start, "b": win_end})
+    plates["g"] = plates["sede"].map(_grp)
+    plates["acriss"] = plates["acriss_sixt"].map(_canon)
+    fleet = plates.groupby(["g", "acriss"], as_index=False).size().rename(columns={"size": "n"})
     snap = load_query("SELECT MAX(fecha) AS f FROM silver.gold_carro_dia", {})
     snap_date = snap.iloc[0]["f"] if not snap.empty else None
 
@@ -214,9 +246,9 @@ def _base_inputs(win_start: str, win_end: str, target_iso: str, suf: str):
         rpd = float(rpd) if pd.notna(rpd) else rpd_glob_win
         rows.append({"sede": g, "acriss": a, "n": n,
                      "occ_base": min(occ * factor, 0.98), "rpd": rpd})
-    return pd.DataFrame(rows), factor, snap_date
+    return pd.DataFrame(rows), factor, snap_date, plates
 
-base_df_all, factor, snap_date = _base_inputs(win_start.isoformat(), win_end.isoformat(),
+base_df_all, factor, snap_date, plates_all = _base_inputs(win_start.isoformat(), win_end.isoformat(),
                                               target.isoformat(), SUF)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
@@ -503,15 +535,66 @@ if c2.button("Volver a lo pre-calculado"):
 
 
 # =============================================================================
+# Placas en el calculo (auditable)
+# =============================================================================
+# Mismo DataFrame del que sale el conteo de flota, asi que la cantidad de filas por
+# ciudad x categoria es EXACTAMENTE la columna Flota de las tablas de arriba.
+_pl = plates_all[plates_all["g"].isin(sedes_present)].copy()
+_pl["_o"] = _pl["g"].map({s: i for i, s in enumerate(SEDE_ORDER)})
+_pl = _pl.sort_values(["_o", "acriss", "acriss_sixt", "placa"])
+_pl["occ_win"] = _pl["dias_rentados"] / _pl["dias_flota"].replace(0, pd.NA)
+section("Placas en el cálculo")
+st.caption(
+    f"Las **{len(_pl)} placas** con las que se calcula la flota del presupuesto "
+    f"(padrón activo al {snap_date}), por ciudad × categoría. **ACRISS Sixt** es la "
+    "categoría original; **Categoría** es la del presupuesto (SDAH se cuenta como "
+    "EDAH y CDMR como EDMR). La ciudad sale del último día libre de la placa. "
+    f"Días rentados / en flota: ventana {_MES_ES[win_start.month]}–"
+    f"{_MES_ES[win_end.month]} {win_end.year} (0 = la placa entró después).")
+with st.expander(f"Ver listado ({len(_pl)} placas)", expanded=False):
+    _res = (_pl.groupby(["g", "acriss"]).size().rename("Placas").reset_index()
+            .assign(Ciudad=lambda x: x["g"].map(SEDE_NICE))
+            .pivot_table(index="acriss", columns="Ciudad", values="Placas",
+                         aggfunc="sum", fill_value=0))
+    _res = _res[[SEDE_NICE[s] for s in sedes_present if SEDE_NICE[s] in _res.columns]]
+    _res["Total"] = _res.sum(axis=1)
+    st.markdown("**Resumen: placas por categoría × ciudad**")
+    st.dataframe(_res.rename_axis("Categoría").reset_index(),
+                 hide_index=True, use_container_width=True)
+    _out = pd.DataFrame({
+        "Ciudad": _pl["g"].map(SEDE_NICE),
+        "Categoría": _pl["acriss"],
+        "ACRISS Sixt": _pl["acriss_sixt"],
+        "Placa": _pl["placa"],
+        "Sede": _pl["sede"],
+        "Último día libre": _pl["ult_dia_libre"],
+        "Última renta": _pl["ult_renta"],
+        "Días rentados (ventana)": _pl["dias_rentados"].astype(int),
+        "Días en flota (ventana)": _pl["dias_flota"].astype(int),
+        "Ocupación ventana (%)": (_pl["occ_win"] * 100).astype(float).round(1),
+    })
+    st.dataframe(_out, hide_index=True, use_container_width=True,
+                 height=min(600, 38 + 35 * len(_out)))
+    xlsx_download_button(_out, file_name=f"presupuesto_placas_{target.isoformat()}",
+                         sheet_name="Placas", key="presup_placas_xlsx")
+
+
+# =============================================================================
 # Comparacion vs el mismo mes del ano anterior (delta)
 # =============================================================================
 py = target.year - 1
 section(f"Comparación vs {_MES_ES[target.month]} {py}")
 prev_a = dt.date(py, target.month, 1)
 prev_b = dt.date(py, target.month, calendar.monthrange(py, target.month)[1])
+# Fuente: gold_cargo_dia codigo T (la misma que el desglose de Analitica), NO
+# gold_carro_dia.tar_. gold_carro_dia solo trae placas del roster ACTIVO de hoy, asi
+# que el ingreso de los carros que salieron de la flota desaparece del pasado: la
+# brecha crece con la antiguedad (carro/cargo = 99,7% en 2026, 95% en 2025, 85% en
+# sep-2024) y subestimaba el "Real" del ano anterior. Ej. Bogota sep-2025:
+# 19.768,28 (carro_dia) vs 20.327,60 (cargo_dia) USD.
 prev = load_query(f"""
-    SELECT sede, SUM(tar_{SUF}) AS t_val FROM silver.gold_carro_dia
-    WHERE fecha BETWEEN :a AND :b GROUP BY sede
+    SELECT sede, SUM(subtotal_{SUF}) AS t_val FROM silver.gold_cargo_dia
+    WHERE fecha BETWEEN :a AND :b AND cargo_codigo = 'T' GROUP BY sede
 """, {"a": prev_a.isoformat(), "b": prev_b.isoformat()})
 prev["t_val"] = pd.to_numeric(prev["t_val"], errors="coerce").fillna(0.0)
 prev["g"] = prev["sede"].map(_grp)
@@ -536,6 +619,12 @@ else:
         f"Real {py}": comp["real_prev"].map(lambda v: fmt_money(v, MON)),
         "Delta": comp["delta"].map(lambda v: f"{v*100:+.1f}%" if pd.notna(v) else "nuevo"),
     }), hide_index=True, use_container_width=True)
+    st.caption(
+        f"**Real {_MES_ES[target.month]} {py}** = cargo T de "
+        "`silver.gold_cargo_dia` (todos los contratos, incluidos los carros que ya "
+        "salieron de la flota), el mismo número que el desglose por código de "
+        f"Analítica para {_MES_ES[target.month]} {py}. Ojo: es una transformación de "
+        "la capa silver y puede tener diferencias con COBRA; se va revisando.")
 
 st.caption(
     "Presupuesto = flota × días × ocupación esperada × RPD de tarifa (solo cargo T). "
