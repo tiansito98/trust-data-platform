@@ -13,6 +13,12 @@ Modelo por (ciudad x categoria ACRISS):
 
 Las tasas (ocupacion y RPD) y los escenarios guardados son los MISMOS en las dos
 paginas: la unica diferencia es como se cuentan los carro-dias.
+
+Estacionalidad: ocupacion Y RPD de la ventana reciente se multiplican cada uno por su
+factor estacional = valor del mes objetivo el ano anterior / valor de la misma ventana
+el ano anterior (tope 0,5-1,5). El de RPD se agrego el 2026-10-02: antes solo se
+ajustaba la ocupacion y la tarifa de temporada baja quedaba sobreestimada (sep-2026:
+factor RPD 0,894 sin aplicar; cumplimiento real 93,5%).
 """
 import calendar
 import datetime as dt
@@ -164,11 +170,18 @@ def rate_lookup(rates: dict, g: str, a: str) -> tuple:
     return occ, rpd
 
 
+def cell_rpd(rates: dict, g: str, a: str) -> float:
+    """RPD de tarifa de la celda YA con el factor estacional de RPD. Usar siempre este
+    (no rate_lookup()[1]) para presupuestar."""
+    return rate_lookup(rates, g, a)[1] * rates["f_rpd"]
+
+
 @st.cache_data(ttl=600)
 def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_iso: str):
     """Tasas de la ventana + flota de la foto. Devuelve
-    (base_df, factor_estacional, plates, rates); base_df = 1 fila por celda de la foto
-    con n (placas), occ_base (con factor estacional, tope 98%) y rpd."""
+    (base_df, factor_estacional_ocupacion, plates, rates); base_df = 1 fila por celda
+    de la foto con n (placas), occ_base (con factor estacional, tope 98%) y rpd (con
+    factor estacional de RPD). rates["f_occ"] / rates["f_rpd"] = los dos factores."""
     m = load_query(f"""
         SELECT sede, acriss, SUM(rented_day) AS rented, COUNT(*) AS fleet_days,
                SUM(tar_{suf}) AS t_val
@@ -196,7 +209,10 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
         "rpd_glob": float(m["t_val"].sum() / m["rented"].sum()) if m["rented"].sum() else 0.0,
     }
 
-    # factor estacional del mes objetivo (ano anterior): occ(mes) / occ(ventana)
+    # factores estacionales del mes objetivo (ano anterior): valor(mes) / valor(ventana),
+    # uno para ocupacion y otro para RPD. El de RPD SIEMPRE en USD, aunque se presupueste
+    # en COP: en COP el cociente mezclaria la temporada con la variacion de la TRM entre
+    # los dos periodos. El factor es una razon, asi que aplica igual al RPD en COP.
     ty, tm = int(target_iso[:4]), int(target_iso[5:7])
     py = ty - 1
     ws, we = dt.date.fromisoformat(win_start), dt.date.fromisoformat(win_end)
@@ -209,7 +225,11 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
           SUM(rented_day) FILTER (WHERE fecha BETWEEN :ta AND :tb)::float
             / NULLIF(COUNT(*) FILTER (WHERE fecha BETWEEN :ta AND :tb),0) AS occ_tgt,
           SUM(rented_day) FILTER (WHERE fecha BETWEEN :wa AND :wb)::float
-            / NULLIF(COUNT(*) FILTER (WHERE fecha BETWEEN :wa AND :wb),0) AS occ_win
+            / NULLIF(COUNT(*) FILTER (WHERE fecha BETWEEN :wa AND :wb),0) AS occ_win,
+          SUM(tar_usd) FILTER (WHERE fecha BETWEEN :ta AND :tb)::float
+            / NULLIF(SUM(rented_day) FILTER (WHERE fecha BETWEEN :ta AND :tb),0) AS rpd_tgt,
+          SUM(tar_usd) FILTER (WHERE fecha BETWEEN :wa AND :wb)::float
+            / NULLIF(SUM(rented_day) FILTER (WHERE fecha BETWEEN :wa AND :wb),0) AS rpd_win
         FROM silver.gold_carro_dia
         WHERE fecha BETWEEN LEAST(CAST(:wa AS date), CAST(:ta AS date))
                         AND GREATEST(CAST(:wb AS date), CAST(:tb AS date))
@@ -217,14 +237,19 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
     occ_t, occ_w = sf.iloc[0]["occ_tgt"], sf.iloc[0]["occ_win"]
     factor = float(occ_t / occ_w) if pd.notna(occ_t) and pd.notna(occ_w) and occ_w else 1.0
     factor = max(0.5, min(1.5, factor))
+    rpd_t, rpd_w = sf.iloc[0]["rpd_tgt"], sf.iloc[0]["rpd_win"]
+    f_rpd = float(rpd_t / rpd_w) if pd.notna(rpd_t) and pd.notna(rpd_w) and rpd_w else 1.0
+    f_rpd = max(0.5, min(1.5, f_rpd))
+    rates["f_occ"], rates["f_rpd"] = factor, f_rpd
 
     plates = fleet_snapshot(as_of_iso, win_start, win_end)
     fleet = plates.groupby(["g", "acriss"], as_index=False).size().rename(columns={"size": "n"})
     rows = []
     for _, fr in fleet.iterrows():
-        occ, rpd = rate_lookup(rates, fr["g"], fr["acriss"])
+        occ, _ = rate_lookup(rates, fr["g"], fr["acriss"])
         rows.append({"sede": fr["g"], "acriss": fr["acriss"], "n": int(fr["n"]),
-                     "occ_base": min(occ * factor, 0.98), "rpd": rpd})
+                     "occ_base": min(occ * factor, 0.98),
+                     "rpd": cell_rpd(rates, fr["g"], fr["acriss"])})
     return pd.DataFrame(rows), factor, plates, rates
 
 

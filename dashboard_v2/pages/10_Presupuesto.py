@@ -14,8 +14,9 @@ Modelo bottom-up por (sede x categoria ACRISS):
   cierre de la ventana contaba 0 y la flota solo crecia con ~2 meses de retraso.
   La sede de cada placa sale de su ULTIMO DIA LIBRE, asi que un TRASLADO entre
   ciudades mueve la flota el mismo dia (la sede modal de 30 dias tardaba ~15).
-- Ocupacion base y RPD: run-rate 3 meses completos x factor estacional (mes objetivo
-  vs ese mismo mes el ano anterior). Son tasas; lo que multiplica es la flota de hoy.
+- Ocupacion base y RPD: run-rate 3 meses completos, cada uno x SU factor estacional
+  (mes objetivo / misma ventana, ambos del ano anterior; el de RPD en USD, desde
+  2026-10-02). Son tasas; lo que multiplica es la flota.
 - La ocupacion esperada se puede editar POR SEDE y POR CATEGORIA; ambos ajustes se
   combinan (multiplican) sobre la base.
 - La pagina respeta el FILTRO DE SEDES del sidebar (agrupado por ciudad). Con una
@@ -506,7 +507,9 @@ else:
 
 st.caption(
     "Presupuesto = flota × días × ocupación esperada × RPD de tarifa (solo cargo T). "
-    f"Factor estacional {factor:.2f} vs {_MES_ES[target.month]} {py}. La **flota** es "
+    f"Factores estacionales vs {_MES_ES[target.month]} {py}: ocupación "
+    f"**{_rates['f_occ']:.3f}** y RPD **{_rates['f_rpd']:.3f}** (mes del año anterior ÷ "
+    "esos mismos 3 meses del año anterior; el de RPD se calcula en USD). La **flota** es "
     f"la foto del padrón al {snap_date} y se usa entera los {DAYS} días; los carros que "
     "cambian de ciudad DENTRO del mes se ven en la página **Presupuesto con traslados**. "
     "La **ocupación** y el **RPD** son tasas de la ventana de 3 meses. Fuente: "

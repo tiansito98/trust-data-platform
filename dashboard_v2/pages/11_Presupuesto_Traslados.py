@@ -103,7 +103,7 @@ daily = daily_all[(daily_all["fecha"] >= mstart) & (daily_all["fecha"] <= mend)]
 # Valor esperado de cada carro-dia en su ciudad x categoria = ocupacion x RPD.
 _cells = daily[["g", "acriss"]].drop_duplicates()
 _cells["occ"] = [occ_final(g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
-_cells["rpd"] = [P.rate_lookup(rates, g, a)[1] for g, a in zip(_cells["g"], _cells["acriss"])]
+_cells["rpd"] = [P.cell_rpd(rates, g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
 daily = daily.merge(_cells, on=["g", "acriss"], how="left")
 daily["val"] = daily["occ"] * daily["rpd"]
 
@@ -309,6 +309,7 @@ else:
 
 st.caption(
     "Presupuesto con traslados = suma, día por día, de los carros en cada ciudad × "
-    "categoría por su ocupación esperada × RPD de tarifa. Ocupación, RPD, factor "
-    f"estacional ({factor:.2f}) y escenario guardado son los de la página Presupuesto. "
+    "categoría por su ocupación esperada × RPD de tarifa. Ocupación, RPD, factores "
+    f"estacionales (ocupación {rates['f_occ']:.3f}, RPD {rates['f_rpd']:.3f}) y escenario "
+    "guardado son los de la página Presupuesto. "
     "Fuente: silver.gold_carro_dia; real: silver.gold_cargo_dia.")
