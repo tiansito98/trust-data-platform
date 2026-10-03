@@ -214,7 +214,7 @@ When the burst budget is exhausted, the DB falls back to baseline 87 Mbps. The d
 
 - **Run pipelines on a schedule** (06:00 + 20:00 COT recommended for 2/day, or 06/13/20 for 3/day)
 - **Avoid manual runs during business hours** (08:00-18:00 COT) unless necessary
-- **If pipeline runs > 20 minutes, kill it and restart** — Supabase pooler/network blips can leave it stuck; the watermark system makes restarts cheap
+- **If pipeline runs > 28 minutes, kill it and restart** — Supabase pooler/network blips can leave it stuck; the watermark system makes restarts cheap. El watchdog de la VM corta a los 1680s (`PIPELINE_TIMEOUT_SEC`); era 1200s hasta el 2026-10-03, cuando cortó una corrida sana porque Redshift estaba lento (bronze 1.192s; lo normal es 513-823s, silver ~120s en la VM). Debe quedar por debajo de `TimeoutStartSec=1800` del servicio systemd.
 - **Never retry a failed pipeline immediately** — investigate first, otherwise you double the IO cost
 - **Don't combine pipeline + heavy ad-hoc analysis on the same day** — that's how budget gets depleted
 

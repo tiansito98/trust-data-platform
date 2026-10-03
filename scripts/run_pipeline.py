@@ -67,11 +67,18 @@ def materialize_ssh_key_if_needed() -> None:
 
 def arm_watchdog() -> None:
     """
-    Backstop de tiempo: si la corrida excede PIPELINE_TIMEOUT_SEC (default 1200s
-    = 20 min), lanza TimeoutError para abortar. Evita corridas colgadas por blips
+    Backstop de tiempo: si la corrida excede PIPELINE_TIMEOUT_SEC (default 1680s
+    = 28 min), lanza TimeoutError para abortar. Evita corridas colgadas por blips
     del pooler/SSH. Solo Unix (SIGALRM); en Windows (corridas manuales) se omite.
+
+    Por que 28 min (antes 20): el 2026-10-03 el watchdog corto una corrida SANA. Bronze
+    no estaba colgado, Redshift estaba lento: 1.192s solo en bronze (partners 165s vs
+    15s el dia anterior) y se mato en la tabla 20/20. Bronze normal: 513-823s; silver
+    en la VM ~120s; corridas OK de fines de sep: 638-1.039s. Tiene que quedar POR
+    DEBAJO del TimeoutStartSec=1800 del servicio systemd (deploy/trust-pipeline.service),
+    para que el watchdog aborte limpio (log + alerta) antes de que systemd lo mate.
     """
-    timeout = int(os.getenv("PIPELINE_TIMEOUT_SEC", "1200"))
+    timeout = int(os.getenv("PIPELINE_TIMEOUT_SEC", "1680"))
     if timeout <= 0 or not hasattr(signal, "SIGALRM"):
         return
 
