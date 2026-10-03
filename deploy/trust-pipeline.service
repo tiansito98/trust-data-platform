@@ -12,8 +12,9 @@ User=trust
 Group=trust
 WorkingDirectory=/home/trust/trust-data-platform
 ExecStart=/home/trust/trust-data-platform/scripts/run_vm.sh
-# Respaldo duro: el watchdog interno (SIGALRM, PIPELINE_TIMEOUT_SEC=1200s) ya
-# mata corridas colgadas; esto es el cinturon por si el proceso se cuelga antes.
+# Respaldo duro: el watchdog interno (SIGALRM, PIPELINE_TIMEOUT_SEC=1680s desde
+# 2026-10-03; antes 1200s) ya mata corridas colgadas; esto es el cinturon por si el
+# proceso se cuelga antes. El watchdog TIENE que quedar por debajo de este valor.
 TimeoutStartSec=1800
 # No reintentar en caliente: un retry inmediato duplica el consumo de IO de
 # Supabase (ver CLAUDE.md). La siguiente corrida del timer se encarga.
