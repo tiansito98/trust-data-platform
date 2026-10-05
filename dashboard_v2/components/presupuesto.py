@@ -46,7 +46,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 5
+API_VERSION = 6
 
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
@@ -65,6 +65,15 @@ ACRISS_CANON = {"SDAH": "EDAH", "CDMR": "EDMR"}
 MIN_RENTED_CELL = 20
 
 MES_KEY = "presup_mes"   # selector de mes compartido entre las dos paginas
+
+# Escenarios del presupuesto: multiplicador sobre la ocupacion esperada (tope 98%).
+# UNICA definicion: la usan Presupuesto y Presupuesto con traslados, asi los dos
+# muestran exactamente los mismos escenarios. (clave, etiqueta, multiplicador)
+ESCENARIOS = (
+    ("conservador", "Conservador (−10%)", 0.90),
+    ("base",        "Base (editado)",     1.00),
+    ("optimista",   "Optimista (+10%)",   1.10),
+)
 
 
 EXCL_TABLE = "operational.presupuesto_exclusion_placa"
@@ -433,7 +442,10 @@ def scenario_occ(base_df_all, rates, factor, saved_sede, saved_cat, saved_cell):
     cell_occ = base_df_all.set_index(["sede", "acriss"])["occ_base"].to_dict()
     fs = {g: (v / 100.0) / bso[g] for g, v in saved_sede.items() if bso.get(g, 0)}
 
-    def occ_final(g, a):
+    def occ_final(g, a, mult=1.0):
+        """Ocupacion del escenario guardado para la celda; `mult` = multiplicador del
+        escenario (ESCENARIOS). El tope de 98% se aplica DESPUES del multiplicador,
+        igual que en 10_Presupuesto."""
         ob = cell_occ.get((g, a))
         if ob is None:
             ob = min(rate_lookup(rates, g, a)[0] * factor, 0.98)
@@ -444,7 +456,7 @@ def scenario_occ(base_df_all, rates, factor, saved_sede, saved_cat, saved_cell):
             fc = (saved_cat[a] / 100.0) / bco[a]
         else:
             fc = 1.0
-        return min(ob * fs.get(g, 1.0) * fc, 0.98)
+        return min(ob * fs.get(g, 1.0) * fc * mult, 0.98)
     return occ_final
 
 

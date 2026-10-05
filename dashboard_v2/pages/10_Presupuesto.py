@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 5
+P_API_REQUERIDA = 6
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -276,10 +276,11 @@ def _rev_at(mult):
     occ = (df["occ_base"] * df["fs"] * df["fc"] * mult).clip(upper=0.98)
     return (df["n"] * DAYS * occ * df["rpd"]).sum()
 section("Escenarios (± ocupación)")
-sc1, sc2, sc3 = st.columns(3)
-kpi(sc1, "Conservador (−10%)", fmt_money(_rev_at(0.90), MON))
-kpi(sc2, "Base (editado)", fmt_money(tot_rev, MON))
-kpi(sc3, "Optimista (+10%)", fmt_money(_rev_at(1.10), MON))
+# Mismos escenarios que Presupuesto con traslados (definidos en P.ESCENARIOS).
+for _col, (_k, _lbl, _m) in zip(st.columns(len(P.ESCENARIOS)), P.ESCENARIOS):
+    kpi(_col, _lbl, fmt_money(tot_rev if _m == 1.0 else _rev_at(_m), MON))
+st.caption("Los mismos escenarios, con los carros que se movieron de ciudad durante el "
+           "mes, están en **Presupuesto con traslados**.")
 
 st.info("Editá la columna **Ocupación esperada (%)** en cualquiera de las dos tablas "
         "(por sede y por categoría). Los ajustes se **combinan**, el presupuesto recalcula "

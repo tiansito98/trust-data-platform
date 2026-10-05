@@ -42,7 +42,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 5
+P_API_REQUERIDA = 6
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -117,14 +117,22 @@ daily = daily_all[(daily_all["fecha"] >= mstart) & (daily_all["fecha"] <= mend)]
 _cells = daily[["g", "acriss"]].drop_duplicates()
 _cells["occ"] = [occ_final(g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
 _cells["rpd"] = [P.cell_rpd(rates, g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
+# una ocupacion por escenario (Conservador / Base / Optimista), misma regla que Presupuesto
+for _k, _lbl, _m in P.ESCENARIOS:
+    _cells[f"occ_{_k}"] = [occ_final(g, a, _m) for g, a in zip(_cells["g"], _cells["acriss"])]
 daily = daily.merge(_cells, on=["g", "acriss"], how="left")
 daily["val"] = daily["occ"] * daily["rpd"]
+for _k, _lbl, _m in P.ESCENARIOS:
+    daily[f"val_{_k}"] = daily[f"occ_{_k}"] * daily["rpd"]
 
 # Base = 10_Presupuesto: flota de la foto x todos los dias del mes.
 base = base_df.copy()
 base["occ"] = [occ_final(g, a) for g, a in zip(base["sede"], base["acriss"])]
 base["carro_dias"] = base["n"] * DAYS
 base["rev"] = base["carro_dias"] * base["occ"] * base["rpd"]
+for _k, _lbl, _m in P.ESCENARIOS:
+    base[f"rev_{_k}"] = base["carro_dias"] * [
+        occ_final(g, a, _m) for g, a in zip(base["sede"], base["acriss"])] * base["rpd"]
 
 # --- alcance: filtro de sedes del sidebar (agrupado por ciudad) ---
 sel = {P.grp(n) for n in (filtros.sedes_nombres or [])} - {"OTRA"}
@@ -182,6 +190,43 @@ if len(real_rev):
         else f"{_rr / _pc * 100:.1f}% del presupuesto con traslados" if _pc else "")
 else:
     kpi(k4, "Real", "-", "el mes todavía no empezó")
+
+
+# =============================================================================
+# Escenarios (mismos de Presupuesto, sobre los carro-dias con traslados)
+# =============================================================================
+section("Escenarios (± ocupación)")
+st.caption(
+    "Los mismos escenarios de la página Presupuesto (la ocupación esperada × "
+    "multiplicador, tope 98%), pero calculados con los carro-días reales de cada "
+    "ciudad. Debajo de cada uno, el valor con la foto: es el número que muestra "
+    "Presupuesto para ese escenario.")
+for _col, (_k, _lbl, _m) in zip(st.columns(len(P.ESCENARIOS)), P.ESCENARIOS):
+    _tt = float(daily[f"val_{_k}"].sum())
+    _tb = float(base[f"rev_{_k}"].sum())
+    _sub = f"foto: {fmt_money(_tb, MON)}"
+    if len(real_rev) and not parcial:
+        _pc_k = float(daily.loc[daily["fecha"] <= cut, f"val_{_k}"].sum())
+        _sub += f" · real = {float(real_rev.sum()) / _pc_k * 100:.1f}% de este escenario" if _pc_k else ""
+    kpi(_col, _lbl, fmt_money(_tt, MON), _sub)
+
+_esc_city = pd.DataFrame(index=ciudades)
+for _k, _lbl, _m in P.ESCENARIOS:
+    _esc_city[_lbl] = daily.groupby("g")[f"val_{_k}"].sum()
+_esc_city = _esc_city.fillna(0.0)
+_out_esc = pd.DataFrame({"Ciudad": [NICE[g] for g in _esc_city.index]})
+for _k, _lbl, _m in P.ESCENARIOS:
+    _out_esc[_lbl] = [fmt_money(v, MON) for v in _esc_city[_lbl]]
+if len(real_rev) and not parcial:
+    _rr_c = [float(real_rev.get(g, 0.0)) for g in _esc_city.index]
+    _out_esc[f"Real {MES[target.month]}"] = [fmt_money(v, MON) for v in _rr_c]
+    for _k, _lbl, _m in P.ESCENARIOS:
+        _pc_c = daily[daily["fecha"] <= cut].groupby("g")[f"val_{_k}"].sum()
+        _out_esc[f"Cumpl. {_lbl.split(' ')[0].lower()}"] = [
+            f"{r / _pc_c.get(g, 0.0) * 100:.1f}%" if _pc_c.get(g, 0.0) else "-"
+            for r, g in zip(_rr_c, _esc_city.index)]
+st.markdown("**Escenarios por ciudad (con traslados)**")
+st.dataframe(_out_esc, hide_index=True, use_container_width=True)
 
 # =============================================================================
 # Por ciudad
