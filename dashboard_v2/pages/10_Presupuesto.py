@@ -319,16 +319,36 @@ sede_ed_df = pd.DataFrame({
     "Sede": [SEDE_NICE[s] for s in sedes_present],
     "Flota": [int(fleet_sede.get(s, 0)) for s in sedes_present],
     "Ocupación esperada (%)": [def_sede_pct[s] for s in sedes_present],
+    # Ocupacion esperada expresada en DIAS: carro-dias x ocupacion (vivo, incluye las
+    # ediciones de las dos tablas porque sale de df["rented"]).
+    "Carro-días": [int(round(bs.loc[s, "n"] * DAYS)) for s in sedes_present],
+    "Días rentados esperados": [int(round(bs.loc[s, "rented"])) for s in sedes_present],
+    # La esperada de la sede es un INPUT; si se editaron categorias de esa sede, la que
+    # de verdad usa el presupuesto es otra (2026-10-05: Bogota esperada 59,6% con
+    # categorias editadas -> 542 dias / 810 = 66,9%).
+    "Ocupación resultante (%)": [round(bs.loc[s, "rented"] / (bs.loc[s, "n"] * DAYS) * 100, 1)
+                                 if bs.loc[s, "n"] else 0.0 for s in sedes_present],
     "RPD": [fmt_money(bs.loc[s, "rev"] / bs.loc[s, "rented"] if bs.loc[s, "rented"] else 0, MON)
             for s in sedes_present],
     "Presupuesto": [fmt_money(bs.loc[s, "rev"], MON) for s in sedes_present],
 })
 st.data_editor(
     sede_ed_df, hide_index=True, use_container_width=True, key=KEY_SEDE,
-    disabled=["Sede", "Flota", "RPD", "Presupuesto"],
+    disabled=["Sede", "Flota", "Carro-días", "Días rentados esperados", "Ocupación resultante (%)",
+              "RPD", "Presupuesto"],
     on_change=_autosave, args=(KEY_SEDE, sedes_present, "sede", lambda c: c),
     column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
-        min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
+        min_value=0.0, max_value=100.0, step=0.5, format="%.1f"),
+        "Carro-días": st.column_config.NumberColumn(
+            help="Carros × días del mes: los días de auto disponibles para rentar."),
+        "Días rentados esperados": st.column_config.NumberColumn(
+            help="Carro-días × ocupación esperada. Se recalcula al editar la ocupación."),
+        "Ocupación resultante (%)": st.column_config.NumberColumn(
+            format="%.1f",
+            help="La ocupación que de verdad usa el presupuesto: días rentados esperados / "
+                 "carro-días. Difiere de la esperada cuando se editó también la otra tabla "
+                 "(p. ej. ocupaciones por categoría dentro de la sede)."),
+    },
 )
 
 # =============================================================================
@@ -361,6 +381,10 @@ cat_ed_df = pd.DataFrame({
     "Categoría": cats_present,
     "Flota": [int(fleet_cat.get(a, 0)) for a in cats_present],
     "Ocupación esperada (%)": [def_cat_pct.get(a, 0) for a in cats_present],
+    "Carro-días": [int(round(bc.loc[a, "n"] * DAYS)) for a in cats_present],
+    "Días rentados esperados": [int(round(bc.loc[a, "rented"])) for a in cats_present],
+    "Ocupación resultante (%)": [round(bc.loc[a, "rented"] / (bc.loc[a, "n"] * DAYS) * 100, 1)
+                                 if bc.loc[a, "n"] else 0.0 for a in cats_present],
     "RPD tarifa": [fmt_money(bc.loc[a, "rev"] / bc.loc[a, "rented"] if bc.loc[a, "rented"] else 0, MON)
                    for a in cats_present],
     "RevPAU": [fmt_money(bc.loc[a, "revpau"], MON) for a in cats_present],
@@ -368,10 +392,21 @@ cat_ed_df = pd.DataFrame({
 })
 st.data_editor(
     cat_ed_df, hide_index=True, use_container_width=True, key=KEY_CAT,
-    disabled=["Categoría", "Flota", "RPD tarifa", "RevPAU", "Presupuesto"],
+    disabled=["Categoría", "Flota", "Carro-días", "Días rentados esperados",
+              "Ocupación resultante (%)", "RPD tarifa", "RevPAU", "Presupuesto"],
     on_change=_autosave, args=(KEY_CAT, cats_present, CAT_DIM, _catkey),
     column_config={"Ocupación esperada (%)": st.column_config.NumberColumn(
-        min_value=0.0, max_value=100.0, step=0.5, format="%.1f")},
+        min_value=0.0, max_value=100.0, step=0.5, format="%.1f"),
+        "Carro-días": st.column_config.NumberColumn(
+            help="Carros × días del mes: los días de auto disponibles para rentar."),
+        "Días rentados esperados": st.column_config.NumberColumn(
+            help="Carro-días × ocupación esperada. Se recalcula al editar la ocupación."),
+        "Ocupación resultante (%)": st.column_config.NumberColumn(
+            format="%.1f",
+            help="La ocupación que de verdad usa el presupuesto: días rentados esperados / "
+                 "carro-días. Difiere de la esperada cuando se editó también la otra tabla "
+                 "(p. ej. ocupaciones por categoría dentro de la sede)."),
+    },
 )
 
 

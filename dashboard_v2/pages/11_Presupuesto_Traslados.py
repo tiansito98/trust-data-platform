@@ -130,6 +130,7 @@ base = base_df.copy()
 base["occ"] = [occ_final(g, a) for g, a in zip(base["sede"], base["acriss"])]
 base["carro_dias"] = base["n"] * DAYS
 base["rev"] = base["carro_dias"] * base["occ"] * base["rpd"]
+base["rented"] = base["carro_dias"] * base["occ"]   # dias rentados esperados (foto)
 for _k, _lbl, _m in P.ESCENARIOS:
     base[f"rev_{_k}"] = base["carro_dias"] * [
         occ_final(g, a, _m) for g, a in zip(base["sede"], base["acriss"])] * base["rpd"]
@@ -232,8 +233,11 @@ st.dataframe(_out_esc, hide_index=True, use_container_width=True)
 # Por ciudad
 # =============================================================================
 section("Por ciudad")
-bc = base.groupby("sede").agg(n=("n", "sum"), cd_base=("carro_dias", "sum"), rev_base=("rev", "sum"))
-dc = daily.groupby("g").agg(cd=("placa", "size"), rev=("val", "sum"))
+bc = base.groupby("sede").agg(n=("n", "sum"), cd_base=("carro_dias", "sum"), rev_base=("rev", "sum"),
+                              rented_base=("rented", "sum"))
+# dias rentados esperados con traslados = suma de la ocupacion de cada carro-dia
+dc = daily.groupby("g").agg(cd=("placa", "size"), rev=("val", "sum"), rented=("occ", "sum"),
+                            rented_real=("rented_day", "sum"))
 city = pd.DataFrame(index=ciudades).join(bc).join(dc).fillna(0.0)
 city["delta"] = city["rev"] - city["rev_base"]
 # Ocupacion esperada por ciudad: el MISMO numero que muestra la tabla "Por sede" de
@@ -243,10 +247,15 @@ _occ_city = [saved_sede.get(g, _bso.get(g, 0.0) * 100) for g in city.index]
 out_city = pd.DataFrame({
     "Ciudad": [NICE[g] for g in city.index],
     "Ocupación esperada (%)": [round(float(v), 1) for v in _occ_city],
+    # la que de verdad usa el presupuesto (igual a la columna de la pagina Presupuesto)
+    "Ocupación resultante (%)": [round(r / c * 100, 1) if c else 0.0
+                                 for r, c in zip(city["rented_base"], city["cd_base"])],
     "Flota foto": city["n"].astype(int).values,
     "Carro-días foto": city["cd_base"].astype(int).values,
     "Carro-días con traslados": city["cd"].astype(int).values,
     "Flota promedio": (city["cd"] / DAYS).round(2).values,
+    "Días rentados esp. (foto)": city["rented_base"].round(0).astype(int).values,
+    "Días rentados esp. (con traslados)": city["rented"].round(0).astype(int).values,
     "Presupuesto foto": city["rev_base"].map(lambda v: fmt_money(v, MON)).values,
     "Con traslados": city["rev"].map(lambda v: fmt_money(v, MON)).values,
     "Diferencia": city["delta"].map(lambda v: fmt_money(v, MON)).values,
@@ -258,6 +267,9 @@ if len(real_rev):
     out_city[f"Real al {cut.day}-{MES[cut.month][:3]}"] = [fmt_money(v, MON) for v in _rrc]
     if not parcial:
         out_city["Cumplimiento"] = [f"{r / p * 100:.1f}%" if p else "-" for r, p in zip(_rrc, _pcc)]
+        # mes cerrado: dias rentados REALES (gold, mismas placas del presupuesto) para
+        # comparar con los esperados
+        out_city["Días rentados reales"] = city["rented_real"].round(0).astype(int).values
 st.dataframe(out_city, hide_index=True, use_container_width=True)
 if len(real_rev) and parcial:
     st.warning(
@@ -268,7 +280,9 @@ if len(real_rev) and parcial:
         "cumplimiento aparece cuando el mes termina.")
 st.caption(
     "**Ocupación esperada** = la misma de la página Presupuesto (lo editado o lo "
-    "pre-calculado); los ajustes por categoría se ven en *Por ciudad × categoría*. "
+    "pre-calculado). **Ocupación resultante** = la que de verdad usa el presupuesto "
+    "(días rentados esperados / carro-días): difiere de la esperada cuando se editaron "
+    "ocupaciones por categoría; el detalle está en *Por ciudad × categoría*. "
     "**Flota promedio** = carro-días / días del mes: un carro que estuvo medio mes "
     "suma 0,5. Si un carro pasa a una ciudad con otra ocupación o RPD, el total "
     "cambia, no solo se reparte. **Real** = cargo T de `silver.gold_cargo_dia` hasta el "
@@ -346,10 +360,12 @@ else:
 # Por ciudad x categoria
 # =============================================================================
 section("Por ciudad × categoría")
-bcell = base.groupby(["sede", "acriss"]).agg(n=("n", "sum"), rev_base=("rev", "sum"))
+bcell = base.groupby(["sede", "acriss"]).agg(n=("n", "sum"), rev_base=("rev", "sum"),
+                                             rented_base=("rented", "sum"))
 bcell.index.names = ["g", "acriss"]
 dcell = daily.groupby(["g", "acriss"]).agg(cd=("placa", "size"), rev=("val", "sum"),
-                                           occ=("occ", "first"), rpd=("rpd", "first"))
+                                           occ=("occ", "first"), rpd=("rpd", "first"),
+                                           rented=("occ", "sum"))
 cell = bcell.join(dcell, how="outer").fillna(0.0).reset_index()
 cell["delta"] = cell["rev"] - cell["rev_base"]
 cell["_o"] = cell["g"].map({g: i for i, g in enumerate(P.SEDE_ORDER)})
@@ -368,6 +384,8 @@ else:
         "Carro-días foto": (cell["n"] * DAYS).astype(int).values,
         "Carro-días con traslados": cell["cd"].astype(int).values,
         "Ocupación (%)": (cell["occ"] * 100).round(1).values,
+        "Días rentados esp. (foto)": cell["rented_base"].round(0).astype(int).values,
+        "Días rentados esp. (con traslados)": cell["rented"].round(0).astype(int).values,
         "RPD": cell["rpd"].map(lambda v: fmt_money(v, MON)).values,
         "Presupuesto foto": cell["rev_base"].map(lambda v: fmt_money(v, MON)).values,
         "Con traslados": cell["rev"].map(lambda v: fmt_money(v, MON)).values,
