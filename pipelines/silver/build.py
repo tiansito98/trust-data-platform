@@ -1932,7 +1932,15 @@ def _sentinel_date(col: str) -> str:
 
 def build_gold_carro_dia(engine):
     """gold_carro_dia: ocupacion (rentado vs flota) + revenue prorrateado 24h, a
-    grano (placa x dia). UBICACION REAL por timeline de SEGMENTOS (v6, 2026-09-01):
+    grano (placa x dia). UBICACION REAL por timeline de SEGMENTOS (v7, 2026-10-05):
+    - v7: (a) DEVOLUCION EFECTIVA: un tramo sin devolucion (centinela 1899) ya no se
+      estira siempre hasta hoy; se cierra en la menor de devolucion del header /
+      proxima entrega del carro / proximo tramo del contrato (9 tramos de 2023-2025 se
+      estiraban anos: LFN509 salia "rentado en Medellin" estando en Pereira). (b) La
+      DEVOLUCION en otra sede MUEVE el carro (antes solo un traslado o una nueva entrega):
+      tras una renta de ida queda en la ciudad donde lo devolvieron (NPN023, NVY873).
+      Revenue y tarifa totales identicos; -1.177 dias rentados fantasma (-2,5%); cambia
+      la ocupacion por ciudad (sep-2026: Pereira 55,2% -> 47,6%, Bogota 56,3% -> 58,9%).
     - v6: (a) DIA = bloque 24h CON 1 HORA DE GRACIA (25h=1 dia); (b) se excluyen
       segmentos ADMINISTRATIVOS sub-hora (check-in/out de cambios de vehiculo) que
       inflaban ocupacion sin generar revenue -- solo si el contrato tiene otro
@@ -2003,25 +2011,55 @@ resumen AS (
 -- segmentos por (contrato, hser): placa, fechas, sede y DURACION real de cada tramo.
 -- v6 (2026-09-01): dia = bloque de 24h CON 1 HORA DE GRACIA (el sistema no cobra
 -- dia extra si se devuelve dentro de la hora siguiente al bloque). dur_s = segundos.
+-- v7 (2026-10-05): DEVOLUCION EFECTIVA de cada tramo. rvnc_return_datm trae el
+-- centinela 1899-12-31 cuando el tramo no tiene devolucion. Antes (v6) se trataba
+-- SIEMPRE como renta abierta y se estiraba hasta hoy. Pero 9 tramos de 2023-2025 son
+-- contratos YA CERRADOS (el header tiene la devolucion y el carro tuvo rentas despues):
+-- gold los estiraba ANOS y el carro salia "rentado" en la sede de aquel contrato todos
+-- los dias sin otra renta encima (caso LFN509: contrato 9511425048 de sep-2024 en
+-- Medellin, devuelto el 21-sep-2024 segun el header, lo mantenia "rentado en Medellin"
+-- en 2026 aunque estaba trasladado a Pereira). Ahora, si el tramo no tiene devolucion,
+-- se usa la MENOR entre: devolucion del header (si ya paso), proxima entrega del MISMO
+-- carro y proximo tramo del MISMO contrato (cambio de carro). Si no hay ninguna, la
+-- renta si esta abierta -> se capa a hoy como antes (caso NIZ571).
+segraw AS (
+    SELECT v.*, r.rate_type_level3_aknm,
+           CASE WHEN v.rvnc_return_datm < TIMESTAMP '1900-01-01' THEN NULL
+                ELSE v.rvnc_return_datm END ret_seg,
+           CASE WHEN r.rntl_return_datm < TIMESTAMP '1900-01-01' OR r.rntl_return_datm > NOW()
+                THEN NULL ELSE r.rntl_return_datm END ret_hdr,
+           LEAD(v.rvnc_handover_datm) OVER (PARTITION BY v.vhcl_int_num
+                ORDER BY v.rvnc_handover_datm, v.rntl_mvnr, v.rvnc_hser) next_ho_veh,
+           LEAD(v.rvnc_handover_datm) OVER (PARTITION BY v.rntl_mvnr
+                ORDER BY v.rvnc_hser, v.rvnc_handover_datm) next_ho_ctr
+    FROM silver.fact_rental_vehicles v
+    JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
+      ON r.rntl_mvnr=v.rntl_mvnr AND r.mndt_code=409
+    WHERE v.mndt_code=409
+),
+segret AS (
+    SELECT sr.*,
+           COALESCE(sr.ret_seg, NULLIF(LEAST(
+               COALESCE(sr.ret_hdr,     CAST('infinity' AS timestamp)),
+               COALESCE(sr.next_ho_veh, CAST('infinity' AS timestamp)),
+               COALESCE(sr.next_ho_ctr, CAST('infinity' AS timestamp))),
+               CAST('infinity' AS timestamp))) ret_eff
+    FROM segraw sr
+),
 seg0 AS (
     SELECT p.placa, v.rntl_mvnr numero_contrato, v.rvnc_hser,
            v.rvnc_handover_datm ts_ho, v.rvnc_handover_datm::date ho_date,
            bh.brnc_name sede_ho, br.brnc_name sede_ret,
-           (r.rate_type_level3_aknm='Internal Products') is_transfer,
-           -- OJO: rvnc_return_datm trae el centinela 1899-12-31 en rentas ABIERTAS
-           -- (largas aun sin devolver). Sin tratarlo, la duracion sale NEGATIVA y la
-           -- renta colapsa a 1 dia (caso NIZ571: contrato mar->sep con 0 ocupacion).
-           -- Se trata como NULL -> abierta -> capada a hoy.
-           EXTRACT(EPOCH FROM (LEAST(COALESCE(
-               CASE WHEN v.rvnc_return_datm < TIMESTAMP '1900-01-01' THEN NULL
-                    ELSE v.rvnc_return_datm END, NOW()), NOW()) - v.rvnc_handover_datm)) dur_s
-    FROM silver.fact_rental_vehicles v
+           (v.rate_type_level3_aknm='Internal Products') is_transfer,
+           v.ret_eff,
+           -- ret_eff NULL = renta realmente abierta -> capada a hoy.
+           EXTRACT(EPOCH FROM (LEAST(COALESCE(v.ret_eff, NOW()), NOW())
+                               - v.rvnc_handover_datm)) dur_s
+    FROM segret v
     JOIN plate p ON p.vhcl_int_num=v.vhcl_int_num
-    JOIN bronze.rent_shop_ra_fct_rentals_vwt_franchise r
-      ON r.rntl_mvnr=v.rntl_mvnr AND r.mndt_code=409
     LEFT JOIN silver.dim_branches bh ON bh.brnc_code=v.brnc_code_handover
     LEFT JOIN silver.dim_branches br ON br.brnc_code=v.brnc_code_return
-    WHERE v.mndt_code=409 AND p.placa IN (SELECT placa FROM roster)
+    WHERE p.placa IN (SELECT placa FROM roster)
 ),
 -- Flags por contrato para el filtro de segmentos ADMINISTRATIVOS (sub-hora):
 -- un segmento < 1h (check-in/out de cambio de vehiculo / paperwork) NO es ocupacion
@@ -2048,15 +2086,27 @@ ctr AS (
            SUM(seg_days) FILTER (WHERE NOT is_transfer AND NOT is_admin) n_contract
     FROM seg GROUP BY 1
 ),
--- ubicacion por placa: cada segmento (renta real o TRASLADO) es un evento; el
--- traslado (Internal Products) reubica al carro a su sede de retorno. Los admin
--- sub-hora NO reubican.
-iv AS (
-    SELECT placa,
-           CASE WHEN is_transfer THEN sede_ret ELSE sede_ho END sede,
-           ho_date loc_from,
-           LEAD(ho_date) OVER (PARTITION BY placa ORDER BY ho_date, ts_ho) loc_to
+-- ubicacion por placa (dias LIBRES; los rentados van a la sede de su renta): cada
+-- segmento (renta real o TRASLADO) es un evento; el traslado (Internal Products)
+-- reubica al carro a su sede de retorno. Los admin sub-hora NO reubican.
+-- v7 (2026-10-05): la DEVOLUCION de una renta tambien es un evento: el carro queda en
+-- la sede donde lo devolvieron. Antes solo lo movia un traslado o una nueva entrega,
+-- asi que tras una renta de ida (one-way) el carro seguia figurando en la ciudad de
+-- origen hasta que lo volvieran a rentar desde la nueva (casos NPN023: devuelto en
+-- Medellin el 12-sep y seguia en Bogota; NVY873: devuelto en Medellin el 1-oct).
+iv_ev AS (
+    SELECT placa, CASE WHEN is_transfer THEN sede_ret ELSE sede_ho END sede, ts_ho ev_ts
     FROM seg WHERE NOT is_admin
+    UNION ALL
+    SELECT placa, sede_ret, ret_eff
+    FROM seg
+    WHERE NOT is_admin AND NOT is_transfer AND sede_ret IS NOT NULL
+      AND ret_eff IS NOT NULL AND ret_eff <= NOW()
+),
+iv AS (
+    SELECT placa, sede, ev_ts::date loc_from,
+           LEAD(ev_ts::date) OVER (PARTITION BY placa ORDER BY ev_ts) loc_to
+    FROM iv_ev
 ),
 first_ho AS (
     SELECT DISTINCT ON (placa) placa, sede_ho FROM seg WHERE NOT is_admin ORDER BY placa, ts_ho

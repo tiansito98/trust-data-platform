@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 4
+P_API_REQUERIDA = 5
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -121,8 +121,10 @@ _cap_base = (
 # Placas que el presupuesto trata como si no existieran desde cierto mes (se gestionan
 # al final de la pagina). Salen de la flota Y de las tasas; el real no se toca.
 EXCL = P.excluded_plates(target.isoformat())
+RECAT = P.recat_map()   # categorias corregidas solo para el presupuesto
 base_df_all, factor, plates_all, _rates = P.base_inputs(
-    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat(), EXCL)
+    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat(),
+    EXCL, RECAT)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
     st.stop()
@@ -165,8 +167,8 @@ st.caption(
     _cap_base
     + f" Alcance: **{_alcance}** (filtro de sedes del sidebar)."
     + f" Flota: foto del padrón al **{snap_date}**"
-    + (" (cierre del mes anterior)." if snap_date == target - dt.timedelta(days=1)
-       else " (la más reciente disponible).")
+    + (" (primer día del mes)." if snap_date == target
+       else " (la más reciente disponible: el mes todavía no empezó).")
     + (" Mes ya cerrado: el presupuesto se reconstruye con la información que había "
        "al inicio del mes." if _es_pasado else "")
     + (f" **{len(EXCL)} placas excluidas** para este mes (ver *Placas excluidas del "
@@ -511,6 +513,69 @@ with st.expander("Agregar o quitar placas excluidas"):
             load_query.clear()
             st.session_state["_presup_msg"] = (
                 f"Exclusiones actualizadas: {len(_add)} agregadas, {len(_quitar)} quitadas.")
+            st.rerun()
+
+
+# =============================================================================
+# Categorias corregidas para el presupuesto (gestion)
+# =============================================================================
+section("Categorías corregidas para el presupuesto")
+st.caption(
+    "Placas cuya categoría está mal cargada en Sixt/COBRA. El presupuesto usa la "
+    "categoría corregida en **toda su historia** (flota, ocupación, RPD y traslados); "
+    "el resto del dashboard sigue mostrando la de Sixt. En el listado de placas se ven "
+    "las dos: *ACRISS Sixt* y *Categoría*.")
+_rc = P.recategorizations_all()
+if len(_rc):
+    st.dataframe(pd.DataFrame({
+        "Placa": _rc["placa"].values,
+        "Categoría para el presupuesto": _rc["acriss"].values,
+        "Motivo": _rc["motivo"].fillna("").values,
+        "Cargada por": _rc["created_by"].fillna("").values,
+    }), hide_index=True, use_container_width=True)
+else:
+    st.caption("No hay categorías corregidas.")
+
+with st.expander("Corregir o quitar la categoría de una placa"):
+    _snap_hoy = P.fleet_snapshot(_last_day.isoformat(), win_start.isoformat(),
+                                 win_end.isoformat())
+    _todas_rc = sorted(_snap_hoy["placa"])
+    _cats_opts = sorted(set(_snap_hoy["acriss_sixt"].dropna()) | {"SDMR", "EDMR", "CDMR",
+                                                                   "EDAH", "SDAH", "IDAH"})
+    _ya_rc = set(_rc["placa"]) if len(_rc) else set()
+    with st.form("presup_recat_form"):
+        _rc_add = st.multiselect("Placas a corregir", options=_todas_rc)
+        _rc_cat = st.selectbox("Categoría correcta", options=_cats_opts)
+        _rc_mot = st.text_input("Motivo", placeholder="p. ej. cargada mal en COBRA",
+                                key="presup_recat_motivo")
+        _rc_quitar = st.multiselect("Placas a volver a la categoría de Sixt",
+                                    options=sorted(_ya_rc))
+        _rc_ok = st.form_submit_button("Guardar categorías", type="primary")
+    if _rc_ok:
+        if not _rc_add and not _rc_quitar:
+            st.warning("No elegiste ninguna placa.")
+        else:
+            try:
+                if _rc_add:
+                    execute_write(f"""
+                        INSERT INTO {P.RECAT_TABLE} (placa, acriss, motivo, created_by)
+                        VALUES (:p, :a, :m, :u)
+                        ON CONFLICT (placa) DO UPDATE SET acriss = EXCLUDED.acriss,
+                            motivo = EXCLUDED.motivo, created_by = EXCLUDED.created_by,
+                            created_at = NOW()
+                    """, [{"p": p_, "a": _rc_cat, "m": _rc_mot.strip() or None,
+                           "u": _u.get("username")} for p_ in _rc_add])
+                if _rc_quitar:
+                    execute_write(f"DELETE FROM {P.RECAT_TABLE} WHERE placa = ANY(:q)",
+                                  {"q": list(_rc_quitar)})
+            except Exception as ex:
+                st.error(f"No se pudieron guardar las categorías: {type(ex).__name__}.")
+                st.exception(ex)
+                st.stop()
+            load_query.clear()
+            st.session_state["_presup_msg"] = (
+                f"Categorías actualizadas: {len(_rc_add)} corregidas, "
+                f"{len(_rc_quitar)} devueltas a la de Sixt.")
             st.rerun()
 
 

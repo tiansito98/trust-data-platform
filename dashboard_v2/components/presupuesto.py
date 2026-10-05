@@ -27,6 +27,10 @@ desde_mes se sacan de la flota, de la ventana de tasas, del factor estacional y 
 los carro-dias de la pagina de traslados. Es lo mismo que hace gold solo cuando
 Sixt los da de baja (borra su historia), asi que al salir no cambia nada mas. El
 REAL (gold_cargo_dia) no se toca.
+
+Reclasificaciones (operational.presupuesto_categoria_placa): placa -> ACRISS correcto
+para el presupuesto (p.ej. cargadas mal en COBRA). Se aplican en la subconsulta _GC,
+por la que pasan las lecturas de gold_carro_dia del presupuesto que usan la categoria.
 """
 import calendar
 import datetime as dt
@@ -42,7 +46,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 4
+API_VERSION = 5
 
 SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
@@ -77,6 +81,56 @@ def ensure_exclusion_table() -> None:
             created_at  timestamptz DEFAULT now()
         )
     """, {})
+
+
+RECAT_TABLE = "operational.presupuesto_categoria_placa"
+
+
+@st.cache_resource
+def ensure_recat_table() -> None:
+    execute_write(f"""
+        CREATE TABLE IF NOT EXISTS {RECAT_TABLE} (
+            placa       text PRIMARY KEY,
+            acriss      text NOT NULL,
+            motivo      text,
+            created_by  text,
+            created_at  timestamptz DEFAULT now()
+        )
+    """, {})
+
+
+def recat_map() -> tuple:
+    """Reclasificaciones de categoria SOLO para el presupuesto: ((placa, acriss), ...)
+    ordenada. Caso de uso (2026-10-05): placas cargadas mal en COBRA (NPM571, NGW352,
+    NPQ347 figuran EDMR y son SDMR). Se aplica a TODA la historia de la placa en las
+    lecturas del presupuesto (flota, tasas, carro-dias), igual que ACRISS_CANON; el
+    resto del dashboard sigue con el ACRISS de Sixt. Tupla -> sirve de llave de cache."""
+    ensure_recat_table()
+    d = load_query(f"SELECT placa, acriss FROM {RECAT_TABLE}", {})
+    if not len(d):
+        return ()
+    return tuple(sorted(zip(d["placa"].astype(str).str.strip(),
+                            d["acriss"].astype(str).str.strip().str.upper())))
+
+
+def recategorizations_all() -> pd.DataFrame:
+    ensure_recat_table()
+    return load_query(f"""
+        SELECT placa, acriss, motivo, created_by, created_at
+        FROM {RECAT_TABLE} ORDER BY placa""", {})
+
+
+# gold_carro_dia con la categoria reclasificada (si la placa tiene ajuste). Todas las
+# lecturas del presupuesto que usan la categoria pasan por aca; acriss_orig = Sixt.
+_GC = """(SELECT g0.placa, g0.fecha, g0.sede, g0.rented_day, g0.tar_usd, g0.tar_cop,
+             g0.acriss AS acriss_orig,
+             COALESCE((CAST(:ra AS text[]))[array_position(CAST(:rp AS text[]), g0.placa)],
+                      g0.acriss) AS acriss
+         FROM silver.gold_carro_dia g0)"""
+
+
+def _rp(recat: tuple) -> dict:
+    return {"rp": [p for p, _ in recat], "ra": [a for _, a in recat]}
 
 
 def excluded_plates(target_iso: str) -> tuple:
@@ -152,12 +206,18 @@ def last_gold_day() -> dt.date:
 
 
 def snapshot_date(target: dt.date, last_day: dt.date) -> dt.date:
-    """Foto de flota: cierre del mes anterior al presupuestado, o la mas reciente."""
-    return min(target - dt.timedelta(days=1), last_day)
+    """Foto de flota: el PRIMER DIA del mes presupuestado (las placas con las que
+    arranca el mes), o la mas reciente si ese dia todavia no llego.
+    Hasta el 2026-10-05 era el cierre del mes anterior: un carro que amanecia el dia 1
+    en otra ciudad quedaba mal (QKP640: al 31-ago figuraba en Bucaramanga y el 1-sep
+    ya estaba en Bogota -> Bogota salia con 5 IDAH y Bucaramanga con 1, cuando el mes
+    arranco con 6 y 0)."""
+    return min(target, last_day)
 
 
 @st.cache_data(ttl=600)
-def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = ()) -> pd.DataFrame:
+def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (),
+                   recat: tuple = ()) -> pd.DataFrame:
     """UNA FILA POR PLACA activa en `as_of` (no conteos): el listado auditable y el
     conteo de flota salen del mismo DataFrame, asi que no pueden diferir.
 
@@ -173,25 +233,26 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (
     """
     plates = load_query("""
         WITH act AS (
-            SELECT DISTINCT ON (g.placa) g.placa, g.acriss, g.sede AS sede_snap
-            FROM silver.gold_carro_dia g WHERE g.fecha = CAST(:asof AS date)
+            SELECT DISTINCT ON (g.placa) g.placa, g.acriss, g.acriss_orig, g.sede AS sede_snap
+            FROM {GC} g WHERE g.fecha = CAST(:asof AS date)
               AND NOT (g.placa = ANY(:ex))
             ORDER BY g.placa, g.rented_day DESC),
         idle AS (
             SELECT DISTINCT ON (g.placa) g.placa, g.sede, g.fecha
-            FROM silver.gold_carro_dia g
+            FROM {GC} g
             WHERE g.rented_day = 0 AND g.fecha > CAST(:asof AS date) - 120
               AND g.fecha <= CAST(:asof AS date)
             ORDER BY g.placa, g.fecha DESC),
         rec AS (
             SELECT g.placa, MAX(g.fecha) FILTER (WHERE g.rented_day = 1) AS ult_renta
-            FROM silver.gold_carro_dia g
+            FROM {GC} g
             WHERE g.fecha > CAST(:asof AS date) - 120 AND g.fecha <= CAST(:asof AS date)
             GROUP BY g.placa),
         win AS (
             SELECT placa, SUM(rented_day) AS dias_rentados, COUNT(*) AS dias_flota
-            FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b GROUP BY placa)
-        SELECT a.placa, COALESCE(i.sede, a.sede_snap) AS sede, a.acriss AS acriss_sixt,
+            FROM {GC} gc WHERE fecha BETWEEN :a AND :b GROUP BY placa)
+        SELECT a.placa, COALESCE(i.sede, a.sede_snap) AS sede, a.acriss_orig AS acriss_sixt,
+               a.acriss AS acriss_ppto,
                i.fecha AS ult_dia_libre, r.ult_renta,
                COALESCE(w.dias_rentados, 0) AS dias_rentados,
                COALESCE(w.dias_flota, 0) AS dias_flota
@@ -199,9 +260,10 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (
         LEFT JOIN idle i ON i.placa = a.placa
         LEFT JOIN rec  r ON r.placa = a.placa
         LEFT JOIN win  w ON w.placa = a.placa
-    """, {"asof": as_of_iso, "a": win_start, "b": win_end, "ex": list(excl)})
+    """.replace("{GC}", _GC), {"asof": as_of_iso, "a": win_start, "b": win_end,
+                               "ex": list(excl), **_rp(recat)})
     plates["g"] = plates["sede"].map(grp)
-    plates["acriss"] = plates["acriss_sixt"].map(canon)
+    plates["acriss"] = plates["acriss_ppto"].map(canon)
     return plates
 
 
@@ -227,7 +289,7 @@ def cell_rpd(rates: dict, g: str, a: str) -> float:
 
 @st.cache_data(ttl=600)
 def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_iso: str,
-                excl: tuple = ()):
+                excl: tuple = (), recat: tuple = ()):
     """Tasas de la ventana + flota de la foto. Devuelve
     (base_df, factor_estacional_ocupacion, plates, rates); base_df = 1 fila por celda
     de la foto con n (placas), occ_base (con factor estacional, tope 98%) y rpd (con
@@ -235,10 +297,10 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
     m = load_query(f"""
         SELECT sede, acriss, SUM(rented_day) AS rented, COUNT(*) AS fleet_days,
                SUM(tar_{suf}) AS t_val
-        FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
+        FROM {_GC} gc WHERE fecha BETWEEN :a AND :b
           AND NOT (placa = ANY(:ex))
         GROUP BY sede, acriss
-    """, {"a": win_start, "b": win_end, "ex": list(excl)})
+    """, {"a": win_start, "b": win_end, "ex": list(excl), **_rp(recat)})
     m["g"] = m["sede"].map(grp)
     m["acriss"] = m["acriss"].map(canon)   # los groupby de abajo suman las unidas
     for c in ("rented", "fleet_days", "t_val"):
@@ -294,7 +356,7 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
     f_rpd = max(0.5, min(1.5, f_rpd))
     rates["f_occ"], rates["f_rpd"] = factor, f_rpd
 
-    plates = fleet_snapshot(as_of_iso, win_start, win_end, excl)
+    plates = fleet_snapshot(as_of_iso, win_start, win_end, excl, recat)
     fleet = plates.groupby(["g", "acriss"], as_index=False).size().rename(columns={"size": "n"})
     rows = []
     for _, fr in fleet.iterrows():
@@ -387,20 +449,20 @@ def scenario_occ(base_df_all, rates, factor, saved_sede, saved_cat, saved_cell):
 
 
 @st.cache_data(ttl=600)
-def daily_rows(desde_iso: str, hasta_iso: str, excl: tuple = ()) -> pd.DataFrame:
+def daily_rows(desde_iso: str, hasta_iso: str, excl: tuple = (), recat: tuple = ()) -> pd.DataFrame:
     """gold_carro_dia crudo (placa x dia) en el rango, con ciudad y ACRISS unificado.
     La ciudad del dia es la de gold (`sede`): en un dia rentado es la sede que entrego
     el carro. Es la MISMA atribucion con la que se miden la ocupacion y el RPD, asi que
     los carro-dias y las tasas quedan coherentes."""
-    d = load_query("""
-        SELECT placa, fecha, sede, acriss, rented_day
-        FROM silver.gold_carro_dia WHERE fecha BETWEEN :a AND :b
+    d = load_query(f"""
+        SELECT placa, fecha, sede, acriss, acriss_orig, rented_day
+        FROM {_GC} gc WHERE fecha BETWEEN :a AND :b
           AND NOT (placa = ANY(:ex))
-    """, {"a": desde_iso, "b": hasta_iso, "ex": list(excl)})
+    """, {"a": desde_iso, "b": hasta_iso, "ex": list(excl), **_rp(recat)})
     d["fecha"] = pd.to_datetime(d["fecha"]).dt.date
     d["g"] = d["sede"].map(grp)
-    d["acriss_sixt"] = d["acriss"]
-    d["acriss"] = d["acriss_sixt"].map(canon)
+    d["acriss_sixt"] = d["acriss_orig"]
+    d["acriss"] = d["acriss"].map(canon)
     return d
 
 

@@ -42,7 +42,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 4
+P_API_REQUERIDA = 5
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -78,8 +78,10 @@ last_day = P.last_gold_day()
 snap = P.snapshot_date(target, last_day)
 
 EXCL = P.excluded_plates(target.isoformat())   # mismas exclusiones que Presupuesto
+RECAT = P.recat_map()                          # mismas categorias corregidas
 base_df, factor, _plates_snap, rates = P.base_inputs(
-    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap.isoformat(), EXCL)
+    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap.isoformat(),
+    EXCL, RECAT)
 if base_df.empty:
     st.info("No hay datos suficientes en la ventana para presupuestar.")
     st.stop()
@@ -94,12 +96,14 @@ real_end = min(mend, last_day)
 parts = []
 # Se carga tambien el dia ANTERIOR al mes para detectar un cambio de ciudad el dia 1.
 if real_end >= mstart:
-    _r = P.daily_rows((mstart - dt.timedelta(days=1)).isoformat(), real_end.isoformat(), EXCL)
+    _r = P.daily_rows((mstart - dt.timedelta(days=1)).isoformat(), real_end.isoformat(),
+                      EXCL, RECAT)
     _r["tipo"] = "real"
     parts.append(_r)
 if real_end < mend:
     # Proyeccion: cada placa activa al ultimo dia de gold se queda donde esta hoy.
-    _now = P.fleet_snapshot(last_day.isoformat(), win_start.isoformat(), win_end.isoformat(), EXCL)
+    _now = P.fleet_snapshot(last_day.isoformat(), win_start.isoformat(), win_end.isoformat(),
+                            EXCL, RECAT)
     _fut = pd.date_range(max(mstart, last_day + dt.timedelta(days=1)), mend).date
     _p = _now[["placa", "g", "acriss", "acriss_sixt"]].merge(
         pd.DataFrame({"fecha": _fut}), how="cross")
