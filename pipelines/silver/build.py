@@ -52,6 +52,28 @@ def _exec(engine, sql: str):
         conn.execute(text(sql))
 
 
+def _swap_table(engine, table: str, indexes: list) -> None:
+    """Reemplaza silver.<table> por silver.<table>__nuevo en UNA transaccion.
+
+    Patron para las tablas que tardan (gold_*): se construyen en <table>__nuevo y solo
+    al final se intercambian. Si la corrida muere a mitad de camino (watchdog, systemd,
+    red), la tabla en uso queda intacta y el dashboard sigue funcionando con la version
+    anterior. Antes el builder hacia DROP y despues CREATE en pasos separados: el
+    2026-10-12 y el 2026-10-14 el pipeline murio dentro del CREATE de gold_carro_dia
+    (Redshift lento, bronze 1.633s / 1.504s) y Analitica + Presupuesto quedaron SIN la
+    tabla hasta la corrida siguiente / el rebuild manual.
+
+    `indexes`: nombres finales de los indices; deben haberse creado sobre __nuevo con
+    el sufijo __nuevo (los nombres de indice son unicos por schema)."""
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = 0"))
+        conn.execute(text(f"DROP TABLE IF EXISTS silver.{table} CASCADE"))
+        conn.execute(text(f"ALTER TABLE silver.{table}__nuevo RENAME TO {table}"))
+        for ix in indexes:
+            conn.execute(text(f"ALTER INDEX silver.{ix}__nuevo RENAME TO {ix}"))
+    _exec(engine, f"ANALYZE silver.{table}")
+
+
 def _scalar(engine, sql: str):
     with engine.connect() as conn:
         row = conn.execute(text(sql)).fetchone()
@@ -1970,10 +1992,11 @@ def build_gold_carro_dia(engine):
     """
     log("\n>> Construyendo gold_carro_dia")
     started = time.time()
-    _exec(engine, "DROP TABLE IF EXISTS silver.gold_carro_dia CASCADE")
-    _exec(engine, "DROP VIEW  IF EXISTS silver.gold_carro_dia CASCADE")
+    # Se construye en __nuevo y se intercambia al final (_swap_table): si la corrida
+    # muere a mitad, el dashboard conserva la tabla anterior.
+    _exec(engine, "DROP TABLE IF EXISTS silver.gold_carro_dia__nuevo CASCADE")
     _exec(engine, f"""
-        CREATE TABLE silver.gold_carro_dia AS
+        CREATE TABLE silver.gold_carro_dia__nuevo AS
 WITH roster AS (
     SELECT DISTINCT ON (placa) placa, base_sede, acriss, in_date FROM (
         SELECT NULLIF(TRIM(dv.vhcl_plate),'') placa,
@@ -2164,10 +2187,10 @@ JOIN roster ro ON ro.placa=s.placa
 LEFT JOIN rented_agg ra ON ra.placa=s.placa AND ra.fecha=s.fecha
 LEFT JOIN rented_sede rs ON rs.placa=s.placa AND rs.fecha=s.fecha;
 
-CREATE INDEX idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)
     """)
-    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_fecha ON silver.gold_carro_dia(fecha)")
-    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_carro_dia_sede  ON silver.gold_carro_dia(sede, fecha)")
+    _exec(engine, "CREATE INDEX idx_gold_carro_dia_fecha__nuevo ON silver.gold_carro_dia__nuevo(fecha)")
+    _exec(engine, "CREATE INDEX idx_gold_carro_dia_sede__nuevo  ON silver.gold_carro_dia__nuevo(sede, fecha)")
+    _swap_table(engine, "gold_carro_dia", ["idx_gold_carro_dia_fecha", "idx_gold_carro_dia_sede"])
     n = _scalar(engine, "SELECT COUNT(*) FROM silver.gold_carro_dia")
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
@@ -2180,10 +2203,9 @@ def build_gold_cargo_dia(engine):
     """
     log("\n>> Construyendo gold_cargo_dia")
     started = time.time()
-    _exec(engine, "DROP TABLE IF EXISTS silver.gold_cargo_dia CASCADE")
-    _exec(engine, "DROP VIEW  IF EXISTS silver.gold_cargo_dia CASCADE")
+    _exec(engine, "DROP TABLE IF EXISTS silver.gold_cargo_dia__nuevo CASCADE")
     _exec(engine, f"""
-        CREATE TABLE silver.gold_cargo_dia AS
+        CREATE TABLE silver.gold_cargo_dia__nuevo AS
         WITH cargos AS (
             SELECT d.numero_contrato, d.cargo_codigo, d.sede_handover,
                    d.fecha_handover_real::date AS f_ini,
@@ -2224,8 +2246,9 @@ def build_gold_cargo_dia(engine):
                ROUND(SUM(val_cop_dia)::numeric, 0) AS subtotal_cop
         FROM expl GROUP BY fecha, sede_handover, cargo_codigo
     """)
-    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_cargo_dia_fecha ON silver.gold_cargo_dia(fecha)")
-    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_gold_cargo_dia_cod   ON silver.gold_cargo_dia(cargo_codigo, fecha)")
+    _exec(engine, "CREATE INDEX idx_gold_cargo_dia_fecha__nuevo ON silver.gold_cargo_dia__nuevo(fecha)")
+    _exec(engine, "CREATE INDEX idx_gold_cargo_dia_cod__nuevo   ON silver.gold_cargo_dia__nuevo(cargo_codigo, fecha)")
+    _swap_table(engine, "gold_cargo_dia", ["idx_gold_cargo_dia_fecha", "idx_gold_cargo_dia_cod"])
     n = _scalar(engine, "SELECT COUNT(*) FROM silver.gold_cargo_dia")
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 

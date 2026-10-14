@@ -67,8 +67,8 @@ def materialize_ssh_key_if_needed() -> None:
 
 def arm_watchdog() -> None:
     """
-    Backstop de tiempo: si la corrida excede PIPELINE_TIMEOUT_SEC (default 1680s
-    = 28 min), lanza TimeoutError para abortar. Evita corridas colgadas por blips
+    Backstop de tiempo: si la corrida excede PIPELINE_TIMEOUT_SEC (default 3300s
+    = 55 min), lanza TimeoutError para abortar. Evita corridas colgadas por blips
     del pooler/SSH. Solo Unix (SIGALRM); en Windows (corridas manuales) se omite.
 
     Por que 28 min (antes 20): el 2026-10-03 el watchdog corto una corrida SANA. Bronze
@@ -77,8 +77,17 @@ def arm_watchdog() -> None:
     en la VM ~120s; corridas OK de fines de sep: 638-1.039s. Tiene que quedar POR
     DEBAJO del TimeoutStartSec=1800 del servicio systemd (deploy/trust-pipeline.service),
     para que el watchdog aborte limpio (log + alerta) antes de que systemd lo mate.
+
+    2026-10-14: 28 min tampoco alcanzo. Bronze llego a 1.633s (12-oct) y 1.504s
+    (14-oct) por Redshift lento, y silver ahora tarda ~205s (gold_carro_dia v7 ~162s).
+    Sube a 3300s con systemd en 3600s. OJO: SIGALRM NO interrumpe una query en curso
+    (el handler corre cuando psycopg2 devuelve el control), asi que el margen hasta
+    systemd (300s) tiene que ser mayor que la query mas larga (~180s); si no, systemd
+    mata el proceso antes de que el watchdog actue (eso paso el 12-oct). Una corrida
+    lenta corre de noche y esperar a Redshift no gasta IO de Supabase. Con las tablas
+    gold construidas con swap (_swap_table), un corte ya no deja el dashboard caido.
     """
-    timeout = int(os.getenv("PIPELINE_TIMEOUT_SEC", "1680"))
+    timeout = int(os.getenv("PIPELINE_TIMEOUT_SEC", "3300"))
     if timeout <= 0 or not hasattr(signal, "SIGALRM"):
         return
 
