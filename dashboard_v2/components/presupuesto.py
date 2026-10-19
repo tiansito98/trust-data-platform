@@ -46,11 +46,14 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 6
+API_VERSION = 7
 
-SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA"]
+# Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
+# FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
+# Cartagena (CARTAGENA AIRPORT RAFAEL NUNEZ, brnc 49513) abrio el 2026-09-09.
+SEDE_ORDER = ["BOGOTA", "MEDELLIN", "BUCARAMANGA", "PEREIRA", "CARTAGENA"]
 SEDE_NICE = {"BOGOTA": "Bogotá", "MEDELLIN": "Medellín",
-             "BUCARAMANGA": "Bucaramanga", "PEREIRA": "Pereira"}
+             "BUCARAMANGA": "Bucaramanga", "PEREIRA": "Pereira", "CARTAGENA": "Cartagena"}
 MES_ES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
           "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
 

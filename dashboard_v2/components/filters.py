@@ -215,6 +215,19 @@ def render_sidebar_filters(default_days: int = 30,
             )
 
     codigos = sedes_df[sedes_df["nombre"].isin(sedes_sel)]["codigo"].astype(int).tolist()
+
+    # FAIL-CLOSED (2026-10-19): en todo el dashboard "lista de sedes vacia" significa
+    # "todas las sedes". Un usuario de sede cuya sede no se reconoce (mal escrita, o
+    # nueva y sin datos) quedaba con la lista vacia y VEIA TODAS LAS SEDES: el usuario
+    # sixt_santamarta ('SANTA MARTA AP SIMON BOLIVAR', que no existe en Sixt) veia en
+    # Cierre Diario 152 filas de las 5 sedes. Ahora se le pasa un codigo imposible:
+    # las consultas no devuelven nada y se le avisa.
+    if not (user_is_admin or "*" in user_branches) and not codigos:
+        codigos = [-1]
+        sedes_sel = list(user_branches)
+        with st.sidebar:
+            st.warning("Tu sede todavía no tiene datos en el sistema o no está "
+                       "configurada. Avisá al administrador.")
     return FilterState(
         sedes_codigos=codigos,
         sedes_nombres=sedes_sel,

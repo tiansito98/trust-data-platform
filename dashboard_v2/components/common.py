@@ -380,13 +380,21 @@ def apply_trm(df: pd.DataFrame, trm_source: str, date_col: str,
 
 @st.cache_data(ttl=600)
 def get_sedes() -> pd.DataFrame:
-    """Sedes que aparecen en vw_rentals_resumen (no todas las de dim_branches
-    estan en uso). Devuelve codigo + nombre, ordenado alfabeticamente."""
+    """Sedes del filtro lateral: las ACTIVAS y RESERVABLES del catalogo de Sixt
+    (dim_branches, mandante 409) + las que tienen contratos. Devuelve codigo + nombre.
+
+    Hasta el 2026-10-19 salian SOLO de vw_rentals_resumen (sedes con contratos): una
+    sede nueva sin rentas todavia (Cartagena, abierta el 9-sep-2026) no aparecia, y su
+    usuario quedaba sin sede reconocida. brnc_bookable_flg = 1 deja afuera la oficina
+    virtual 'COLOMBIA ZKST'."""
     return load_query(
-        "SELECT DISTINCT sede_handover_codigo AS codigo, sede_handover AS nombre "
-        "FROM vw_rentals_resumen "
-        "WHERE sede_handover IS NOT NULL "
-        "ORDER BY sede_handover"
+        "SELECT codigo, nombre FROM ("
+        "  SELECT brnc_code AS codigo, brnc_name AS nombre FROM dim_branches "
+        "  WHERE mndt_code = 409 AND brnc_active_flg = 1 AND brnc_bookable_flg = 1 "
+        "  UNION "
+        "  SELECT DISTINCT sede_handover_codigo, sede_handover FROM vw_rentals_resumen "
+        "  WHERE sede_handover IS NOT NULL"
+        ") s ORDER BY nombre"
     )
 
 

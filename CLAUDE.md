@@ -139,6 +139,14 @@ Credentials stored as bcrypt hashes in `dashboard_v2/config/users.yml` (local de
 
 Every page calls `require_auth()` + `require_page("X_PageName")` at the top.
 
+**Usuarios en prod:** viven en los secrets de Streamlit Cloud como tablas TOML `[users.<username>]` con `password_hash` (bcrypt), `role` (`admin`/`sede`), `branches` y `pages`. `branches` tiene que ser el **nombre exacto de la sede en Sixt** (`dim_branches.brnc_name`). **Fail-closed (2026-10-19):** en todo el dashboard una lista de sedes vacía significa "todas"; un usuario de sede cuya sede no se reconoce quedaba con la lista vacía y **veía todas las sedes** (`sixt_santamarta`, con una sede que no existe en Sixt, veía 152 filas de las 5 sedes en Cierre Diario). Ahora `render_sidebar_filters` le pasa un código imposible (`-1`) y un aviso: no ve nada.
+
+**Alta de una sede nueva** (hecho para Cartagena, `CARTAGENA AIRPORT RAFAEL NUNEZ`, brnc 49513, abierta 2026-09-09):
+1. Datos: bronze trae todas las sedes del mandante 409, no hay que tocar el pipeline. `get_sedes()` lista las sedes activas y reservables de `dim_branches` + las que tienen contratos, así que la sede aparece en el filtro aunque todavía no tenga rentas.
+2. Presupuesto: agregar la ciudad a `SEDE_ORDER`/`SEDE_NICE` en `components/presupuesto.py` (si no matchea cae en "OTRA" y queda fuera) y subir `API_VERSION`/`P_API_REQUERIDA`.
+3. Cargos Granular: agregarla a `SEDES_CONOCIDAS` (metas por sede).
+4. Usuario: bloque `[users.sixt_<sede>]` en los secrets de Streamlit Cloud, `role = "sede"`, `branches` = nombre exacto de Sixt, `pages = ["1_Cierre_Diario", "6_Facturas", "7_Disponibilidad_Flota"]`. Hash: `python -c "import bcrypt; print(bcrypt.hashpw(b'CLAVE', bcrypt.gensalt()).decode())"`.
+
 ## Prepay/counter charge split (critical business logic)
 
 For each `fact_charges_ra` row (counter contract), LEFT JOIN to `fact_charges_rs` (reservation) by `(rsrv_resn, inty, chco)` — **NOT by pos** (positions shift when counter inserts charges in the middle). The rs value = prepagado, the delta (ra - rs) = counter.
