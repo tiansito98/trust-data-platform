@@ -110,7 +110,20 @@ def require_auth() -> None:
         submitted = st.form_submit_button("Entrar")
 
     if submitted:
+        # Normalizar lo tipeado: un espacio pegado al copiar o la mayuscula que pone
+        # el celular al inicio ("Sixt_cartagena") daban "incorrectos" con credenciales
+        # buenas. Los usernames son todos en minuscula.
+        username = (username or "").strip().lower()
+        password = (password or "").strip()
         user_cfg = users.get(username)
+        if user_cfg is None:
+            # _load_users esta cacheado 1 hora: un usuario recien agregado a los
+            # secrets no aparecia hasta que expirara el cache o se reiniciara la app
+            # (2026-10-19, alta de sixt_cartagena). Se recarga una vez antes de
+            # rechazarlo.
+            _load_users.clear()
+            users = _load_users()
+            user_cfg = users.get(username)
         if user_cfg is None:
             st.error("Usuario o contrasena incorrectos.")
             st.stop()
