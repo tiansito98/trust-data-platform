@@ -47,6 +47,15 @@ def get_engine():
     es 100% confiable.
     """
     url = get_secret("SUPABASE_DB_URL")
+    # Forzar psycopg2 (el unico driver en requirements.txt). SQLAlchemy 2.1
+    # cambio el default de 'postgresql://' a psycopg3, y sin esto la app revienta
+    # con ModuleNotFoundError: No module named 'psycopg'. Mismo fix que
+    # pipelines/_common.py::_ensure_pg().
+    for pref in ("postgresql+psycopg://", "postgresql+psycopg3://",
+                 "postgresql://", "postgres://"):
+        if url.startswith(pref):
+            url = "postgresql+psycopg2://" + url[len(pref):]
+            break
     engine = create_engine(
         url,
         pool_pre_ping=True,

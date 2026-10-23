@@ -15,7 +15,8 @@
 # anterior hasta decidir si migramos.
 streamlit>=1.57,<1.62
 psycopg2-binary>=2.9.9
-sqlalchemy>=2.0.0
+# Techo <2.1: 2.1 cambio el driver default de postgresql:// a psycopg3.
+sqlalchemy>=2.0.0,<2.1
 pandas>=2.0.0
 plotly>=5.18.0
 bcrypt>=4.0.0
