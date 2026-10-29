@@ -1848,6 +1848,154 @@ def build_asesor_dias_mes(engine):
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
 
+def build_cobro_contrato(engine):
+    """fact_cobro_contrato: QUIEN COBRA la plata de cada contrato (1 fila/contrato).
+
+    Responde "cuanto de este contrato pago un tercero por adelantado (y la franquicia
+    tiene que reclamar despues) y cuanto se cobro en el counter". Es una pregunta de
+    CAJA, distinta de la de vw_rentals_detail.prepagado_cargo_usd: aquella compara
+    contra los cargos de la RESERVA ("venia en la reserva o lo vendio el asesor") y es
+    la correcta para COMISIONES y para el desglose de Cierre Diario, pero NO dice quien
+    paga: una reserva web "pago en counter" tambien trae sus cargos cotizados. Medido
+    2026: en canal COUNTER silver marcaba 859.794 USD como "prepagado" y lo
+    efectivamente pagado por terceros era 87.834. Por eso esta tabla es aparte y NO
+    toca la logica de comisiones.
+
+    Fuente: el encabezado del contrato separa el ingreso en dos pagadores (MAIN y
+    SECONDARY), cada uno con su forma de pago; la reserva trae el valor prepagado y el
+    valor de voucher. Validado sobre 2026 (3.536 contratos con ingreso, 2026-10-29):
+    main + secondary = ingreso total en el 100% de los contratos.
+
+    Montos en USD CON IVA (rntl_revenue_*_rental + rntl_tax_*_rental): es la plata que
+    se paga; el valor prepagado de la reserva incluye IVA y cuadra al centavo con
+    main + impuesto main. OJO monedas: en la RESERVA la moneda local es USD, asi que
+    rsrv_prepaid_value_local / rsrv_voucher_value_local estan en USD (el campo sin
+    sufijo esta en EUR); en el CONTRATO la local es COP. Solo contratos en USD: todos
+    los contratos con ingreso estan en USD (los en COP tienen ingreso 0).
+
+    Formas de pago (codigo -> quien cobra):
+      FE  credit card without numbers  -> la franquicia, en el counter
+      CC  Sixt Corporate Card          -> mayorista (lo paga a Sixt), retenido
+      FC  Full Credit Voucher          -> agencia por voucher, retenido
+      AI  Prepaid Agency Encashment    -> agencia, retenido
+      VI/EC/AE/DC tarjetas             -> retenido SOLO si la reserva tiene prepago
+                                          (Sixt cobro online); si no, es garantia y se
+                                          cobra en el counter
+
+    Regla del cubo MAIN (el SECONDARY es retenido solo si se pago CC/FC/AI; en 2026
+    siempre fue FE = counter):
+      1. CC / AI                 -> todo el main es anticipado.
+      2. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter.
+         El voucher manda aunque el contrato diga FE (4 de 11 contratos FE con voucher
+         lo cubren al centavo).
+      3. FC sin valor de voucher -> todo el main es anticipado.
+      4. hay prepago en la reserva -> anticipado = MIN(main, prepago); el resto son
+         extras cobrados en el counter (ej. prepago 200 + 100 de dias/conductor extra
+         en el counter -> 200 anticipado, 100 counter).
+      5. resto                   -> counter.
+    revisar = TRUE marca casos a confirmar a mano: FC con contrato mayor al voucher (no
+    esta claro si el excedente lo paga la agencia o el cliente) y reservas con flag de
+    prepago pero sin valor prepagado (se tratan como counter: el contrato dice FE).
+    """
+    log("\n>> Construyendo fact_cobro_contrato")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.fact_cobro_contrato CASCADE")
+    _exec(engine, """
+        CREATE TABLE silver.fact_cobro_contrato AS
+        WITH b AS (
+            SELECT
+                rf.numero_contrato,
+                rf.numero_reserva,
+                rf.fecha_handover_real::date                      AS fecha_entrega,
+                rf.fecha_devolucion_real::date                    AS fecha_devolucion,
+                rf.sede_handover,
+                rf.sede_handover_codigo,
+                rf.canal_cobro_tarifa,
+                rf.tipo_agencia_main,
+                rf.tercero_nombre,
+                -- Sin placa = no-show (hard rule 10). Cierre Diario los excluye, pero
+                -- aca SI van: en 2026 son 97 reservas PREPAGADAS online donde el
+                -- cliente no se presento y Sixt se quedo con el prepago (28.978 USD);
+                -- es plata retenida reclamable. Se marcan para mostrarlas aparte.
+                TRIM(COALESCE(rf.placa, '')) = ''                 AS es_no_show,
+                NULLIF(TRIM(r.rntl_voucher_number), '')           AS voucher_numero,
+                r.rntl_payment_type_code                          AS pago_main_codigo,
+                r.rntl_payment_type                               AS pago_main,
+                r.rntl_payment_type_s_code                        AS pago_secondary_codigo,
+                r.rntl_payment_type_s                             AS pago_secondary,
+                COALESCE(rs.rsrv_prepaid_flg, 0)                  AS prepago_flag,
+                COALESCE(r.rntl_revenue_main_rental, 0)
+                  + COALESCE(r.rntl_tax_main_rental, 0)           AS main_usd,
+                COALESCE(r.rntl_revenue_secondary_rental, 0)
+                  + COALESCE(r.rntl_tax_secondary_rental, 0)      AS secondary_usd,
+                NULLIF(COALESCE(rs.rsrv_prepaid_value_main_local,
+                                rs.rsrv_prepaid_value_local), 0)  AS prepago_usd,
+                NULLIF(COALESCE(rs.rsrv_voucher_value_main_local,
+                                rs.rsrv_voucher_value_local), 0)  AS voucher_usd
+            FROM silver.vw_rentals_full rf
+            JOIN silver.fact_rentals r ON r.rntl_mvnr = rf.numero_contrato
+            LEFT JOIN silver.fact_reservations rs
+                   ON rs.rsrv_resn = r.rsrv_resn AND r.rsrv_resn > 0
+            WHERE r.rntl_rental_currency_code = 'USD'
+              AND COALESCE(r.rntl_revenue_rental, 0) > 0
+        ), c AS (
+            SELECT b.*,
+                CASE
+                    WHEN pago_main_codigo IN ('CC', 'AI') THEN main_usd
+                    WHEN voucher_usd > 0                  THEN LEAST(main_usd, voucher_usd)
+                    WHEN pago_main_codigo = 'FC'          THEN main_usd
+                    WHEN prepago_usd > 0                  THEN LEAST(main_usd, prepago_usd)
+                    ELSE 0
+                END AS ant_main,
+                CASE WHEN pago_secondary_codigo IN ('CC', 'FC', 'AI')
+                     THEN secondary_usd ELSE 0 END        AS ant_secondary,
+                CASE
+                    WHEN pago_main_codigo = 'CC'          THEN 'MAYORISTA_TARJETA_CORPORATIVA'
+                    WHEN pago_main_codigo = 'AI'          THEN 'AGENCIA_PREPAGO'
+                    WHEN voucher_usd > 0 OR pago_main_codigo = 'FC' THEN 'VOUCHER_AGENCIA'
+                    WHEN prepago_usd > 0                  THEN 'PREPAGO_WEB_SIXT'
+                END AS origen_anticipado
+            FROM b
+        )
+        SELECT
+            numero_contrato, numero_reserva, fecha_entrega, fecha_devolucion,
+            sede_handover, sede_handover_codigo, canal_cobro_tarifa, tipo_agencia_main,
+            tercero_nombre, es_no_show, voucher_numero,
+            pago_main_codigo, pago_main, pago_secondary_codigo, pago_secondary,
+            prepago_flag,
+            ROUND(prepago_usd::numeric, 2)                          AS prepago_reserva_usd,
+            ROUND(voucher_usd::numeric, 2)                          AS voucher_reserva_usd,
+            ROUND(main_usd::numeric, 2)                             AS main_usd,
+            ROUND(secondary_usd::numeric, 2)                        AS secondary_usd,
+            ROUND((main_usd + secondary_usd)::numeric, 2)           AS total_usd,
+            ROUND((ant_main + ant_secondary)::numeric, 2)           AS anticipado_usd,
+            ROUND((main_usd + secondary_usd - ant_main - ant_secondary)::numeric, 2)
+                                                                    AS counter_usd,
+            CASE WHEN ant_main + ant_secondary > 0 THEN origen_anticipado END
+                                                                    AS origen_anticipado,
+            CASE
+                WHEN pago_main_codigo IN ('CC', 'AI') THEN 'Main pagado por tercero (' || pago_main_codigo || ')'
+                WHEN voucher_usd > 0                  THEN 'Voucher de agencia, hasta su valor'
+                WHEN pago_main_codigo = 'FC'          THEN 'Voucher FC sin valor: main completo'
+                WHEN prepago_usd > 0                  THEN 'Prepago web, hasta lo prepagado'
+                ELSE 'Cobrado en counter (' || COALESCE(pago_main_codigo, '-') || ')'
+            END                                                     AS regla,
+            (pago_main_codigo = 'FC' AND voucher_usd > 0 AND main_usd - voucher_usd > 0.05)
+              OR (prepago_flag = 1 AND prepago_usd IS NULL)         AS revisar,
+            CASE
+                WHEN pago_main_codigo = 'FC' AND voucher_usd > 0 AND main_usd - voucher_usd > 0.05
+                    THEN 'Voucher FC menor que el contrato: confirmar quien pago el excedente'
+                WHEN prepago_flag = 1 AND prepago_usd IS NULL
+                    THEN 'Reserva marcada prepagada pero sin valor prepagado: se tomo como counter'
+            END                                                     AS motivo_revision
+        FROM c
+    """)
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_cobro_fecha ON silver.fact_cobro_contrato(fecha_entrega, sede_handover_codigo)")
+    _exec(engine, "CREATE UNIQUE INDEX IF NOT EXISTS idx_cobro_contrato ON silver.fact_cobro_contrato(numero_contrato)")
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.fact_cobro_contrato")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
 def build_comision_dia(engine):
     """Base comisionable PRORRATEADA por dia efectivo 24h (para Cargos Granular).
 
@@ -2307,6 +2455,7 @@ def main():
     build_asesor_dias_mes(engine)
 
     # 13. Comisiones prorrateadas por dia efectivo (Cargos Granular)
+    build_cobro_contrato(engine)
     build_comision_dia(engine)
 
     # 14. Capa gold: analitica acida prorrateada (pagina 9_Analitica, solo admin)
