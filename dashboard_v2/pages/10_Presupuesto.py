@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 7
+P_API_REQUERIDA = 8
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -121,10 +121,12 @@ _cap_base = (
 # Placas que el presupuesto trata como si no existieran desde cierto mes (se gestionan
 # al final de la pagina). Salen de la flota Y de las tasas; el real no se toca.
 EXCL = P.excluded_plates(target.isoformat())
+EXCL_T = P.excluded_plates_rates(target.isoformat(), win_start.isoformat())
 RECAT = P.recat_map()   # categorias corregidas solo para el presupuesto
+UBIC = P.ubicaciones(target.isoformat())   # ciudades corregidas (solo la foto)
 base_df_all, factor, plates_all, _rates = P.base_inputs(
     win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat(),
-    EXCL, RECAT)
+    EXCL, RECAT, EXCL_T, UBIC)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
     st.stop()
@@ -455,7 +457,8 @@ st.caption(
     f"Las **{len(_pl)} placas** con las que se calcula la flota del presupuesto "
     f"(padrón activo al {snap_date}), por ciudad × categoría. **ACRISS Sixt** es la "
     "categoría original; **Categoría** es la del presupuesto (SDAH se cuenta como "
-    "EDAH y CDMR como EDMR). La ciudad sale del último día libre de la placa. "
+    "EDAH y CDMR como EDMR). La ciudad sale del último día libre de la placa, salvo "
+    "las **ubicaciones corregidas** (ver abajo). "
     f"Días rentados / en flota: ventana {_MES_ES[win_start.month]}–"
     f"{_MES_ES[win_end.month]} {win_end.year} (0 = la placa entró después).")
 with st.expander(f"Ver listado ({len(_pl)} placas)", expanded=False):
@@ -474,6 +477,7 @@ with st.expander(f"Ver listado ({len(_pl)} placas)", expanded=False):
         "ACRISS Sixt": _pl["acriss_sixt"],
         "Placa": _pl["placa"],
         "Sede": _pl["sede"],
+        "Ubicación corregida": _pl["ubic_ajustada"].map({True: "Sí", False: ""}),
         "Último día libre": _pl["ult_dia_libre"],
         "Última renta": _pl["ult_renta"],
         "Días rentados (ventana)": _pl["dias_rentados"].astype(int),
@@ -504,11 +508,15 @@ if len(_ex):
         "Placa": _ex["placa"].values,
         "Excluida desde": pd.to_datetime(_ex["desde_mes"]).map(
             lambda d: P.mes_label(d.date())).values,
+        "Hasta (inclusive)": pd.to_datetime(_ex["hasta_mes"]).map(
+            lambda d: P.mes_label(d.date()) if pd.notna(d) else "Sin fin").values,
         "Motivo": _ex["motivo"].fillna("").values,
         "Cargada por": _ex["created_by"].fillna("").values,
         "Estado": ["En la flota" if p_ in _en_flota else "Ya salió de la flota (baja en Sixt)"
                    for p_ in _ex["placa"]],
-        "Aplica a este mes": ["Sí" if p_ in EXCL else "No (empieza después)" for p_ in _ex["placa"]],
+        "Aplica a este mes": ["Sí" if p_ in EXCL
+                              else ("Volvió a la flota (fuera de las tasas)" if p_ in EXCL_T
+                                    else "No") for p_ in _ex["placa"]],
     }), hide_index=True, use_container_width=True)
 else:
     st.caption("No hay placas excluidas.")
@@ -519,25 +527,36 @@ with st.expander("Agregar o quitar placas excluidas"):
     _ya = set(_ex["placa"]) if len(_ex) else set()
     _mopts = P.month_options(today)
     with st.form("presup_excl_form"):
-        _add = st.multiselect("Placas a excluir", options=[p_ for p_ in _todas if p_ not in _ya])
+        _add = st.multiselect("Placas a excluir (o cambiar su período)", options=_todas)
         _desde = st.selectbox("Desde el mes", options=_mopts, format_func=P.mes_label,
                               index=_mopts.index(target) if target in _mopts else 0)
+        _hasta = st.selectbox("Hasta el mes (inclusive)", options=[None] + _mopts,
+                              format_func=lambda d: "Sin fin" if d is None else P.mes_label(d),
+                              help="Último mes excluido. Desde el mes siguiente la placa vuelve "
+                                   "a la flota (y a las tasas cuando la ventana de 3 meses ya "
+                                   "no toque el período excluido).")
         _motivo = st.text_input("Motivo", placeholder="p. ej. sale de la flota en noviembre")
-        _quitar = st.multiselect("Placas a volver a contar", options=sorted(_ya))
+        _quitar = st.multiselect("Placas a volver a contar (borra la exclusión, también "
+                                 "de los meses pasados)", options=sorted(_ya))
         _ok = st.form_submit_button("Guardar exclusiones", type="primary")
     if _ok:
         if not _add and not _quitar:
             st.warning("No elegiste ninguna placa.")
+        elif _add and _hasta is not None and _hasta < _desde:
+            st.warning("El mes *hasta* no puede ser anterior al mes *desde*.")
         else:
             try:
                 if _add:
                     execute_write(f"""
-                        INSERT INTO {P.EXCL_TABLE} (placa, desde_mes, motivo, created_by)
-                        VALUES (:p, :d, :m, :u)
+                        INSERT INTO {P.EXCL_TABLE} (placa, desde_mes, hasta_mes, motivo, created_by)
+                        VALUES (:p, :d, :h, :m, :u)
                         ON CONFLICT (placa) DO UPDATE SET desde_mes = EXCLUDED.desde_mes,
+                            hasta_mes = EXCLUDED.hasta_mes,
                             motivo = EXCLUDED.motivo, created_by = EXCLUDED.created_by,
                             created_at = NOW()
-                    """, [{"p": p_, "d": _desde.isoformat(), "m": _motivo.strip() or None,
+                    """, [{"p": p_, "d": _desde.isoformat(),
+                           "h": _hasta.isoformat() if _hasta else None,
+                           "m": _motivo.strip() or None,
                            "u": _u.get("username")} for p_ in _add])
                 if _quitar:
                     execute_write(f"DELETE FROM {P.EXCL_TABLE} WHERE placa = ANY(:q)",
@@ -549,6 +568,74 @@ with st.expander("Agregar o quitar placas excluidas"):
             load_query.clear()
             st.session_state["_presup_msg"] = (
                 f"Exclusiones actualizadas: {len(_add)} agregadas, {len(_quitar)} quitadas.")
+            st.rerun()
+
+
+# =============================================================================
+# Ubicaciones corregidas para el presupuesto (gestion)
+# =============================================================================
+section("Ubicaciones corregidas para el presupuesto")
+st.caption(
+    "Placas que el presupuesto pone en **otra ciudad** desde el mes indicado (p. ej. un "
+    "carro que la dirección mueve para el mes que viene y en Sixt todavía figura donde "
+    "quedó). Solo cambia la **foto de flota** (y la proyección de la página de traslados); "
+    "la ocupación y el RPD históricos siguen con la ciudad de Sixt. Cuando el traslado "
+    "quede registrado en Sixt, la corrección se puede quitar.")
+_ub = P.ubicaciones_all()
+if len(_ub):
+    st.dataframe(pd.DataFrame({
+        "Placa": _ub["placa"].values,
+        "Ciudad para el presupuesto": _ub["ciudad"].map(lambda c: SEDE_NICE.get(c, c)).values,
+        "Desde": pd.to_datetime(_ub["desde_mes"]).map(lambda d: P.mes_label(d.date())).values,
+        "Motivo": _ub["motivo"].fillna("").values,
+        "Cargada por": _ub["created_by"].fillna("").values,
+        "Aplica a este mes": ["Sí" if p_ in dict(UBIC) else "No (empieza después)"
+                              for p_ in _ub["placa"]],
+    }), hide_index=True, use_container_width=True)
+else:
+    st.caption("No hay ubicaciones corregidas.")
+
+with st.expander("Corregir o quitar la ciudad de una placa"):
+    _todas_ub = sorted(P.fleet_snapshot(_last_day.isoformat(), win_start.isoformat(),
+                                        win_end.isoformat())["placa"])
+    _ya_ub = set(_ub["placa"]) if len(_ub) else set()
+    _mopts_ub = P.month_options(today)
+    with st.form("presup_ubic_form"):
+        _ub_add = st.multiselect("Placas a mover", options=_todas_ub)
+        _ub_city = st.selectbox("Ciudad", options=SEDE_ORDER, format_func=lambda c: SEDE_NICE[c])
+        _ub_desde = st.selectbox("Desde el mes", options=_mopts_ub, format_func=P.mes_label,
+                                 index=_mopts_ub.index(target) if target in _mopts_ub else 0,
+                                 key="presup_ubic_desde")
+        _ub_mot = st.text_input("Motivo", placeholder="p. ej. pasa a Bogotá en noviembre",
+                                key="presup_ubic_motivo")
+        _ub_quitar = st.multiselect("Placas a volver a la ciudad de Sixt", options=sorted(_ya_ub))
+        _ub_ok = st.form_submit_button("Guardar ubicaciones", type="primary")
+    if _ub_ok:
+        if not _ub_add and not _ub_quitar:
+            st.warning("No elegiste ninguna placa.")
+        else:
+            try:
+                if _ub_add:
+                    execute_write(f"""
+                        INSERT INTO {P.UBIC_TABLE} (placa, ciudad, desde_mes, motivo, created_by)
+                        VALUES (:p, :c, :d, :m, :u)
+                        ON CONFLICT (placa) DO UPDATE SET ciudad = EXCLUDED.ciudad,
+                            desde_mes = EXCLUDED.desde_mes, motivo = EXCLUDED.motivo,
+                            created_by = EXCLUDED.created_by, created_at = NOW()
+                    """, [{"p": p_, "c": _ub_city, "d": _ub_desde.isoformat(),
+                           "m": _ub_mot.strip() or None, "u": _u.get("username")}
+                          for p_ in _ub_add])
+                if _ub_quitar:
+                    execute_write(f"DELETE FROM {P.UBIC_TABLE} WHERE placa = ANY(:q)",
+                                  {"q": list(_ub_quitar)})
+            except Exception as ex:
+                st.error(f"No se pudieron guardar las ubicaciones: {type(ex).__name__}.")
+                st.exception(ex)
+                st.stop()
+            load_query.clear()
+            st.session_state["_presup_msg"] = (
+                f"Ubicaciones actualizadas: {len(_ub_add)} movidas, "
+                f"{len(_ub_quitar)} devueltas a la ciudad de Sixt.")
             st.rerun()
 
 

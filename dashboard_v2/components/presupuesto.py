@@ -26,7 +26,17 @@ trata como si NO HUBIERAN EXISTIDO desde `desde_mes` (decision de negocio
 desde_mes se sacan de la flota, de la ventana de tasas, del factor estacional y de
 los carro-dias de la pagina de traslados. Es lo mismo que hace gold solo cuando
 Sixt los da de baja (borra su historia), asi que al salir no cambia nada mas. El
-REAL (gold_cargo_dia) no se toca.
+REAL (gold_cargo_dia) no se toca. Con `hasta_mes` (2026-10-30) la exclusion TERMINA:
+la placa vuelve a la flota desde el mes siguiente, pero sigue fuera de las TASAS
+mientras la ventana de 3 meses toque el periodo excluido (NPM363: parada en Cartagena
+sep-oct sin traslado registrado, gold la tenia "libre en Medellin"; esos dias no deben
+bajar la ocupacion de Medellin).
+
+Ubicaciones corregidas (operational.presupuesto_ubicacion_placa): placa -> ciudad
+desde un mes, SOLO para la foto de flota (y la proyeccion de traslados). La historia
+y las tasas siguen con la sede de gold. Caso de uso: la direccion mueve un carro de
+ciudad para el mes que viene y gold todavia lo tiene donde quedo (NPN023
+Medellin -> Bogota desde nov-2026).
 
 Reclasificaciones (operational.presupuesto_categoria_placa): placa -> ACRISS correcto
 para el presupuesto (p.ej. cargadas mal en COBRA). Se aplican en la subconsulta _GC,
@@ -46,7 +56,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 7
+API_VERSION = 8
 
 # Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
 # FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
@@ -93,6 +103,8 @@ def ensure_exclusion_table() -> None:
             created_at  timestamptz DEFAULT now()
         )
     """, {})
+    # 2026-10-30: la exclusion puede terminar (ultimo mes excluido, inclusive).
+    execute_write(f"ALTER TABLE {EXCL_TABLE} ADD COLUMN IF NOT EXISTS hasta_mes date", {})
 
 
 RECAT_TABLE = "operational.presupuesto_categoria_placa"
@@ -146,19 +158,70 @@ def _rp(recat: tuple) -> dict:
 
 
 def excluded_plates(target_iso: str) -> tuple:
-    """Placas excluidas para el mes `target_iso` (desde_mes <= mes). Tupla ordenada:
-    se pasa a las funciones cacheadas, asi el cache se invalida si cambia la lista."""
+    """Placas FUERA DE LA FLOTA del mes `target_iso` (desde_mes <= mes <= hasta_mes).
+    Tupla ordenada: se pasa a las funciones cacheadas, asi el cache se invalida si
+    cambia la lista."""
     ensure_exclusion_table()
-    d = load_query(f"SELECT placa FROM {EXCL_TABLE} WHERE desde_mes <= :m",
+    d = load_query(f"""SELECT placa FROM {EXCL_TABLE}
+                       WHERE desde_mes <= :m AND (hasta_mes IS NULL OR hasta_mes >= :m)""",
                    {"m": target_iso})
+    return tuple(sorted(d["placa"].astype(str).str.strip().unique())) if len(d) else ()
+
+
+def excluded_plates_rates(target_iso: str, win_start: str) -> tuple:
+    """Placas FUERA DE LAS TASAS (ocupacion, RPD, factor estacional) del mes: las de
+    la flota + las que ya volvieron pero cuyo periodo excluido todavia cae dentro de
+    la ventana de 3 meses (desde win_start)."""
+    ensure_exclusion_table()
+    d = load_query(f"""SELECT placa FROM {EXCL_TABLE}
+                       WHERE desde_mes <= :m
+                         AND (hasta_mes IS NULL
+                              OR (hasta_mes + INTERVAL '1 month' - INTERVAL '1 day')::date >= :w)""",
+                   {"m": target_iso, "w": win_start})
     return tuple(sorted(d["placa"].astype(str).str.strip().unique())) if len(d) else ()
 
 
 def exclusions_all() -> pd.DataFrame:
     ensure_exclusion_table()
     return load_query(f"""
-        SELECT placa, desde_mes, motivo, created_by, created_at
+        SELECT placa, desde_mes, hasta_mes, motivo, created_by, created_at
         FROM {EXCL_TABLE} ORDER BY desde_mes, placa""", {})
+
+
+UBIC_TABLE = "operational.presupuesto_ubicacion_placa"
+
+
+@st.cache_resource
+def ensure_ubic_table() -> None:
+    execute_write(f"""
+        CREATE TABLE IF NOT EXISTS {UBIC_TABLE} (
+            placa       text PRIMARY KEY,
+            ciudad      text NOT NULL,
+            desde_mes   date NOT NULL,
+            motivo      text,
+            created_by  text,
+            created_at  timestamptz DEFAULT now()
+        )
+    """, {})
+
+
+def ubicaciones(target_iso: str) -> tuple:
+    """Ubicaciones corregidas vigentes para el mes: ((placa, CIUDAD), ...) ordenada.
+    CIUDAD es una clave de SEDE_ORDER. Solo mueve la placa en la foto de flota."""
+    ensure_ubic_table()
+    d = load_query(f"SELECT placa, ciudad FROM {UBIC_TABLE} WHERE desde_mes <= :m",
+                   {"m": target_iso})
+    if not len(d):
+        return ()
+    return tuple(sorted(zip(d["placa"].astype(str).str.strip(),
+                            d["ciudad"].astype(str).str.strip().str.upper())))
+
+
+def ubicaciones_all() -> pd.DataFrame:
+    ensure_ubic_table()
+    return load_query(f"""
+        SELECT placa, ciudad, desde_mes, motivo, created_by, created_at
+        FROM {UBIC_TABLE} ORDER BY desde_mes, placa""", {})
 
 
 def grp(sede: str) -> str:
@@ -229,7 +292,7 @@ def snapshot_date(target: dt.date, last_day: dt.date) -> dt.date:
 
 @st.cache_data(ttl=600)
 def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (),
-                   recat: tuple = ()) -> pd.DataFrame:
+                   recat: tuple = (), ubic: tuple = ()) -> pd.DataFrame:
     """UNA FILA POR PLACA activa en `as_of` (no conteos): el listado auditable y el
     conteo de flota salen del mismo DataFrame, asi que no pueden diferir.
 
@@ -242,6 +305,9 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (
     Sesgo conocido: gold_carro_dia solo trae placas del roster ACTIVO de hoy, asi que
     en una foto vieja faltan los carros que ya salieron de la flota (en 2026 es
     ~0,3% del ingreso; crece hacia atras).
+
+    `ubic` ((placa, CIUDAD), ...) pisa la ciudad de la foto (ubicaciones corregidas);
+    la columna ubic_ajustada lo marca para el listado.
     """
     plates = load_query("""
         WITH act AS (
@@ -275,6 +341,9 @@ def fleet_snapshot(as_of_iso: str, win_start: str, win_end: str, excl: tuple = (
     """.replace("{GC}", _GC), {"asof": as_of_iso, "a": win_start, "b": win_end,
                                "ex": list(excl), **_rp(recat)})
     plates["g"] = plates["sede"].map(grp)
+    _u = dict(ubic)
+    plates["ubic_ajustada"] = plates["placa"].isin(_u) & (plates["placa"].map(_u) != plates["g"])
+    plates.loc[plates["placa"].isin(_u), "g"] = plates["placa"].map(_u)
     plates["acriss"] = plates["acriss_ppto"].map(canon)
     return plates
 
@@ -301,18 +370,21 @@ def cell_rpd(rates: dict, g: str, a: str) -> float:
 
 @st.cache_data(ttl=600)
 def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_iso: str,
-                excl: tuple = (), recat: tuple = ()):
-    """Tasas de la ventana + flota de la foto. Devuelve
+                excl: tuple = (), recat: tuple = (), excl_tasas: tuple = None,
+                ubic: tuple = ()):
+    """Tasas de la ventana + flota de la foto. `excl` saca placas de la flota y
+    `excl_tasas` (default = excl) de las tasas; ver excluded_plates_rates(). Devuelve
     (base_df, factor_estacional_ocupacion, plates, rates); base_df = 1 fila por celda
     de la foto con n (placas), occ_base (con factor estacional, tope 98%) y rpd (con
     factor estacional de RPD). rates["f_occ"] / rates["f_rpd"] = los dos factores."""
+    ex_t = excl if excl_tasas is None else excl_tasas
     m = load_query(f"""
         SELECT sede, acriss, SUM(rented_day) AS rented, COUNT(*) AS fleet_days,
                SUM(tar_{suf}) AS t_val
         FROM {_GC} gc WHERE fecha BETWEEN :a AND :b
           AND NOT (placa = ANY(:ex))
         GROUP BY sede, acriss
-    """, {"a": win_start, "b": win_end, "ex": list(excl), **_rp(recat)})
+    """, {"a": win_start, "b": win_end, "ex": list(ex_t), **_rp(recat)})
     m["g"] = m["sede"].map(grp)
     m["acriss"] = m["acriss"].map(canon)   # los groupby de abajo suman las unidas
     for c in ("rented", "fleet_days", "t_val"):
@@ -359,7 +431,7 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
         WHERE fecha BETWEEN LEAST(CAST(:wa AS date), CAST(:ta AS date))
                         AND GREATEST(CAST(:wb AS date), CAST(:tb AS date))
           AND NOT (placa = ANY(:ex))
-    """, {"ta": tgt_prev_a, "tb": tgt_prev_b, "wa": ws_prev, "wb": we_prev, "ex": list(excl)})
+    """, {"ta": tgt_prev_a, "tb": tgt_prev_b, "wa": ws_prev, "wb": we_prev, "ex": list(ex_t)})
     occ_t, occ_w = sf.iloc[0]["occ_tgt"], sf.iloc[0]["occ_win"]
     factor = float(occ_t / occ_w) if pd.notna(occ_t) and pd.notna(occ_w) and occ_w else 1.0
     factor = max(0.5, min(1.5, factor))
@@ -368,7 +440,7 @@ def base_inputs(win_start: str, win_end: str, target_iso: str, suf: str, as_of_i
     f_rpd = max(0.5, min(1.5, f_rpd))
     rates["f_occ"], rates["f_rpd"] = factor, f_rpd
 
-    plates = fleet_snapshot(as_of_iso, win_start, win_end, excl, recat)
+    plates = fleet_snapshot(as_of_iso, win_start, win_end, excl, recat, ubic)
     fleet = plates.groupby(["g", "acriss"], as_index=False).size().rename(columns={"size": "n"})
     rows = []
     for _, fr in fleet.iterrows():

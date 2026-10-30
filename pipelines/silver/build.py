@@ -1883,19 +1883,22 @@ def build_cobro_contrato(engine):
                                           cobra en el counter
 
     Regla del cubo MAIN (el SECONDARY es retenido solo si se pago CC/FC/AI; en 2026
-    siempre fue FE = counter):
-      1. CC / AI                 -> todo el main es anticipado.
-      2. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter.
-         El voucher manda aunque el contrato diga FE (4 de 11 contratos FE con voucher
-         lo cubren al centavo).
-      3. FC sin valor de voucher -> todo el main es anticipado.
+    siempre fue FE = counter). Revisada con la direccion el 2026-10-30:
+      1. FE                      -> TODO counter, aunque la reserva venga prepagada o
+         con voucher: es una reserva prepagada a la que le cambiaron la forma de pago
+         en el counter y el cliente pago ahi (ej. 9523929866, 9524003988).
+      2. CC / AI / FC            -> todo el main es anticipado. FC = voucher de agencia
+         que cubre el contrato completo; el valor del voucher de la reserva puede
+         diferir por centavos o por cambios y NO topa (ej. 9524073587).
+      3. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter.
       4. hay prepago en la reserva -> anticipado = MIN(main, prepago); el resto son
          extras cobrados en el counter (ej. prepago 200 + 100 de dias/conductor extra
          en el counter -> 200 anticipado, 100 counter).
       5. resto                   -> counter.
-    revisar = TRUE marca casos a confirmar a mano: FC con contrato mayor al voucher (no
-    esta claro si el excedente lo paga la agencia o el cliente) y reservas con flag de
-    prepago pero sin valor prepagado (se tratan como counter: el contrato dice FE).
+    revisar = TRUE marca casos a confirmar a mano: contrato MENOR que lo prepagado (se
+    devolvio antes o bajo de categoria; el anticipado queda en el valor del contrato,
+    ej. 9523810630 prepago 409,31 vs contrato 329,32) y reservas con flag de prepago
+    pero sin valor prepagado (se tratan como counter).
     """
     log("\n>> Construyendo fact_cobro_contrato")
     started = time.time()
@@ -1941,10 +1944,10 @@ def build_cobro_contrato(engine):
         ), c AS (
             SELECT b.*,
                 CASE
-                    WHEN pago_main_codigo IN ('CC', 'AI') THEN main_usd
-                    WHEN voucher_usd > 0                  THEN LEAST(main_usd, voucher_usd)
-                    WHEN pago_main_codigo = 'FC'          THEN main_usd
-                    WHEN prepago_usd > 0                  THEN LEAST(main_usd, prepago_usd)
+                    WHEN pago_main_codigo = 'FE'                THEN 0
+                    WHEN pago_main_codigo IN ('CC', 'AI', 'FC') THEN main_usd
+                    WHEN voucher_usd > 0                        THEN LEAST(main_usd, voucher_usd)
+                    WHEN prepago_usd > 0                        THEN LEAST(main_usd, prepago_usd)
                     ELSE 0
                 END AS ant_main,
                 CASE WHEN pago_secondary_codigo IN ('CC', 'FC', 'AI')
@@ -1974,23 +1977,30 @@ def build_cobro_contrato(engine):
             CASE WHEN ant_main + ant_secondary > 0 THEN origen_anticipado END
                                                                     AS origen_anticipado,
             CASE
-                WHEN pago_main_codigo IN ('CC', 'AI') THEN 'Main pagado por tercero (' || pago_main_codigo || ')'
+                WHEN pago_main_codigo = 'FE' AND (prepago_usd > 0 OR voucher_usd > 0)
+                                                      THEN 'Venia prepagada, cambio a FE en counter'
+                WHEN pago_main_codigo IN ('CC', 'AI', 'FC')
+                                                      THEN 'Main pagado por tercero (' || pago_main_codigo || ')'
                 WHEN voucher_usd > 0                  THEN 'Voucher de agencia, hasta su valor'
-                WHEN pago_main_codigo = 'FC'          THEN 'Voucher FC sin valor: main completo'
                 WHEN prepago_usd > 0                  THEN 'Prepago web, hasta lo prepagado'
                 ELSE 'Cobrado en counter (' || COALESCE(pago_main_codigo, '-') || ')'
             END                                                     AS regla,
-            (pago_main_codigo = 'FC' AND voucher_usd > 0 AND main_usd - voucher_usd > 0.05)
-              OR (prepago_flag = 1 AND prepago_usd IS NULL)         AS revisar,
+            COALESCE(
+                (ant_main > 0 AND COALESCE(pago_main_codigo, '') NOT IN ('CC', 'AI', 'FC')
+                     AND GREATEST(COALESCE(voucher_usd, 0), COALESCE(prepago_usd, 0)) - main_usd > 0.05)
+                OR (COALESCE(pago_main_codigo, '') <> 'FE' AND prepago_flag = 1 AND prepago_usd IS NULL),
+                FALSE)                                              AS revisar,
             CASE
-                WHEN pago_main_codigo = 'FC' AND voucher_usd > 0 AND main_usd - voucher_usd > 0.05
-                    THEN 'Voucher FC menor que el contrato: confirmar quien pago el excedente'
-                WHEN prepago_flag = 1 AND prepago_usd IS NULL
+                WHEN ant_main > 0 AND COALESCE(pago_main_codigo, '') NOT IN ('CC', 'AI', 'FC')
+                     AND GREATEST(COALESCE(voucher_usd, 0), COALESCE(prepago_usd, 0)) - main_usd > 0.05
+                    THEN 'Contrato menor que lo prepagado: anticipado = valor del contrato'
+                WHEN COALESCE(pago_main_codigo, '') <> 'FE' AND prepago_flag = 1 AND prepago_usd IS NULL
                     THEN 'Reserva marcada prepagada pero sin valor prepagado: se tomo como counter'
             END                                                     AS motivo_revision
         FROM c
     """)
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_cobro_fecha ON silver.fact_cobro_contrato(fecha_entrega, sede_handover_codigo)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_cobro_devolucion ON silver.fact_cobro_contrato(fecha_devolucion, sede_handover_codigo)")
     _exec(engine, "CREATE UNIQUE INDEX IF NOT EXISTS idx_cobro_contrato ON silver.fact_cobro_contrato(numero_contrato)")
     n = _scalar(engine, "SELECT COUNT(*) FROM silver.fact_cobro_contrato")
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")

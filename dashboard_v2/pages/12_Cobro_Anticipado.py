@@ -12,7 +12,8 @@ prepagado/counter de Cierre Diario: aquel dice si el cargo "venia en la reserva"
 de las comisiones), no quien pago la plata.
 
 Montos en USD con IVA (lo que efectivamente se paga). Filtra por fecha de ENTREGA del
-contrato, igual que Cierre Diario.
+contrato (igual que Cierre Diario) o de DEVOLUCION (como COBRA, que factura al cierre).
+No-shows y cancelaciones (sin carro) NO se muestran (decision de la direccion 2026-10-30).
 """
 import sys
 from pathlib import Path
@@ -58,7 +59,13 @@ ORIGEN_NICE = {
 # =============================================================================
 # Datos
 # =============================================================================
-_where = ["fecha_entrega BETWEEN :a AND :b"]
+_base = st.radio("Filtrar el rango de fechas por", ["Fecha de entrega", "Fecha de devolución"],
+                 horizontal=True, key="cobro_base",
+                 help="Entrega = como Cierre Diario. Devolución = como COBRA (el contrato se "
+                      "factura al cerrar): una renta del 29-jul al 1-ago cae en julio por "
+                      "entrega y en agosto por devolución.")
+_col_fecha = "fecha_entrega" if _base == "Fecha de entrega" else "fecha_devolucion"
+_where = [f"{_col_fecha} BETWEEN :a AND :b", "NOT es_no_show"]
 _params = {"a": filtros.fecha_desde.isoformat(), "b": filtros.fecha_hasta.isoformat()}
 if filtros.sedes_codigos:
     _where.append("sede_handover_codigo = ANY(:sedes)")
@@ -72,7 +79,7 @@ df = load_query(f"""
            revisar, motivo_revision
     FROM silver.fact_cobro_contrato
     WHERE {' AND '.join(_where)}
-    ORDER BY fecha_entrega, numero_contrato
+    ORDER BY {_col_fecha}, numero_contrato
 """, _params)
 for c in ("total_usd", "anticipado_usd", "counter_usd", "main_usd", "secondary_usd",
           "prepago_reserva_usd", "voucher_reserva_usd"):
@@ -89,11 +96,10 @@ df["a_quien"] = df.apply(
     if r["anticipado_usd"] > 0 else "-", axis=1)
 df["numero_contrato"] = df["numero_contrato"].astype("int64").astype(str)
 
-ren = df[~df["es_no_show"]]
-nos = df[df["es_no_show"]]
+ren = df
 
 # =============================================================================
-# KPIs (contratos; los no-shows van aparte)
+# KPIs
 # =============================================================================
 _tot, _ant, _cnt = ren["total_usd"].sum(), ren["anticipado_usd"].sum(), ren["counter_usd"].sum()
 k1, k2, k3, k4 = st.columns(4)
@@ -103,16 +109,12 @@ kpi(k3, "Anticipado — a reclamar (USD)", fmt_money(_ant, "USD"),
     f"{_ant / _tot * 100:.1f}% del total" if _tot else "")
 kpi(k4, "Cobrado en counter (USD)", fmt_money(_cnt, "USD"),
     f"{_cnt / _tot * 100:.1f}% del total" if _tot else "")
-if len(nos):
-    st.info(f"Además hay **{len(nos)} no-shows prepagados** por **{fmt_money(nos['anticipado_usd'].sum(), 'USD')}** "
-            "anticipados: el cliente prepagó online, no se presentó y Sixt retuvo el prepago. "
-            "No cuentan en los totales de arriba (Cierre Diario tampoco los cuenta); están al final.")
-
 st.caption(
     "**Anticipado** = lo que pagó un tercero por adelantado: prepago web de Sixt (hasta lo "
-    "prepagado), mayorista con tarjeta corporativa Sixt (CC) o voucher de agencia (hasta su "
-    "valor). **Counter** = lo demás: lo que pagó el cliente en la sede (extras, días "
-    "adicionales, reservas web con pago en counter). Montos con IVA, por fecha de entrega.")
+    "prepagado), mayorista con tarjeta corporativa Sixt (CC) o voucher de agencia FC (contrato "
+    "completo). **Counter** = lo demás: lo que pagó el cliente en la sede (extras, días "
+    "adicionales, reservas web con pago en counter y reservas prepagadas a las que les "
+    "cambiaron la forma de pago a FE en el counter). Montos con IVA. Sin no-shows ni cancelaciones.")
 
 # =============================================================================
 # A quien reclamar
@@ -128,7 +130,6 @@ st.dataframe(pd.DataFrame({
     "Contratos": _rec["contratos"].values,
     "Anticipado (USD)": _rec["anticipado"].map(lambda v: fmt_money(v, "USD")).values,
 }), hide_index=True, use_container_width=True)
-st.caption("Incluye los no-shows prepagados.")
 
 # =============================================================================
 # Contratos
@@ -149,11 +150,14 @@ def _tabla(t: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({
         "Contrato": t["numero_contrato"].values,
         "Entrega": t["fecha_entrega"].values,
+        "Devolución": t["fecha_devolucion"].values,
         "Sede": t["sede_handover"].values,
         "Origen anticipado": t["origen"].values,
         "A quién reclamar": t["a_quien"].values,
         "Pago main": t["pago_main_codigo"].fillna("").values,
         "Pago secondary": t["pago_secondary_codigo"].fillna("").values,
+        "Prepago reserva (USD)": t["prepago_reserva_usd"].round(2).values,
+        "Voucher reserva (USD)": t["voucher_reserva_usd"].round(2).values,
         "Total (USD)": t["total_usd"].round(2).values,
         "Anticipado (USD)": t["anticipado_usd"].round(2).values,
         "Counter (USD)": t["counter_usd"].round(2).values,
@@ -162,19 +166,20 @@ def _tabla(t: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+_MONTOS = ("Prepago reserva (USD)", "Voucher reserva (USD)", "Total (USD)",
+           "Anticipado (USD)", "Counter (USD)")
 _out = _tabla(_t)
 st.dataframe(_out, hide_index=True, use_container_width=True,
              height=min(600, 38 + 35 * max(len(_out), 1)),
              column_config={c: st.column_config.NumberColumn(format="%.2f")
-                            for c in ("Total (USD)", "Anticipado (USD)", "Counter (USD)")})
+                            for c in _MONTOS})
 st.caption(f"{fmt_int(len(_out))} contratos · total {fmt_money(_t['total_usd'].sum(), 'USD')} · "
            f"anticipado {fmt_money(_t['anticipado_usd'].sum(), 'USD')} · "
            f"counter {fmt_money(_t['counter_usd'].sum(), 'USD')}")
-xlsx_download_button(_tabla(df.assign(origen=df["origen"])).assign(
-                         **{"No-show": df["es_no_show"].map({True: "Sí", False: ""}).values}),
+xlsx_download_button(_tabla(df),
                      file_name=f"cobro_anticipado_{filtros.fecha_desde}_{filtros.fecha_hasta}",
                      sheet_name="Contratos", key="cobro_xlsx")
-st.caption("El Excel trae todos los contratos del rango (incluidos los no-shows prepagados).")
+st.caption("El Excel trae todos los contratos del rango.")
 
 # =============================================================================
 # Detalle de un contrato
@@ -220,18 +225,6 @@ if _sel:
             "Con IVA (USD)": pd.to_numeric(cargos["subtotal_con_iva_usd"], errors="coerce").round(2).values,
         }), hide_index=True, use_container_width=True)
 
-# =============================================================================
-# No-shows prepagados
-# =============================================================================
-if len(nos):
-    section("No-shows prepagados")
-    st.caption("Reservas prepagadas online donde el cliente no se presentó: Sixt cobró y "
-               "retuvo el prepago. No son rentas (no tienen carro) y Cierre Diario no las "
-               "cuenta, pero es plata reclamable.")
-    st.dataframe(_tabla(nos), hide_index=True, use_container_width=True,
-                 column_config={c: st.column_config.NumberColumn(format="%.2f")
-                                for c in ("Total (USD)", "Anticipado (USD)", "Counter (USD)")})
-
 st.caption("Fuente: silver.fact_cobro_contrato. Regla: el pagador MAIN/SECONDARY del contrato y "
-           "su forma de pago (FE = counter; CC, FC, AI = tercero), más el prepago y el voucher de "
+           "su forma de pago (FE = counter aunque la reserva venga prepagada; CC, FC, AI = tercero), más el prepago y el voucher de "
            "la reserva. Validado 2026: main + secondary = total en el 100% de los contratos.")
