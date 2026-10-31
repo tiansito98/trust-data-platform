@@ -5,7 +5,8 @@ Distribucion por categoria ACRISS (codigo de 4 letras: M/E/C/I/S/F/P =
 tamano, D/C/W/V/T = tipo carroceria, M/A = transmision, R/N/D = combustible).
 
 Tres bloques:
-  1. Distribucion por categoria ACRISS / label humano.
+  1. Por categoria de vehiculo desde la capa gold (ticket promedio por dia = RPD,
+     ocupacion, RevPAU), con las categorias corregidas del presupuesto.
   2. Upgrades vs downgrades comparando acriss_reservado vs acriss_entregado.
   3. Top vehiculos fisicos (marca + modelo, por revenue).
 """
@@ -26,6 +27,7 @@ from components.common import (
 )
 from components.filters import render_sidebar_filters, render_active_filters_banner
 from components.auth import require_auth, require_page, logout_button
+from components import presupuesto as P   # categorias corregidas (mismas del presupuesto)
 
 st.set_page_config(page_title="TRUST - Vehiculos", layout="wide")
 require_auth()
@@ -41,80 +43,124 @@ where_sql, params = filtros.where_clause()
 suf = "_usd" if filtros.moneda == "USD" else "_cop"
 cur = filtros.moneda
 
-# ---------- Distribucion por categoria entregada ----------
-section("Distribucion por categoria entregada")
-cat_sql = f"""
-SELECT acriss_entregado, categoria_entregada,
-       COUNT(*)                       AS rentals,
-       SUM(neto_usd)                  AS neto_usd,
-       AVG(neto_usd)                  AS ticket_usd,
-       SUM(neto_cop)                  AS neto_cop,
-       AVG(dias_renta * 1.0)          AS dias_avg,
-       SUM(CASE WHEN acriss_reservado IS NOT NULL
-                 AND acriss_entregado != acriss_reservado
-                THEN 1 ELSE 0 END)    AS upgrades_o_downgrades,
-       SUM(CASE WHEN acriss_reservado IS NULL THEN 1 ELSE 0 END) AS walk_in
-FROM vw_rentals_resumen
-WHERE {where_sql}
-  AND acriss_entregado IS NOT NULL
-GROUP BY acriss_entregado, categoria_entregada
-ORDER BY rentals DESC
-"""
-df_cat = load_query(cat_sql, params)
+# No-shows y cancelaciones (sin placa o total 0) NO son rentas (hard rule 10). Aplica a
+# las tres secciones; antes entraban y creaban categorias falsas (CDMR ago-oct 2026 =
+# 35 no-shows y ninguna renta real).
+where_sql += " AND TRIM(COALESCE(placa,'')) <> '' AND COALESCE(total_con_iva_usd,0) > 0"
 
-if df_cat.empty:
-    st.info("Sin contratos en los filtros seleccionados.")
+# ---------- Por categoria de vehiculo (capa gold, acida) ----------
+# Fuente: silver.gold_carro_dia (placa x dia), la misma de Analitica: ingreso repartido
+# en bloques de 24h dentro del rango (una renta que cruza meses aporta solo sus dias),
+# categoria del carro REAL de cada tramo (no el primero del contrato), sin no-shows.
+# Categoria = la del presupuesto: correcciones por placa (operational.
+# presupuesto_categoria_placa) + unificadas SDAH->EDAH y CDMR->EDMR (ACRISS_CANON).
+# Ticket promedio = RPD = ingreso / dia rentado. Sesgo conocido: gold solo trae los
+# carros del roster activo (en 2026 falta ~0,3% del ingreso; mas hacia atras).
+section("Por categoria de vehiculo (ácida, capa gold)")
+_recat = P.recat_map()
+if filtros.sedes_nombres:
+    _sedes_g = list(filtros.sedes_nombres)
+else:
+    _sedes_g = load_query(
+        "SELECT DISTINCT sede FROM silver.gold_carro_dia WHERE fecha BETWEEN :d AND :h",
+        {"d": filtros.fecha_desde.isoformat(), "h": filtros.fecha_hasta.isoformat()},
+    )["sede"].dropna().tolist()
+_SUFG = "cop" if cur == "COP" else "usd"
+df_cat = load_query(f"""
+    SELECT gc.acriss, gc.acriss_orig,
+           COUNT(DISTINCT gc.placa)      AS placas,
+           COUNT(*)                      AS fleet_days,
+           SUM(gc.rented_day)            AS rented_days,
+           SUM(g.rev_{_SUFG})            AS revenue
+    FROM {P._GC} gc
+    JOIN silver.gold_carro_dia g ON g.placa = gc.placa AND g.fecha = gc.fecha
+    WHERE gc.fecha BETWEEN :d AND :h AND gc.sede = ANY(:sedes)
+    GROUP BY gc.acriss, gc.acriss_orig
+""", {"d": filtros.fecha_desde.isoformat(), "h": filtros.fecha_hasta.isoformat(),
+      "sedes": _sedes_g, **P._rp(_recat)})
+for c in ("placas", "fleet_days", "rented_days", "revenue"):
+    df_cat[c] = pd.to_numeric(df_cat[c], errors="coerce").fillna(0.0)
+df_cat["categoria"] = df_cat["acriss"].map(P.canon)
+if filtros.acriss:   # el filtro del sidebar usa codigos de Sixt: se unifican igual
+    _fa = {P.canon(a) for a in filtros.acriss}
+    df_cat = df_cat[df_cat["categoria"].isin(_fa)]
+
+if df_cat.empty or df_cat["fleet_days"].sum() == 0:
+    st.info("Sin datos de flota en los filtros seleccionados.")
     st.stop()
 
-for c in ["rentals", "neto_usd", "ticket_usd", "neto_cop", "dias_avg",
-          "upgrades_o_downgrades", "walk_in"]:
-    df_cat[c] = pd.to_numeric(df_cat[c], errors="coerce").fillna(0.0)
+_n_dias = max((filtros.fecha_hasta - filtros.fecha_desde).days + 1, 1)
+_orig = (df_cat[df_cat["acriss_orig"] != df_cat["categoria"]]
+         .groupby("categoria")["acriss_orig"]
+         .apply(lambda x: ", ".join(sorted(set(x)))))
+gcat = (df_cat.groupby("categoria", as_index=False)
+        .agg(fleet_days=("fleet_days", "sum"), rented_days=("rented_days", "sum"),
+             revenue=("revenue", "sum")))
+gcat["flota_prom"] = gcat["fleet_days"] / _n_dias
+gcat["ocupacion"] = gcat["rented_days"] / gcat["fleet_days"].replace(0, pd.NA)
+gcat["ticket"] = gcat["revenue"] / gcat["rented_days"].replace(0, pd.NA)
+gcat["revpau"] = gcat["revenue"] / gcat["fleet_days"].replace(0, pd.NA)
+gcat["incluye"] = gcat["categoria"].map(_orig).fillna("")
+gcat = gcat.sort_values("revenue", ascending=False)
 
-total_rentals = int(df_cat["rentals"].sum())
-total_neto = float(df_cat[f"neto{suf}"].sum())
-total_ud = int(df_cat["upgrades_o_downgrades"].sum())
-walk_in = int(df_cat["walk_in"].sum())
+total_rev = float(gcat["revenue"].sum())
+total_rd = float(gcat["rented_days"].sum())
+total_fd = float(gcat["fleet_days"].sum())
+_ud = load_query(f"""
+    SELECT COUNT(*) AS rentals,
+           SUM(CASE WHEN acriss_reservado IS NOT NULL
+                     AND acriss_entregado != acriss_reservado THEN 1 ELSE 0 END) AS ud,
+           SUM(CASE WHEN acriss_reservado IS NULL THEN 1 ELSE 0 END) AS walk_in
+    FROM vw_rentals_resumen WHERE {where_sql}
+""", params)
+total_rentals = int(pd.to_numeric(_ud["rentals"], errors="coerce").fillna(0).iloc[0])
+total_ud = int(pd.to_numeric(_ud["ud"], errors="coerce").fillna(0).iloc[0])
+walk_in = int(pd.to_numeric(_ud["walk_in"], errors="coerce").fillna(0).iloc[0])
 
 c1, c2, c3, c4 = st.columns(4)
-kpi(c1, "Rentals", fmt_int(total_rentals))
-kpi(c2, "Revenue neto", fmt_money(total_neto, cur), fmt_money_short(total_neto, cur))
+kpi(c1, f"Ticket promedio / día ({cur})", fmt_money(total_rev / total_rd if total_rd else 0, cur),
+    f"{fmt_int(int(total_rd))} días rentados · ocupación {total_rd / total_fd * 100:.1f}%")
+kpi(c2, f"Revenue del período ({cur})", fmt_money(total_rev, cur), fmt_money_short(total_rev, cur))
 kpi(c3, "Upgrades/Downgrades", fmt_int(total_ud),
     f"{(total_ud / max(1, total_rentals - walk_in)) * 100:.1f} % de los que tenian reserva")
 kpi(c4, "Walk-ins", fmt_int(walk_in),
-    f"{(walk_in / max(1, total_rentals)) * 100:.1f} % del total")
+    f"{(walk_in / max(1, total_rentals)) * 100:.1f} % de {fmt_int(total_rentals)} contratos entregados")
 
-c_left, c_right = st.columns([3, 2])
+c_left, c_right = st.columns([2, 3])
 with c_left:
-    fig = px.bar(
-        df_cat.head(15), x="acriss_entregado", y="rentals",
-        color="categoria_entregada",
-        title="Rentals por categoria ACRISS (top 15)",
-        hover_data=["categoria_entregada", "neto_usd"],
-    )
-    fig.update_layout(**PLOTLY_LAYOUT, xaxis_title="",
-                      legend=dict(orientation="h", y=-0.2))
+    fig = px.bar(gcat, x="categoria", y="ticket",
+                 title=f"Ticket promedio por día rentado ({cur})",
+                 color_discrete_sequence=[SIXT_ORANGE],
+                 hover_data={"rented_days": True, "revenue": ":,.0f"})
+    fig.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title=cur)
     st.plotly_chart(fig, use_container_width=True)
 with c_right:
-    view = df_cat.head(15).copy()
-    view[f"neto{suf}"] = view[f"neto{suf}"].apply(lambda v: fmt_money(v, cur))
-    view["ticket_usd"] = view["ticket_usd"].apply(lambda v: fmt_money(v, "USD"))
-    view["dias_avg"] = view["dias_avg"].round(1)
-    view = view[["acriss_entregado", "categoria_entregada", "rentals",
-                 f"neto{suf}", "ticket_usd", "dias_avg"]].rename(columns={
-        "acriss_entregado": "ACRISS",
-        "categoria_entregada": "Categoria",
-        "rentals": "Rentals",
-        f"neto{suf}": f"Neto ({cur})",
-        "ticket_usd": "Ticket avg (USD)",
-        "dias_avg": "Dias avg",
+    view = pd.DataFrame({
+        "Categoría": gcat["categoria"].values,
+        "Incluye (Sixt)": gcat["incluye"].values,
+        "Flota prom": gcat["flota_prom"].round(1).values,
+        "Días rentados": gcat["rented_days"].astype(int).values,
+        "Ocupación (%)": (gcat["ocupacion"].astype(float) * 100).round(1).values,
+        f"Ticket prom / día ({cur})": gcat["ticket"].map(lambda v: fmt_money(v, cur) if pd.notna(v) else "-").values,
+        f"RevPAU ({cur})": gcat["revpau"].map(lambda v: fmt_money(v, cur) if pd.notna(v) else "-").values,
+        f"Revenue ({cur})": gcat["revenue"].map(lambda v: fmt_money(v, cur)).values,
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
     xlsx_download_button(
-        df_cat.head(15),
-        file_name=f"vehiculos_acriss_{dt.date.today()}",
-        sheet_name="ACRISS top15",
+        gcat[["categoria", "incluye", "flota_prom", "rented_days", "ocupacion",
+              "ticket", "revpau", "revenue"]],
+        file_name=f"vehiculos_categoria_gold_{dt.date.today()}",
+        sheet_name="Por categoria",
         key="xlsx_vehiculos_acriss",
     )
+st.caption(
+    "Misma base que **Analítica**: cada renta se reparte en bloques de 24h (con 1 hora de "
+    "gracia) y cada día cuenta para el carro que de verdad estaba rentado, así que el "
+    "rango de fechas toma solo los días que caen dentro. Sin no-shows ni cancelaciones. "
+    "**Ticket prom / día** = revenue ÷ días rentados (el RPD de la categoría); **RevPAU** = "
+    "revenue ÷ días en flota. Categorías del presupuesto: con las correcciones por placa y "
+    "SDAH contada como EDAH, CDMR como EDMR. Upgrades y walk-ins salen de los contratos "
+    "entregados en el rango.")
 
 # ---------- Upgrades vs downgrades ----------
 section("Upgrades vs downgrades (reservado -> entregado)")
