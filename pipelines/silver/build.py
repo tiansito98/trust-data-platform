@@ -1891,14 +1891,20 @@ def build_cobro_contrato(engine):
          que cubre el contrato completo; el valor del voucher de la reserva puede
          diferir por centavos o por cambios y NO topa (ej. 9524073587).
       3. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter.
-      4. hay prepago en la reserva -> anticipado = MIN(main, prepago); el resto son
-         extras cobrados en el counter (ej. prepago 200 + 100 de dias/conductor extra
-         en el counter -> 200 anticipado, 100 counter).
+      4. hay prepago en la reserva -> anticipado = el PREPAGO COMPLETO; si el contrato
+         es mayor, la diferencia son extras cobrados en el counter (ej. prepago 200 +
+         100 de dias/conductor extra -> 200 anticipado, 100 counter).
+         Si el contrato es MENOR que el prepago, el anticipado sigue siendo el prepago
+         (decision de la direccion 2026-11-05: es lo que el cliente pago y Sixt tiene).
+         Pasa cuando el contrato trae un descuento que compensa (los cargos brutos suman
+         exactamente el prepago: 9523810630 prepago 409,31 = cargos 409,32, descuento
+         79,99 -> contrato 329,32; 9524197397 reservo 5 dias por 958,99, devolvio al dia
+         2, descuento 395,50 -> contrato 563,49) o cuando la renta fue mas corta. Esa
+         diferencia va en exceso_prepago_usd, asi que en esas filas
+         anticipado + counter = total + exceso (total sigue = Cierre Diario).
       5. resto                   -> counter.
-    revisar = TRUE marca casos a confirmar a mano: contrato MENOR que lo prepagado (se
-    devolvio antes o bajo de categoria; el anticipado queda en el valor del contrato,
-    ej. 9523810630 prepago 409,31 vs contrato 329,32) y reservas con flag de prepago
-    pero sin valor prepagado (se tratan como counter).
+    revisar = TRUE marca reservas con flag de prepago pero sin valor prepagado (se
+    tratan como counter).
     """
     log("\n>> Construyendo fact_cobro_contrato")
     started = time.time()
@@ -1947,6 +1953,8 @@ def build_cobro_contrato(engine):
                     WHEN pago_main_codigo = 'FE'                THEN 0
                     WHEN pago_main_codigo IN ('CC', 'AI', 'FC') THEN main_usd
                     WHEN voucher_usd > 0                        THEN LEAST(main_usd, voucher_usd)
+                    -- tolerancia de 5 centavos: diferencias de redondeo no son exceso
+                    WHEN prepago_usd > 0 AND prepago_usd - main_usd > 0.05 THEN prepago_usd
                     WHEN prepago_usd > 0                        THEN LEAST(main_usd, prepago_usd)
                     ELSE 0
                 END AS ant_main,
@@ -1972,8 +1980,9 @@ def build_cobro_contrato(engine):
             ROUND(secondary_usd::numeric, 2)                        AS secondary_usd,
             ROUND((main_usd + secondary_usd)::numeric, 2)           AS total_usd,
             ROUND((ant_main + ant_secondary)::numeric, 2)           AS anticipado_usd,
-            ROUND((main_usd + secondary_usd - ant_main - ant_secondary)::numeric, 2)
+            ROUND((GREATEST(main_usd - ant_main, 0) + secondary_usd - ant_secondary)::numeric, 2)
                                                                     AS counter_usd,
+            ROUND(GREATEST(ant_main - main_usd, 0)::numeric, 2)    AS exceso_prepago_usd,
             CASE WHEN ant_main + ant_secondary > 0 THEN origen_anticipado END
                                                                     AS origen_anticipado,
             CASE
@@ -1982,18 +1991,14 @@ def build_cobro_contrato(engine):
                 WHEN pago_main_codigo IN ('CC', 'AI', 'FC')
                                                       THEN 'Main pagado por tercero (' || pago_main_codigo || ')'
                 WHEN voucher_usd > 0                  THEN 'Voucher de agencia, hasta su valor'
-                WHEN prepago_usd > 0                  THEN 'Prepago web, hasta lo prepagado'
+                WHEN prepago_usd > 0 AND prepago_usd - main_usd > 0.05
+                                                      THEN 'Prepago web mayor que el contrato (descuento o renta mas corta)'
+                WHEN prepago_usd > 0                  THEN 'Prepago web, el resto en counter'
                 ELSE 'Cobrado en counter (' || COALESCE(pago_main_codigo, '-') || ')'
             END                                                     AS regla,
-            COALESCE(
-                (ant_main > 0 AND COALESCE(pago_main_codigo, '') NOT IN ('CC', 'AI', 'FC')
-                     AND GREATEST(COALESCE(voucher_usd, 0), COALESCE(prepago_usd, 0)) - main_usd > 0.05)
-                OR (COALESCE(pago_main_codigo, '') <> 'FE' AND prepago_flag = 1 AND prepago_usd IS NULL),
-                FALSE)                                              AS revisar,
+            COALESCE(COALESCE(pago_main_codigo, '') <> 'FE' AND prepago_flag = 1
+                     AND prepago_usd IS NULL, FALSE)                AS revisar,
             CASE
-                WHEN ant_main > 0 AND COALESCE(pago_main_codigo, '') NOT IN ('CC', 'AI', 'FC')
-                     AND GREATEST(COALESCE(voucher_usd, 0), COALESCE(prepago_usd, 0)) - main_usd > 0.05
-                    THEN 'Contrato menor que lo prepagado: anticipado = valor del contrato'
                 WHEN COALESCE(pago_main_codigo, '') <> 'FE' AND prepago_flag = 1 AND prepago_usd IS NULL
                     THEN 'Reserva marcada prepagada pero sin valor prepagado: se tomo como counter'
             END                                                     AS motivo_revision

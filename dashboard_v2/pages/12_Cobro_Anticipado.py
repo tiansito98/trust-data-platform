@@ -75,13 +75,13 @@ df = load_query(f"""
            canal_cobro_tarifa, tipo_agencia_main, tercero_nombre, es_no_show, voucher_numero,
            pago_main_codigo, pago_main, pago_secondary_codigo, pago_secondary,
            prepago_reserva_usd, voucher_reserva_usd, main_usd, secondary_usd,
-           total_usd, anticipado_usd, counter_usd, origen_anticipado, regla,
+           total_usd, anticipado_usd, counter_usd, exceso_prepago_usd, origen_anticipado, regla,
            revisar, motivo_revision
     FROM silver.fact_cobro_contrato
     WHERE {' AND '.join(_where)}
     ORDER BY {_col_fecha}, numero_contrato
 """, _params)
-for c in ("total_usd", "anticipado_usd", "counter_usd", "main_usd", "secondary_usd",
+for c in ("total_usd", "anticipado_usd", "counter_usd", "exceso_prepago_usd", "main_usd", "secondary_usd",
           "prepago_reserva_usd", "voucher_reserva_usd"):
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -105,13 +105,17 @@ _tot, _ant, _cnt = ren["total_usd"].sum(), ren["anticipado_usd"].sum(), ren["cou
 k1, k2, k3, k4 = st.columns(4)
 kpi(k1, "Contratos", fmt_int(len(ren)), f"{fmt_int(int((ren['anticipado_usd'] > 0).sum()))} con parte anticipada")
 kpi(k2, "Total con IVA (USD)", fmt_money(_tot, "USD"), "igual a Cierre Diario")
+_exc = ren["exceso_prepago_usd"].fillna(0).sum()
 kpi(k3, "Anticipado — a reclamar (USD)", fmt_money(_ant, "USD"),
-    f"{_ant / _tot * 100:.1f}% del total" if _tot else "")
+    (f"incluye {fmt_money(_exc, 'USD')} de prepago mayor que el contrato" if _exc > 0.005
+     else (f"{_ant / _tot * 100:.1f}% del total" if _tot else "")))
 kpi(k4, "Cobrado en counter (USD)", fmt_money(_cnt, "USD"),
     f"{_cnt / _tot * 100:.1f}% del total" if _tot else "")
 st.caption(
-    "**Anticipado** = lo que pagó un tercero por adelantado: prepago web de Sixt (hasta lo "
-    "prepagado), mayorista con tarjeta corporativa Sixt (CC) o voucher de agencia FC (contrato "
+    "**Anticipado** = lo que pagó un tercero por adelantado: prepago web de Sixt (el prepago "
+    "completo, aunque el contrato haya quedado menor por un descuento o por devolver antes; "
+    "esa diferencia es la columna *Prepago > contrato* y hace que anticipado + counter "
+    "supere el total), mayorista con tarjeta corporativa Sixt (CC) o voucher de agencia FC (contrato "
     "completo). **Counter** = lo demás: lo que pagó el cliente en la sede (extras, días "
     "adicionales, reservas web con pago en counter y reservas prepagadas a las que les "
     "cambiaron la forma de pago a FE en el counter). Montos con IVA. Sin no-shows ni cancelaciones.")
@@ -135,13 +139,16 @@ st.dataframe(pd.DataFrame({
 # Contratos
 # =============================================================================
 section("Contratos")
-_ver = st.radio("Mostrar", ["Todos", "Con parte anticipada", "Solo counter", "Para revisar"],
+_ver = st.radio("Mostrar", ["Todos", "Con parte anticipada", "Solo counter",
+                           "Prepago mayor que el contrato", "Para revisar"],
                 horizontal=True, key="cobro_ver")
 _t = ren
 if _ver == "Con parte anticipada":
     _t = ren[ren["anticipado_usd"] > 0]
 elif _ver == "Solo counter":
     _t = ren[ren["anticipado_usd"] == 0]
+elif _ver == "Prepago mayor que el contrato":
+    _t = ren[ren["exceso_prepago_usd"].fillna(0) > 0]
 elif _ver == "Para revisar":
     _t = ren[ren["revisar"]]
 
@@ -161,13 +168,14 @@ def _tabla(t: pd.DataFrame) -> pd.DataFrame:
         "Total (USD)": t["total_usd"].round(2).values,
         "Anticipado (USD)": t["anticipado_usd"].round(2).values,
         "Counter (USD)": t["counter_usd"].round(2).values,
+        "Prepago > contrato (USD)": t["exceso_prepago_usd"].round(2).values,
         "Regla": t["regla"].values,
         "Revisar": t["motivo_revision"].fillna("").values,
     })
 
 
 _MONTOS = ("Prepago reserva (USD)", "Voucher reserva (USD)", "Total (USD)",
-           "Anticipado (USD)", "Counter (USD)")
+           "Anticipado (USD)", "Counter (USD)", "Prepago > contrato (USD)")
 _out = _tabla(_t)
 st.dataframe(_out, hide_index=True, use_container_width=True,
              height=min(600, 38 + 35 * max(len(_out), 1)),
