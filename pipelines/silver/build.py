@@ -1884,13 +1884,17 @@ def build_cobro_contrato(engine):
 
     Regla del cubo MAIN (el SECONDARY es retenido solo si se pago CC/FC/AI; en 2026
     siempre fue FE = counter). Revisada con la direccion el 2026-10-30:
-      1. FE                      -> TODO counter, aunque la reserva venga prepagada o
-         con voucher: es una reserva prepagada a la que le cambiaron la forma de pago
-         en el counter y el cliente pago ahi (ej. 9523929866, 9524003988).
-      2. CC / AI / FC            -> todo el main es anticipado. FC = voucher de agencia
+      1. CC / AI / FC            -> todo el main es anticipado. FC = voucher de agencia
          que cubre el contrato completo; el valor del voucher de la reserva puede
          diferir por centavos o por cambios y NO topa (ej. 9524073587).
-      3. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter.
+      2. hay voucher en la reserva -> anticipado = MIN(main, voucher); el resto counter,
+         AUNQUE el contrato diga FE: el voucher de agencia cubre su valor y el cliente
+         paga en el counter lo que lo supera (9524178852: voucher 140,16, contrato
+         176,17 -> 140,16 anticipado + 36,01 counter). Corregido 2026-11-05: la regla
+         del 30-oct mandaba todo FE a counter y se comia estos vouchers.
+      3. FE                      -> TODO counter, aunque la reserva venga prepagada:
+         le cambiaron la forma de pago en el counter y el cliente pago ahi (ej.
+         9523929866, 9524003988). Solo anula el PREPAGO web, no el voucher.
       4. hay prepago en la reserva -> anticipado = el PREPAGO COMPLETO; si el contrato
          es mayor, la diferencia son extras cobrados en el counter (ej. prepago 200 +
          100 de dias/conductor extra -> 200 anticipado, 100 counter).
@@ -1950,8 +1954,9 @@ def build_cobro_contrato(engine):
         ), c AS (
             SELECT b.*,
                 CASE
-                    WHEN pago_main_codigo = 'FE'                THEN 0
                     WHEN pago_main_codigo IN ('CC', 'AI', 'FC') THEN main_usd
+                    WHEN voucher_usd > 0                        THEN LEAST(main_usd, voucher_usd)
+                    WHEN pago_main_codigo = 'FE'                THEN 0
                     WHEN voucher_usd > 0                        THEN LEAST(main_usd, voucher_usd)
                     -- tolerancia de 5 centavos: diferencias de redondeo no son exceso
                     WHEN prepago_usd > 0 AND prepago_usd - main_usd > 0.05 THEN prepago_usd
@@ -1986,11 +1991,11 @@ def build_cobro_contrato(engine):
             CASE WHEN ant_main + ant_secondary > 0 THEN origen_anticipado END
                                                                     AS origen_anticipado,
             CASE
-                WHEN pago_main_codigo = 'FE' AND (prepago_usd > 0 OR voucher_usd > 0)
-                                                      THEN 'Venia prepagada, cambio a FE en counter'
                 WHEN pago_main_codigo IN ('CC', 'AI', 'FC')
                                                       THEN 'Main pagado por tercero (' || pago_main_codigo || ')'
-                WHEN voucher_usd > 0                  THEN 'Voucher de agencia, hasta su valor'
+                WHEN voucher_usd > 0                  THEN 'Voucher de agencia, hasta su valor; resto en counter'
+                WHEN pago_main_codigo = 'FE' AND prepago_usd > 0
+                                                      THEN 'Venia prepagada, cambio a FE en counter'
                 WHEN prepago_usd > 0 AND prepago_usd - main_usd > 0.05
                                                       THEN 'Prepago web mayor que el contrato (descuento o renta mas corta)'
                 WHEN prepago_usd > 0                  THEN 'Prepago web, el resto en counter'
