@@ -30,7 +30,7 @@ from sqlalchemy import text
 from components.common import execute_write, execute_write_returning, get_engine, _clean_params
 from components import storage as S
 
-API_VERSION = 3
+API_VERSION = 4
 
 
 def load_query(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -91,6 +91,9 @@ def ensure_tables() -> bool:
             ON operational.documentos (contrato) WHERE NOT eliminado;
         CREATE INDEX IF NOT EXISTS documentos_placas_idx
             ON operational.documentos USING gin (placas);
+        -- Expedientes de contrato (components/expedientes.py)
+        ALTER TABLE operational.documentos ADD COLUMN IF NOT EXISTS tipo_documento text;
+        ALTER TABLE operational.documentos ADD COLUMN IF NOT EXISTS plantilla_id bigint;
     """, {})
     S.ensure_bucket()
     return True
@@ -200,7 +203,8 @@ def documentos(carpeta_id: int):
     return load_query("""
         SELECT d.documento_id, d.nombre, d.mime_type, d.tamano_bytes, d.storage_path,
                d.subido_por, d.subido_at, d.firmado_de, d.firmado_por, d.firmado_at,
-               d.descripcion, d.origen, d.contrato, d.placas, d.sede_nombre, d.firma_pagina
+               d.descripcion, d.origen, d.contrato, d.placas, d.sede_nombre, d.firma_pagina,
+               d.tipo_documento
         FROM operational.documentos d
         WHERE d.carpeta_id = :c AND NOT d.eliminado
         ORDER BY d.subido_at DESC
@@ -209,25 +213,27 @@ def documentos(carpeta_id: int):
 
 def subir(carpeta_id: int, nombre: str, data: bytes, mime: str, usuario: str,
           descripcion: str = "", firmado_de: int | None = None,
-          contrato: dict | None = None, firma_pagina: int | None = None) -> int:
+          contrato: dict | None = None, firma_pagina: int | None = None,
+          tipo_documento: str | None = None, plantilla_id: int | None = None,
+          path_prefix: str | None = None) -> int:
     """Sube el binario y registra la fila. Si el INSERT falla, borra el objeto.
     contrato = dict de info_contrato() (o None). firmado_de != None => copia firmada:
     firmado_por = usuario y firmado_at = ahora. La traza de QUIEN firmo vive aqui,
     no en el papel (la leyenda del PDF solo lleva la fecha)."""
-    path = f"{int(carpeta_id)}/{uuid.uuid4().hex}_{_slug(nombre)}"
+    path = f"{path_prefix or int(carpeta_id)}/{uuid.uuid4().hex[:12]}_{_slug(nombre)}"
     S.upload(path, data, mime)
     try:
         return execute_write_returning("""
             INSERT INTO operational.documentos
                 (carpeta_id, nombre, storage_path, mime_type, tamano_bytes, sha256,
                  descripcion, subido_por, firmado_de, firmado_por, firmado_at,
-                 contrato, placas, sede_nombre, firma_pagina)
+                 contrato, placas, sede_nombre, firma_pagina, tipo_documento, plantilla_id)
             VALUES (:c, :n, :p, :m, :t, :h, :d, :u, :f,
                     CASE WHEN :f IS NULL THEN NULL ELSE :u END,
                     CASE WHEN :f IS NULL THEN NULL ELSE now() END,
-                    :ct, :pl, :sd, :fp)
+                    :ct, :pl, :sd, :fp, :td, :pi)
             RETURNING documento_id
-        """, {"c": int(carpeta_id), "n": nombre, "p": path, "m": mime, "t": len(data),
+        """, {"td": tipo_documento, "pi": plantilla_id, "c": int(carpeta_id), "n": nombre, "p": path, "m": mime, "t": len(data),
               "h": hashlib.sha256(data).hexdigest(), "d": descripcion or None,
               "u": usuario, "f": firmado_de,
               "ct": contrato["contrato"] if contrato else None,

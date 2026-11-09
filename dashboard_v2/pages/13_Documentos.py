@@ -1,27 +1,30 @@
 """
-Documentos (piloto del reemplazo de Odoo Documents) — solo trust_admin.
+Documentos — solo trust_admin (piloto del reemplazo de Odoo Documents).
 
-Carpetas + subir / ver / descargar archivos en Supabase Storage (bucket privado
-'documentos') y firmar PDFs con el mouse. Indice en operational.doc_carpetas y
-operational.documentos; logica en components/documentos.py y components/storage.py.
+Pestanas:
+  - Contratos: buscar por placa o contrato (Contratos / PLACA / CONTRATO) y crear un
+    expediente nuevo: el asesor sube SOLO el contrato; adendum e informacion general
+    salen de las plantillas; una firma se estampa en los 3, vista previa, guardar.
+  - Validacion: como Facturas. Expediente vs sistema (silver): pendiente / placa no
+    coincide / faltan documentos / al dia, y contratos del sistema sin expediente.
+  - Plantillas: adendum e informacion general (versionadas) y donde va la firma.
+  - Archivos generales: carpetas libres (lo que venga de Odoo, etc.).
 
-- Cada documento se puede atar a un CONTRATO; la(s) placa(s) salen de silver, asi que
-  se puede buscar todo lo anexado a un carro por placa o por contrato.
-- Vista previa de PDF = paginas rasterizadas en el servidor (el visor del navegador
-  no carga dentro de Streamlit).
-- Firmar = vista previa de la pagina firmada -> guardar una COPIA en la carpeta
-  'Documentos firmados'. La leyenda del PDF solo lleva la fecha; QUIEN firmo queda
-  en la base (firmado_por / firmado_at).
+Logica en components/expedientes.py, components/documentos.py y components/storage.py.
 """
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import datetime as dt
+import math
+
 import pandas as pd
 import streamlit as st
 
-from components.common import inject_styles, render_header, section, kpi, fmt_int
+from components.common import inject_styles, render_header, section, kpi, fmt_int, xlsx_download_button
 from components.auth import require_auth, require_page, logout_button, get_current_user
+from components.filters import render_sidebar_filters
 from components import storage as S
 
 st.set_page_config(page_title="TRUST - Documentos", layout="wide")
@@ -43,28 +46,34 @@ if not S.configurado():
     st.error(
         "Falta configurar Supabase Storage. Agrega en los secrets (y en `.env` para local):\n\n"
         "```\nSUPABASE_URL = \"https://<ref>.supabase.co\"\n"
-        "SUPABASE_SERVICE_ROLE_KEY = \"...\"\n```\n\n"
-        "La llave sale de Supabase → Project Settings → API Keys (secret key)."
+        "SUPABASE_SERVICE_ROLE_KEY = \"...\"\n```"
     )
     st.stop()
 
-from components import documentos as D  # noqa: E402  (importa el componente de firma)
+from components import documentos as D   # noqa: E402  (registra el componente de firma)
+from components import expedientes as E  # noqa: E402
 
-# Streamlit Cloud puede servir el modulo viejo tras un push (ver CLAUDE.md): recargarlo.
-D_API_REQUERIDA = 3
-if getattr(D, "API_VERSION", 0) < D_API_REQUERIDA:
-    import importlib
+# Streamlit Cloud puede servir modulos viejos tras un push (ver CLAUDE.md): recargarlos.
+import importlib  # noqa: E402
+if getattr(D, "API_VERSION", 0) < 4:
     D = importlib.reload(D)
+if getattr(E, "API_VERSION", 0) < 1:
+    E = importlib.reload(E)
 
 try:
-    D.ensure_tables()
+    E.ensure_tables()
 except Exception as e:  # noqa: BLE001
     st.error(f"No se pudo preparar Storage / tablas: {e}")
     st.stop()
 
+filtros = render_sidebar_filters(default_days=7)   # lo usa la pestana Validacion
+
+FIRMA_EJEMPLO = {"trazos": [[[40 + i * 4, 100 + 45 * math.sin(i / 4)] for i in range(110)],
+                            [[150, 40], [200, 165]]]}
+
 
 # =============================================================================
-# Helpers de la pagina
+# Helpers
 # =============================================================================
 def _tam(n) -> str:
     n = float(n or 0)
@@ -77,54 +86,40 @@ def _tam(n) -> str:
 
 
 def _fecha(v) -> str:
-    if v is None or pd.isna(v):
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
         return ""
-    return pd.Timestamp(v).tz_convert("America/Bogota").strftime("%d/%m/%Y %H:%M") \
-        if pd.Timestamp(v).tzinfo else pd.Timestamp(v).strftime("%d/%m/%Y %H:%M")
+    t = pd.Timestamp(v)
+    if t.tzinfo:
+        t = t.tz_convert("America/Bogota")
+    return t.strftime("%d/%m/%Y %H:%M")
 
 
 def _placas(v) -> str:
     return ", ".join(v) if isinstance(v, (list, tuple)) and len(v) else ""
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=16)
 def _bytes(path: str) -> bytes:
-    # storage_path es unico e inmutable (uuid), asi que cachear por path es seguro
-    return S.download(path)
+    return S.download(path)   # storage_path es unico e inmutable: cache seguro
 
 
-@st.cache_data(show_spinner=False, max_entries=24)
-def _png(path: str, pagina: int) -> bytes:
+@st.cache_data(show_spinner=False, max_entries=48)
+def _png_path(path: str, pagina: int) -> bytes:
     return D.render_pagina(_bytes(path), pagina)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=48)
+def _png_bytes(data: bytes, pagina: int, ancho: int = 900) -> bytes:
+    return D.render_pagina(data, pagina, ancho)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
 def _npag(path: str) -> int:
     return D.n_paginas(_bytes(path))
 
 
-def input_contrato(label: str, key: str, default=None):
-    """Campo de contrato. Devuelve (ok, dict|None). ok=False si lo escrito es invalido."""
-    txt = st.text_input(label, value="" if default in (None, "") or pd.isna(default) else str(int(default)),
-                        key=key, placeholder="ej. 9524178852 (opcional)")
-    t = (txt or "").strip()
-    if not t:
-        return True, None
-    if not t.isdigit():
-        st.error("El contrato son solo números.")
-        return False, None
-    info = D.info_contrato(int(t))
-    if info is None:
-        st.warning("Ese contrato no está en la base todavía (el pipeline lo trae en la madrugada). "
-                   "Se guarda el número; la placa se completa al volver a vincularlo.")
-        return True, {"contrato": int(t), "placas": [], "sede": None}
-    st.caption(f"Placa(s): **{_placas(info['placas']) or '-'}** · {info['sede'] or ''} · "
-               f"entrega {info['entrega']}")
-    return True, info
-
-
 def visor(fila, key: str) -> None:
-    """Abrir / descargar / vista previa de un documento + su contrato."""
+    """Abrir / descargar / vista previa de un documento."""
     try:
         url = S.signed_url(fila["storage_path"], 300)
         url_dl = S.signed_url(fila["storage_path"], 300, descargar_como=fila["nombre"])
@@ -132,257 +127,377 @@ def visor(fila, key: str) -> None:
         st.error(f"No se pudo generar el enlace: {e}")
         return
     b1, b2, b3 = st.columns([1, 1, 3])
-    b1.link_button("Abrir en pestaña nueva", url, use_container_width=True)
-    b2.link_button("Descargar", url_dl, use_container_width=True)
-    info = []
-    if pd.notna(fila.get("contrato")):
-        info.append(f"Contrato **{int(fila['contrato'])}** · placa(s) **{_placas(fila.get('placas')) or '-'}**")
-    if pd.notna(fila.get("firmado_de")):
-        info.append(f"Firmado por **{fila['firmado_por']}** el {_fecha(fila['firmado_at'])}")
-    b3.caption(" · ".join(info) if info else "Sin contrato vinculado.")
-
+    b1.link_button("Abrir en pestaña nueva", url, width="stretch")
+    b2.link_button("Descargar", url_dl, width="stretch")
+    info = [f"Cargado el {_fecha(fila['subido_at'])} por {fila['subido_por']}"]
+    if pd.notna(fila.get("firmado_por")) and fila.get("firmado_por"):
+        info.append(f"firmado (usuario **{fila['firmado_por']}**, {_fecha(fila['firmado_at'])})")
+    b3.caption(" · ".join(info))
     mime = (fila["mime_type"] or "").lower()
     if mime == "application/pdf":
         try:
             n = _npag(fila["storage_path"])
             pg = 1
             if n > 1:
-                pg = st.number_input(f"Página (de {n})", 1, n, 1, key=f"{key}_pg")
-            st.image(_png(fila["storage_path"], int(pg) - 1), use_container_width=True)
+                ini = int(fila["firma_pagina"]) if pd.notna(fila.get("firma_pagina")) else 1
+                pg = st.number_input(f"Página (de {n})", 1, n, min(max(ini, 1), n), key=f"{key}_pg")
+            st.image(_png_path(fila["storage_path"], int(pg) - 1), width="stretch")
         except Exception as e:  # noqa: BLE001
             st.error(f"No se pudo mostrar el PDF: {e}")
     elif mime.startswith("image/"):
         st.image(url)
-    elif mime.startswith("text/") or mime in ("application/json",):
-        try:
-            st.code(_bytes(fila["storage_path"])[:200_000].decode("utf-8", "replace"))
-        except Exception as e:  # noqa: BLE001
-            st.error(str(e))
+    elif mime.startswith("text/") or mime == "application/json":
+        st.code(_bytes(fila["storage_path"])[:200_000].decode("utf-8", "replace"))
     else:
         st.caption("Vista previa solo para PDF, imágenes y texto. Usa *Abrir* o *Descargar*.")
 
 
-def tabla(docs: pd.DataFrame, rutas: dict | None = None) -> None:
-    view = pd.DataFrame({
-        "Nombre": docs["nombre"],
-        **({"Carpeta": docs["carpeta_id"].map(lambda c: rutas.get(int(c), ""))} if rutas else {}),
-        "Contrato": docs["contrato"].map(lambda v: "" if pd.isna(v) else str(int(v))),
-        "Placa(s)": docs["placas"].map(_placas),
-        "Tamaño": docs["tamano_bytes"].map(_tam),
-        "Subido por": docs["subido_por"],
-        "Subido": docs["subido_at"].map(_fecha),
-        "Firmado por": docs["firmado_por"].fillna(""),
-    })
-    st.dataframe(view, use_container_width=True, hide_index=True)
-
-
-# =============================================================================
-# Buscar por contrato o placa (en todas las carpetas)
-# =============================================================================
-df_c = D.carpetas()
-rutas = D.rutas_carpetas(df_c) if not df_c.empty else {}
-
-q = st.text_input("Buscar por contrato o placa", key="doc_buscar",
-                  placeholder="ej. 9524178852 o QQT746")
-if q.strip():
-    res = D.buscar(q)
-    if res.empty:
-        st.info("No hay documentos para ese contrato o placa.")
+def posicion(key: str, n_paginas: int, defaults=(None, 64.0, 8.0, 28.0)):
+    """Selector de pagina/posicion/ancho de la firma. Devuelve (pagina 0-based, x, y, ancho)."""
+    pg0, x0, y0, a0 = defaults
+    c1, c2, c3 = st.columns(3)
+    pagina = c1.number_input(f"Página (de {n_paginas})", 1, n_paginas,
+                             min(int(pg0), n_paginas) if pg0 else n_paginas, key=f"{key}_pag") - 1
+    pos = c2.selectbox("Posición", ["Abajo a la derecha", "Abajo al centro", "Abajo a la izquierda",
+                                    "Personalizada"], key=f"{key}_pos")
+    ancho = c3.slider("Ancho de la firma (% de la hoja)", 10, 60, int(a0), key=f"{key}_ancho")
+    presets = {"Abajo a la derecha": (100 - ancho - 8, 8), "Abajo al centro": ((100 - ancho) / 2, 8),
+               "Abajo a la izquierda": (8, 8)}
+    if pos == "Personalizada":
+        q1, q2 = st.columns(2)
+        x = q1.slider("Desde la izquierda (%)", 0, 95, int(x0), key=f"{key}_x")
+        y = q2.slider("Desde abajo (%)", 0, 95, int(y0), key=f"{key}_y")
     else:
-        st.caption(f"{len(res)} documento(s).")
-        tabla(res, rutas)
-        op = dict(zip(res["documento_id"].astype(int), res["nombre"]))
-        did = st.selectbox("Ver", list(op), format_func=op.get, key="doc_buscar_sel")
-        visor(res[res["documento_id"] == did].iloc[0], f"b{did}")
-    st.divider()
+        x, y = presets[pos]
+    return int(pagina), float(x), float(y), float(ancho)
+
+
+tab_con, tab_val, tab_pla, tab_gen = st.tabs(["Contratos", "Validación", "Plantillas", "Archivos generales"])
 
 # =============================================================================
-# Carpetas
+# CONTRATOS
 # =============================================================================
-_pend_c = st.session_state.pop("doc_carpeta_pendiente", None)
-if _pend_c in rutas:
-    st.session_state["doc_carpeta"] = _pend_c
+with tab_con:
+    _pend_modo = st.session_state.pop("exp_modo_pendiente", None)
+    if _pend_modo:
+        st.session_state["exp_modo"] = _pend_modo
+    _pend_q = st.session_state.pop("exp_q_pendiente", None)
+    if _pend_q:
+        st.session_state["exp_q"] = _pend_q
+    modo = st.radio("Modo", ["Buscar placa o contrato", "Nuevo contrato firmado"], horizontal=True,
+                    key="exp_modo", label_visibility="collapsed")
 
-c_sel, c_new = st.columns([3, 2])
-with c_new:
-    with st.expander("Nueva carpeta", expanded=not rutas):
-        with st.form("doc_new_folder", clear_on_submit=True):
-            nombre = st.text_input("Nombre")
-            opciones_padre = [None] + list(rutas)
-            actual = st.session_state.get("doc_carpeta")
-            padre = st.selectbox("Dentro de", opciones_padre,
-                                 format_func=lambda c: "(raíz)" if c is None else rutas[c],
-                                 index=opciones_padre.index(actual) if actual in rutas else 0)
-            if st.form_submit_button("Crear"):
-                if not nombre.strip():
-                    st.error("Ponle un nombre.")
+    # ---------------------------------------------------------------- Buscar
+    if modo == "Buscar placa o contrato":
+        q = st.text_input("Placa o número de contrato", key="exp_q", placeholder="ej. QQT746 o 9524178852")
+        t = E.normalizar_placa(q)
+        contrato_sel = None
+        if t.isdigit():
+            if E.expediente(int(t)):
+                contrato_sel = int(t)
+            else:
+                st.info("Ese contrato no tiene documentos todavía.")
+        elif t:
+            exps = E.contratos_de_placa(t)
+            if exps.empty:
+                st.info(f"No hay contratos con documentos para la placa {t}.")
+            else:
+                section(f"Placa {t}: {len(exps)} contrato(s)")
+                st.dataframe(pd.DataFrame({
+                    "Contrato": exps["contrato"].astype(str),
+                    "Placa": exps["placa"],
+                    "Documentos firmados": exps["firmados"].astype(int).astype(str) + " de 3",
+                    "Creado por": exps["creado_por"],
+                    "Creado": exps["creado_at"].map(_fecha),
+                    "Última carga": exps["ultima_carga"].map(_fecha),
+                }), width="stretch", hide_index=True)
+                contrato_sel = st.selectbox("Contrato", exps["contrato"].astype(int).tolist(), key="exp_sel")
+
+        if contrato_sel:
+            exp = E.expediente(contrato_sel)
+            docs = E.documentos_contrato(contrato_sel)
+            section(f"Contrato {contrato_sel} · placa {exp['placa']}")
+            firmados = docs[docs["tipo_documento"].isin(E.TIPOS_REQUERIDOS)]
+            faltan = [E.TIPOS[x] for x in E.TIPOS_REQUERIDOS if x not in set(firmados["tipo_documento"])]
+            if faltan:
+                st.warning("Faltan: " + ", ".join(faltan))
+            st.dataframe(pd.DataFrame({
+                "Documento": docs["tipo_documento"].map(lambda x: E.TIPOS.get(x, "Contrato sin firma (original)")),
+                "Archivo": docs["nombre"],
+                "Cargado": docs["subido_at"].map(_fecha),
+                "Usuario": docs["subido_por"],
+                "Plantilla": docs["plantilla_version"].map(lambda v: "" if pd.isna(v) else f"v{int(v)}"),
+                "Tamaño": docs["tamano_bytes"].map(_tam),
+            }), width="stretch", hide_index=True)
+            if not docs.empty:
+                op = dict(zip(docs["documento_id"].astype(int), docs["nombre"]))
+                did = st.selectbox("Ver documento", list(op), format_func=op.get, key=f"exp_ver_{contrato_sel}")
+                visor(docs[docs["documento_id"] == did].iloc[0], f"exp{did}")
+
+    # ---------------------------------------------------------------- Nuevo
+    else:
+        nonce = st.session_state.setdefault("exp_nonce", 0)
+        pla = E.plantillas_activas()
+        faltan_pl = [E.TIPOS[x] for x in E.TIPOS_PLANTILLA if x not in set(pla["tipo"])]
+        if faltan_pl:
+            st.warning(f"Falta cargar la plantilla de: **{', '.join(faltan_pl)}** (pestaña *Plantillas*). "
+                       "Se puede firmar igual, pero el contrato quedará *incompleto* en Validación.")
+
+        section("1. Placa y contrato")
+        c1, c2 = st.columns(2)
+        placa = E.normalizar_placa(c1.text_input("Placa", key=f"exp_placa_{nonce}", placeholder="ABC123"))
+        ctxt = c2.text_input("Número de contrato (10 dígitos)", key=f"exp_ct_{nonce}").strip()
+        ok_datos = True
+        if placa and not E.placa_valida(placa):
+            c1.error("La placa debe ser 3 letras y 3 números (ej. ABC123).")
+            ok_datos = False
+        if ctxt and not E.contrato_valido(ctxt):
+            c2.error("El contrato son 10 dígitos.")
+            ok_datos = False
+        ok_datos = ok_datos and bool(placa) and bool(ctxt)
+        if ok_datos:
+            info = D.info_contrato(int(ctxt))
+            if info is None:
+                st.caption("El contrato todavía no está en el sistema (llega con el pipeline de la "
+                           "madrugada). Se valida después en *Validación*.")
+            elif placa not in info["placas"]:
+                st.error(f"Según el sistema, el contrato {ctxt} es de la placa "
+                         f"**{_placas(info['placas']) or '-'}**, no {placa}. Revisa antes de firmar.")
+            else:
+                st.caption(f"Contrato en el sistema: {info['sede']} · entrega {info['entrega']} · placa OK.")
+            ex = E.expediente(int(ctxt))
+            if ex:
+                if ex["placa"] != placa:
+                    st.error(f"Ese contrato ya tiene documentos con la placa {ex['placa']}.")
+                    ok_datos = False
                 else:
-                    try:
-                        D.crear_carpeta(nombre, padre, USUARIO)
-                        st.success(f"Carpeta '{nombre.strip()}' creada.")
-                        st.rerun()
-                    except Exception as e:  # noqa: BLE001
-                        st.error("Ya existe una carpeta con ese nombre ahí." if "unique" in str(e).lower()
-                                 else f"No se pudo crear: {e}")
+                    st.warning("Este contrato ya tiene documentos: al guardar se reemplazan por los nuevos "
+                               "(los anteriores quedan en el historial).")
 
-if not rutas:
-    st.info("Todavía no hay carpetas. Crea la primera a la derecha.")
-    st.stop()
-
-with c_sel:
-    carpeta = st.selectbox("Carpeta", list(rutas), format_func=lambda c: rutas[c], key="doc_carpeta")
-
-docs = D.documentos(carpeta)
-k1, k2, k3 = st.columns(3)
-kpi(k1, "Archivos en la carpeta", fmt_int(len(docs)))
-kpi(k2, "Tamaño", _tam(docs["tamano_bytes"].sum() if not docs.empty else 0))
-kpi(k3, "Con contrato", fmt_int(int(docs["contrato"].notna().sum()) if not docs.empty else 0))
-
-tab_ver, tab_subir, tab_firmar = st.tabs(["Archivos", "Subir", "Firmar PDF"])
-
-# =============================================================================
-# Archivos
-# =============================================================================
-with tab_ver:
-    if docs.empty:
-        st.info("La carpeta está vacía. Sube archivos en la pestaña **Subir**.")
-    else:
-        tabla(docs)
-        opciones = dict(zip(docs["documento_id"].astype(int), docs["nombre"]))
-        _pend = st.session_state.pop("doc_abrir_pendiente", None)
-        if _pend in opciones:
-            st.session_state["doc_abrir"] = _pend
-        doc_id = st.selectbox("Ver archivo", list(opciones), format_func=opciones.get, key="doc_abrir")
-        fila = docs[docs["documento_id"] == doc_id].iloc[0]
-        visor(fila, f"v{doc_id}")
-
-        with st.expander("Vincular a un contrato"):
-            ok_c, ct = input_contrato("Contrato", f"doc_vinc_{doc_id}", fila.get("contrato"))
-            if st.button("Guardar vínculo", key=f"doc_vinc_btn_{doc_id}", disabled=not ok_c):
-                D.vincular_contrato(doc_id, ct)
-                st.success("Vínculo guardado." if ct else "Contrato quitado.")
-                st.rerun()
-
-        with st.expander("Eliminar este archivo"):
-            seguro = st.checkbox(f"Sí, eliminar '{fila['nombre']}'", key=f"doc_del_ok_{doc_id}")
-            if st.button("Eliminar", disabled=not seguro, key=f"doc_del_{doc_id}"):
-                D.eliminar(doc_id, USUARIO)
-                st.success("Eliminado.")
-                st.rerun()
-
-# =============================================================================
-# Subir
-# =============================================================================
-with tab_subir:
-    st.caption(f"Se suben a **{rutas[carpeta]}**. Máximo 50 MB por archivo.")
-    nonce = st.session_state.setdefault("doc_up_nonce", 0)
-    ok_c, ct_up = input_contrato("Contrato (opcional; aplica a todos los archivos de esta subida)",
-                                 f"doc_up_ct_{nonce}")
-    with st.form(f"doc_upload_{nonce}"):
-        files = st.file_uploader("Archivos", accept_multiple_files=True, key=f"doc_files_{nonce}")
-        desc = st.text_input("Descripción (opcional)")
-        ok = st.form_submit_button("Subir", disabled=not ok_c)
-    if ok:
-        if not files:
-            st.error("Elige al menos un archivo.")
-        else:
-            subidos, errores = 0, []
-            barra = st.progress(0.0)
-            for i, f in enumerate(files, 1):
-                data = f.getvalue()
-                if len(data) > 50 * 1024 * 1024:
-                    errores.append(f"{f.name}: pesa más de 50 MB")
-                    continue
-                try:
-                    D.subir(carpeta, f.name, data, f.type or "application/octet-stream", USUARIO,
-                            desc, contrato=ct_up)
-                    subidos += 1
-                except Exception as e:  # noqa: BLE001
-                    errores.append(f"{f.name}: {e}")
-                barra.progress(i / len(files))
-            if subidos:
-                st.success(f"{subidos} archivo(s) subido(s).")
-            for e in errores:
-                st.error(e)
-            if subidos and not errores:
-                st.session_state["doc_up_nonce"] = nonce + 1
-                st.rerun()
-
-# =============================================================================
-# Firmar PDF
-# =============================================================================
-with tab_firmar:
-    pdfs = docs[docs["mime_type"].fillna("").str.lower().eq("application/pdf")] if not docs.empty else docs
-    if pdfs.empty:
-        st.info("No hay PDFs en esta carpeta.")
-    else:
-        op_pdf = dict(zip(pdfs["documento_id"].astype(int), pdfs["nombre"]))
-        pdf_id = st.selectbox("PDF a firmar", list(op_pdf), format_func=op_pdf.get, key="doc_firmar_pdf")
-        fila = pdfs[pdfs["documento_id"] == pdf_id].iloc[0]
-        try:
-            data = _bytes(fila["storage_path"])
-            paginas = D.info_pdf(data)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"No se pudo leer el PDF: {e}")
-            st.stop()
-
-        section("1. Contrato")
-        ok_cf, ct_f = input_contrato("Contrato al que pertenece el documento firmado",
-                                     f"doc_firma_ct_{pdf_id}", fila.get("contrato"))
-
-        section("2. Dibuja la firma con el mouse (o el dedo en el celular)")
-        firma = D.panel_firma("doc_firma")
-
-        section("3. Dónde va")
-        p1, p2, p3, p4 = st.columns(4)
-        pagina = p1.number_input(f"Página (de {len(paginas)})", 1, len(paginas), len(paginas),
-                                 key=f"doc_firma_pag_{pdf_id}") - 1
-        pos = p2.selectbox("Posición", ["Abajo a la derecha", "Abajo al centro",
-                                        "Abajo a la izquierda", "Personalizada"], key="doc_firma_pos")
-        ancho = p3.slider("Ancho de la firma (% de la hoja)", 10, 60, 28, key="doc_firma_ancho")
-        leyenda_on = p4.checkbox("Agregar la fecha de la firma", True, key="doc_firma_ley")
-        presets = {"Abajo a la derecha": (100 - ancho - 8, 8), "Abajo al centro": ((100 - ancho) / 2, 8),
-                   "Abajo a la izquierda": (8, 8)}
-        if pos == "Personalizada":
-            q1, q2 = st.columns(2)
-            x_pct = q1.slider("Desde la izquierda (%)", 0, 95, 60, key="doc_firma_x")
-            y_pct = q2.slider("Desde abajo (%)", 0, 95, 8, key="doc_firma_y")
-        else:
-            x_pct, y_pct = presets[pos]
-        ahora = pd.Timestamp.now(tz="America/Bogota").strftime("%d/%m/%Y %H:%M")
-        leyenda = f"Firmado el {ahora}" if leyenda_on else ""
-
-        section("4. Vista previa y guardar")
-        if not firma:
-            st.info("Dibuja la firma y presiona **Usar esta firma** para ver cómo queda.")
-        else:
+        section("2. Sube el contrato (PDF)")
+        up = st.file_uploader("Contrato", type=["pdf"], key=f"exp_file_{nonce}")
+        contrato_pdf = up.getvalue() if up else None
+        n_pag = 0
+        if contrato_pdf:
             try:
-                firmado = D.estampar_firma(data, firma, int(pagina), x_pct, y_pct, ancho, leyenda)
+                n_pag = len(D.info_pdf(contrato_pdf))
             except Exception as e:  # noqa: BLE001
-                st.error(f"No se pudo estampar la firma: {e}")
-                firmado = None
-            if firmado:
-                st.image(D.render_pagina(firmado, int(pagina)), use_container_width=True,
-                         caption=f"Página {int(pagina) + 1} con la firma (así quedará el documento)")
-                r1, r2 = st.columns(2)
-                r1.download_button("Descargar el PDF firmado para revisar", firmado,
-                                   file_name=D.nombre_firmado(fila["nombre"]),
-                                   mime="application/pdf", use_container_width=True)
-                if r2.button(f"Guardar en '{D.CARPETA_FIRMADOS}'", type="primary",
-                             use_container_width=True, disabled=not ok_cf):
-                    try:
-                        destino = D.carpeta_firmados(USUARIO)
-                        nuevo = D.subir(destino, D.nombre_firmado(fila["nombre"]), firmado,
-                                        "application/pdf", USUARIO, f"Firma de '{fila['nombre']}'",
-                                        firmado_de=int(pdf_id), contrato=ct_f,
-                                        firma_pagina=int(pagina) + 1)
-                        D.limpiar_firma("doc_firma")
-                        st.session_state["doc_carpeta_pendiente"] = destino
-                        st.session_state["doc_abrir_pendiente"] = int(nuevo)
-                        st.success(f"Guardado en **{D.CARPETA_FIRMADOS}**.")
+                st.error(f"Ese PDF no se puede leer: {e}")
+                contrato_pdf = None
+
+        if contrato_pdf and ok_datos:
+            section("3. Firma del cliente (con el mouse o el dedo)")
+            firma = D.panel_firma(f"exp_firma_{nonce}")
+
+            section("4. Dónde va la firma en el contrato")
+            pg, x, y, an = posicion(f"exp_pos_{nonce}", n_pag)
+            if not pla.empty:
+                st.caption("En el adendum y la información general la firma va donde lo define la plantilla.")
+
+            if not firma:
+                st.info("Dibuja la firma y presiona **Usar esta firma** para ver cómo quedan los documentos.")
+            else:
+                section("5. Vista previa")
+                leyenda = f"Firmado el {pd.Timestamp.now(tz='America/Bogota'):%d/%m/%Y %H:%M}"
+                try:
+                    prep = E.preparar(contrato_pdf, firma, {"pagina": pg, "x": x, "y": y, "ancho": an},
+                                      leyenda, pla, _bytes)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"No se pudo estampar la firma: {e}")
+                    prep = []
+                if prep:
+                    cols = st.columns(len(prep))
+                    for col, item in zip(cols, prep):
+                        with col:
+                            st.markdown(f"**{E.TIPOS[item['tipo']]}** · pág. {item['pagina'] + 1}")
+                            st.image(_png_bytes(item["firmado"], item["pagina"]), width="stretch")
+                            st.download_button("Descargar", item["firmado"],
+                                               file_name=E.nombre_archivo(int(ctxt), placa, item["tipo"]),
+                                               mime="application/pdf", key=f"exp_dl_{item['tipo']}_{nonce}",
+                                               width="stretch")
+                    if st.button("Guardar los documentos firmados", type="primary", key=f"exp_save_{nonce}"):
+                        try:
+                            with st.spinner("Guardando..."):
+                                E.guardar(int(ctxt), placa, prep, USUARIO)
+                            D.limpiar_firma(f"exp_firma_{nonce}")
+                            st.session_state["exp_nonce"] = nonce + 1
+                            st.session_state["exp_modo_pendiente"] = "Buscar placa o contrato"
+                            st.session_state["exp_q_pendiente"] = str(int(ctxt))
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"No se pudo guardar: {e}")
+
+# =============================================================================
+# VALIDACION
+# =============================================================================
+with tab_val:
+    st.caption(f"Rango del filtro lateral ({filtros.fecha_desde} → {filtros.fecha_hasta}). Expedientes creados "
+               f"en el rango + contratos del sistema entregados en el rango sin documentos (desde "
+               f"{E.FECHA_INICIO:%d/%m/%Y}, cuando arranca el uso).")
+    try:
+        val = E.validacion(filtros.fecha_desde, filtros.fecha_hasta, filtros.sedes_nombres or None)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudo validar: {e}")
+        val = pd.DataFrame()
+    if val.empty:
+        st.info("No hay contratos en el rango.")
+    else:
+        cnt = val["estado"].value_counts()
+        ks = st.columns(5)
+        for col, k in zip(ks, ["OK", "PENDIENTE", "PLACA", "INCOMPLETO", "SIN_DOCS"]):
+            kpi(col, E.ESTADOS[k], fmt_int(int(cnt.get(k, 0))))
+        ver = st.radio("Mostrar", ["Con problemas", "Todos", "Al día", "Pendientes"], horizontal=True,
+                       key="exp_val_ver")
+        t = {"Con problemas": val[val["estado"].isin(["PLACA", "INCOMPLETO", "SIN_DOCS"])],
+             "Todos": val, "Al día": val[val["estado"] == "OK"],
+             "Pendientes": val[val["estado"] == "PENDIENTE"]}[ver]
+        orden = {"PLACA": 0, "INCOMPLETO": 1, "SIN_DOCS": 2, "PENDIENTE": 3, "OK": 4}
+        t = t.assign(_o=t["estado"].map(orden)).sort_values(["_o", "contrato"])
+        vista = pd.DataFrame({
+            "Estado": t["estado"].map(E.ESTADOS),
+            "Contrato": t["contrato"].astype(str),
+            "Placa digitada": t["placa_digitada"],
+            "Placa(s) en el sistema": t["placas_sistema"],
+            "Sede": t["sede"].fillna(""),
+            "Entrega": t["entrega"].map(lambda v: "" if v is None or pd.isna(v) else str(v)),
+            "Faltan": t["faltan"],
+            "Creado por": t["creado_por"],
+            "Creado": t["creado_at"].map(_fecha),
+        })
+        st.dataframe(vista, width="stretch", hide_index=True)
+        xlsx_download_button(vista, file_name=f"validacion_contratos_{dt.date.today()}",
+                             sheet_name="Validacion", key="xlsx_exp_val")
+
+        malas = val[val["estado"] == "PLACA"]
+        if not malas.empty:
+            with st.expander(f"Corregir placa ({len(malas)} contrato(s) con placa distinta al sistema)"):
+                cm = st.selectbox("Contrato", malas["contrato"].astype(int).tolist(), key="exp_fix_ct")
+                fm = malas[malas["contrato"] == cm].iloc[0]
+                opciones = [p.strip() for p in fm["placas_sistema"].split(",") if p.strip()]
+                nueva = st.selectbox(f"Placa correcta (digitada: {fm['placa_digitada']})", opciones,
+                                     key="exp_fix_pl")
+                if st.button("Corregir", key="exp_fix_btn"):
+                    E.corregir_placa(int(cm), nueva, USUARIO)
+                    st.success(f"Contrato {cm} movido a la placa {nueva}.")
+                    st.rerun()
+
+# =============================================================================
+# PLANTILLAS
+# =============================================================================
+with tab_pla:
+    st.caption("Documentos iguales para TODOS los contratos. Cada carga es una versión nueva; los "
+               "contratos ya firmados conservan la versión con la que se firmaron.")
+    pla = E.plantillas_activas()
+    for tipo in E.TIPOS_PLANTILLA:
+        section(E.TIPOS[tipo])
+        act = pla[pla["tipo"] == tipo]
+        if act.empty:
+            st.info("Todavía no hay plantilla cargada.")
+        else:
+            a = act.iloc[0]
+            data = _bytes(a["storage_path"])
+            n = len(D.info_pdf(data))
+            st.caption(f"Versión **{int(a['version'])}** · {a['nombre']} · {n} página(s) · cargada el "
+                       f"{_fecha(a['subido_at'])} por {a['subido_por']}")
+            with st.expander("Ajustar dónde va la firma"):
+                pg, x, y, an = posicion(f"pla_{tipo}", n,
+                                        (a["firma_pagina"] if pd.notna(a["firma_pagina"]) else None,
+                                         a["firma_x"], a["firma_y"], a["firma_ancho"]))
+                st.image(_png_bytes(D.estampar_firma(data, FIRMA_EJEMPLO, pg, x, y, an, "Firmado el dd/mm/aaaa hh:mm"),
+                                    pg, 700), caption="Vista previa con una firma de ejemplo", width=520)
+                if st.button("Guardar posición", key=f"pla_pos_btn_{tipo}"):
+                    E.actualizar_posicion(int(a["plantilla_id"]), pg + 1, x, y, an)
+                    st.success("Posición guardada.")
+                    st.rerun()
+        with st.expander(f"Cargar {'nueva versión' if not act.empty else 'plantilla'} de {E.TIPOS[tipo]}"):
+            f = st.file_uploader("PDF", type=["pdf"], key=f"pla_up_{tipo}")
+            if f is not None and st.button("Cargar", key=f"pla_up_btn_{tipo}"):
+                try:
+                    E.subir_plantilla(tipo, f.name, f.getvalue(), USUARIO, None, 64, 8, 28)
+                    st.success("Plantilla cargada. Ajusta dónde va la firma arriba.")
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"No se pudo cargar: {e}")
+    hist = E.historial_plantillas()
+    if not hist.empty:
+        with st.expander("Historial de versiones"):
+            st.dataframe(pd.DataFrame({
+                "Tipo": hist["tipo"].map(E.TIPOS), "Versión": hist["version"], "Archivo": hist["nombre"],
+                "Activa": hist["activa"].map({True: "Sí", False: ""}), "Cargada por": hist["subido_por"],
+                "Cargada": hist["subido_at"].map(_fecha)}), width="stretch", hide_index=True)
+
+# =============================================================================
+# ARCHIVOS GENERALES (carpetas libres)
+# =============================================================================
+with tab_gen:
+    df_c = D.carpetas()
+    rutas = D.rutas_carpetas(df_c) if not df_c.empty else {}
+    c_sel, c_new = st.columns([3, 2])
+    with c_new:
+        with st.expander("Nueva carpeta", expanded=not rutas):
+            with st.form("doc_new_folder", clear_on_submit=True):
+                nombre = st.text_input("Nombre")
+                opciones_padre = [None] + list(rutas)
+                actual = st.session_state.get("doc_carpeta")
+                padre = st.selectbox("Dentro de", opciones_padre,
+                                     format_func=lambda c: "(raíz)" if c is None else rutas[c],
+                                     index=opciones_padre.index(actual) if actual in rutas else 0)
+                if st.form_submit_button("Crear"):
+                    if not nombre.strip():
+                        st.error("Ponle un nombre.")
+                    else:
+                        try:
+                            D.crear_carpeta(nombre, padre, USUARIO)
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error("Ya existe una carpeta con ese nombre ahí." if "unique" in str(e).lower()
+                                     else f"No se pudo crear: {e}")
+    if not rutas:
+        st.info("Todavía no hay carpetas.")
+    else:
+        with c_sel:
+            carpeta = st.selectbox("Carpeta", list(rutas), format_func=lambda c: rutas[c], key="doc_carpeta")
+        docs = D.documentos(carpeta)
+        if docs.empty:
+            st.info("La carpeta está vacía.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "Nombre": docs["nombre"],
+                "Contrato": docs["contrato"].map(lambda v: "" if pd.isna(v) else str(int(v))),
+                "Tamaño": docs["tamano_bytes"].map(_tam),
+                "Cargado por": docs["subido_por"],
+                "Cargado": docs["subido_at"].map(_fecha),
+            }), width="stretch", hide_index=True)
+            op = dict(zip(docs["documento_id"].astype(int), docs["nombre"]))
+            doc_id = st.selectbox("Ver archivo", list(op), format_func=op.get, key="doc_abrir")
+            fila = docs[docs["documento_id"] == doc_id].iloc[0]
+            visor(fila, f"g{doc_id}")
+            if pd.isna(fila.get("tipo_documento")):   # los de un expediente se manejan en Contratos
+                with st.expander("Eliminar este archivo"):
+                    seguro = st.checkbox(f"Sí, eliminar '{fila['nombre']}'", key=f"doc_del_ok_{doc_id}")
+                    if st.button("Eliminar", disabled=not seguro, key=f"doc_del_{doc_id}"):
+                        D.eliminar(doc_id, USUARIO)
                         st.rerun()
+
+        with st.expander(f"Subir archivos a {rutas[carpeta]}"):
+            gn = st.session_state.setdefault("doc_up_nonce", 0)
+            with st.form(f"doc_upload_{gn}"):
+                files = st.file_uploader("Archivos (máx. 50 MB c/u)", accept_multiple_files=True,
+                                         key=f"doc_files_{gn}")
+                ok = st.form_submit_button("Subir")
+            if ok and files:
+                errores = []
+                for f in files:
+                    data = f.getvalue()
+                    if len(data) > 50 * 1024 * 1024:
+                        errores.append(f"{f.name}: pesa más de 50 MB")
+                        continue
+                    try:
+                        D.subir(carpeta, f.name, data, f.type or "application/octet-stream", USUARIO)
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"No se pudo guardar: {e}")
-            st.caption("El original no se modifica: se guarda una copia nueva con la firma. "
-                       "Quién firmó y cuándo queda registrado en la base. Es una firma manuscrita "
-                       "digitalizada, no una firma digital certificada.")
+                        errores.append(f"{f.name}: {e}")
+                for e in errores:
+                    st.error(e)
+                if not errores:
+                    st.session_state["doc_up_nonce"] = gn + 1
+                    st.rerun()
