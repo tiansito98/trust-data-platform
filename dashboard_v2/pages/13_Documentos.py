@@ -46,6 +46,12 @@ if not S.configurado():
 
 from components import documentos as D  # noqa: E402  (importa el componente de firma)
 
+# Streamlit Cloud puede servir el modulo viejo tras un push (ver CLAUDE.md): recargarlo.
+D_API_REQUERIDA = 2
+if getattr(D, "API_VERSION", 0) < D_API_REQUERIDA:
+    import importlib
+    D = importlib.reload(D)
+
 try:
     D.ensure_tables()
 except Exception as e:  # noqa: BLE001

@@ -23,12 +23,22 @@ import unicodedata
 import uuid
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
+from sqlalchemy import text
 
-from components.common import execute_write, execute_write_returning, load_query
+from components.common import execute_write, execute_write_returning, get_engine, _clean_params
 from components import storage as S
 
-API_VERSION = 1
+API_VERSION = 2
+
+
+def load_query(sql: str, params: dict | None = None) -> pd.DataFrame:
+    """Lectura SIN cache. common.load_query cachea 5 minutos (bien para silver, que
+    cambia 1 vez al dia), pero aqui una carpeta o archivo recien creado tiene que
+    verse en el acto (2026-11-09: la carpeta 'Prueba' no aparecia)."""
+    with get_engine().connect() as conn:
+        return pd.read_sql_query(text(sql), conn, params=_clean_params(params or {}))
 
 
 # =============================================================================
