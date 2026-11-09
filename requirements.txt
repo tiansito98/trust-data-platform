@@ -24,3 +24,4 @@ pyyaml>=6.0
 openpyxl>=3.1.0           # Engine de pandas para xlsx_download_button
 requests>=2.31            # Supabase Storage via REST (components/storage.py)
 pypdf>=4.0                # Firmar PDFs (components/documentos.py)
+pypdfium2>=4.30          # Vista previa de PDFs como imagen (components/documentos.py)

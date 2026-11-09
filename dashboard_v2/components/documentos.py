@@ -30,7 +30,7 @@ from sqlalchemy import text
 from components.common import execute_write, execute_write_returning, get_engine, _clean_params
 from components import storage as S
 
-API_VERSION = 2
+API_VERSION = 3
 
 
 def load_query(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -81,6 +81,16 @@ def ensure_tables() -> bool:
         );
         CREATE INDEX IF NOT EXISTS documentos_carpeta_idx
             ON operational.documentos (carpeta_id) WHERE NOT eliminado;
+        -- Atado a contrato -> placa(s) (2026-11-09): la placa es la llave para ver todo
+        -- lo anexado a un carro. placas = foto de TODAS las placas del contrato al
+        -- momento de vincularlo (un contrato puede cambiar de carro, ver hard rule 16).
+        ALTER TABLE operational.documentos ADD COLUMN IF NOT EXISTS contrato bigint;
+        ALTER TABLE operational.documentos ADD COLUMN IF NOT EXISTS placas text[];
+        ALTER TABLE operational.documentos ADD COLUMN IF NOT EXISTS firma_pagina integer;
+        CREATE INDEX IF NOT EXISTS documentos_contrato_idx
+            ON operational.documentos (contrato) WHERE NOT eliminado;
+        CREATE INDEX IF NOT EXISTS documentos_placas_idx
+            ON operational.documentos USING gin (placas);
     """, {})
     S.ensure_bucket()
     return True
@@ -117,6 +127,65 @@ def crear_carpeta(nombre: str, parent_id: int | None, usuario: str) -> None:
     """, {"p": parent_id, "n": nombre.strip(), "u": usuario})
 
 
+CARPETA_FIRMADOS = "Documentos firmados"
+
+
+def carpeta_firmados(usuario: str) -> int:
+    """Id de la carpeta raiz 'Documentos firmados'; la crea si no existe."""
+    execute_write("""
+        INSERT INTO operational.doc_carpetas (parent_id, nombre, created_by)
+        VALUES (NULL, :n, :u)
+        ON CONFLICT DO NOTHING
+    """, {"n": CARPETA_FIRMADOS, "u": usuario})
+    return int(load_query("""
+        SELECT carpeta_id FROM operational.doc_carpetas
+        WHERE parent_id IS NULL AND lower(nombre) = lower(:n)
+    """, {"n": CARPETA_FIRMADOS}).iloc[0, 0])
+
+
+# =============================================================================
+# Contrato -> placa(s)
+# =============================================================================
+def info_contrato(contrato: int) -> dict | None:
+    """Placa(s), sede y fechas del contrato, o None si no esta en silver.
+    Placas = la del header + la de CADA tramo (fact_rental_vehicles x dim_vehicles):
+    si el contrato cambio de carro, el documento queda atado a todos."""
+    df = load_query("""
+        SELECT numero_contrato::bigint AS contrato, TRIM(placa) AS placa, sede_handover,
+               fecha_handover_real::date AS entrega
+        FROM silver.vw_rentals_full WHERE numero_contrato = :c LIMIT 1
+    """, {"c": int(contrato)})
+    if df.empty:
+        return None
+    pl = load_query("""
+        SELECT DISTINCT TRIM(dv.vhcl_plate) AS placa
+        FROM silver.fact_rental_vehicles rv
+        JOIN silver.dim_vehicles dv ON dv.vhcl_int_num = rv.vhcl_int_num
+        WHERE rv.rntl_mvnr = :c AND rv.mndt_code = 409
+          AND NULLIF(TRIM(dv.vhcl_plate), '') IS NOT NULL
+    """, {"c": int(contrato)})["placa"].tolist()
+    r = df.iloc[0]
+    placas = sorted({p for p in [r["placa"], *pl] if p})
+    return {"contrato": int(r["contrato"]), "placas": placas, "sede": r["sede_handover"],
+            "entrega": r["entrega"]}
+
+
+def buscar(texto: str):
+    """Documentos por contrato (solo digitos) o por placa, en cualquier carpeta."""
+    t = (texto or "").strip().upper().replace(" ", "").replace("-", "")
+    if not t:
+        return pd.DataFrame()
+    return load_query("""
+        SELECT d.documento_id, d.nombre, d.carpeta_id, d.contrato, d.placas, d.mime_type,
+               d.tamano_bytes, d.storage_path, d.subido_por, d.subido_at,
+               d.firmado_de, d.firmado_por, d.firmado_at
+        FROM operational.documentos d
+        WHERE NOT d.eliminado
+          AND (d.contrato = :c OR :t = ANY(d.placas))
+        ORDER BY d.subido_at DESC
+    """, {"t": t, "c": int(t) if t.isdigit() and len(t) < 19 else None})
+
+
 # =============================================================================
 # Documentos
 # =============================================================================
@@ -131,7 +200,7 @@ def documentos(carpeta_id: int):
     return load_query("""
         SELECT d.documento_id, d.nombre, d.mime_type, d.tamano_bytes, d.storage_path,
                d.subido_por, d.subido_at, d.firmado_de, d.firmado_por, d.firmado_at,
-               d.descripcion, d.origen
+               d.descripcion, d.origen, d.contrato, d.placas, d.sede_nombre, d.firma_pagina
         FROM operational.documentos d
         WHERE d.carpeta_id = :c AND NOT d.eliminado
         ORDER BY d.subido_at DESC
@@ -139,27 +208,49 @@ def documentos(carpeta_id: int):
 
 
 def subir(carpeta_id: int, nombre: str, data: bytes, mime: str, usuario: str,
-          descripcion: str = "", firmado_de: int | None = None) -> int:
-    """Sube el binario y registra la fila. Si el INSERT falla, borra el objeto."""
+          descripcion: str = "", firmado_de: int | None = None,
+          contrato: dict | None = None, firma_pagina: int | None = None) -> int:
+    """Sube el binario y registra la fila. Si el INSERT falla, borra el objeto.
+    contrato = dict de info_contrato() (o None). firmado_de != None => copia firmada:
+    firmado_por = usuario y firmado_at = ahora. La traza de QUIEN firmo vive aqui,
+    no en el papel (la leyenda del PDF solo lleva la fecha)."""
     path = f"{int(carpeta_id)}/{uuid.uuid4().hex}_{_slug(nombre)}"
     S.upload(path, data, mime)
     try:
         return execute_write_returning("""
             INSERT INTO operational.documentos
                 (carpeta_id, nombre, storage_path, mime_type, tamano_bytes, sha256,
-                 descripcion, subido_por, firmado_de, firmado_por, firmado_at)
+                 descripcion, subido_por, firmado_de, firmado_por, firmado_at,
+                 contrato, placas, sede_nombre, firma_pagina)
             VALUES (:c, :n, :p, :m, :t, :h, :d, :u, :f,
                     CASE WHEN :f IS NULL THEN NULL ELSE :u END,
-                    CASE WHEN :f IS NULL THEN NULL ELSE now() END)
+                    CASE WHEN :f IS NULL THEN NULL ELSE now() END,
+                    :ct, :pl, :sd, :fp)
             RETURNING documento_id
         """, {"c": int(carpeta_id), "n": nombre, "p": path, "m": mime, "t": len(data),
               "h": hashlib.sha256(data).hexdigest(), "d": descripcion or None,
-              "u": usuario, "f": firmado_de})
+              "u": usuario, "f": firmado_de,
+              "ct": contrato["contrato"] if contrato else None,
+              "pl": list(contrato["placas"]) if contrato else None,
+              "sd": contrato["sede"] if contrato else None,
+              "fp": firma_pagina})
     except Exception:
         try:
             S.delete([path])
         finally:
             raise
+
+
+def vincular_contrato(documento_id: int, contrato: dict | None) -> None:
+    """Ata (o desata, con None) un documento existente a un contrato."""
+    execute_write("""
+        UPDATE operational.documentos
+        SET contrato = :ct, placas = :pl, sede_nombre = :sd
+        WHERE documento_id = :id
+    """, {"id": int(documento_id),
+          "ct": contrato["contrato"] if contrato else None,
+          "pl": list(contrato["placas"]) if contrato else None,
+          "sd": contrato["sede"] if contrato else None})
 
 
 def eliminar(documento_id: int, usuario: str) -> None:
@@ -350,6 +441,31 @@ def estampar_firma(data: bytes, firma: dict, pagina: int, x_pct: float, y_pct: f
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+def n_paginas(data: bytes) -> int:
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    try:
+        return len(pdf)
+    finally:
+        pdf.close()
+
+
+def render_pagina(data: bytes, pagina: int, ancho_px: int = 1100) -> bytes:
+    """PNG de una pagina del PDF (pypdfium2; respeta /Rotate). El visor de PDF del
+    navegador no carga dentro del iframe de Streamlit, por eso se rasteriza aqui."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    try:
+        page = pdf[pagina]
+        w, _ = page.get_size()
+        img = page.render(scale=ancho_px / max(w, 1)).to_pil()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+    finally:
+        pdf.close()
 
 
 def nombre_firmado(nombre: str) -> str:
