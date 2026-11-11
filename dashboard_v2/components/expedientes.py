@@ -2,12 +2,11 @@
 Expedientes de contrato firmados (sobre components/documentos.py + Supabase Storage).
 
 EL CONTRATO ES LA LLAVE (2026-11-11): es unico para siempre y a mitad de renta le pueden
-cambiar el carro, asi que las carpetas van por contrato, no por placa. La placa se guarda
-como dato (la digitada al firmar) y se valida contra todos los tramos del sistema.
+cambiar el carro, asi que las carpetas van por contrato, no por placa. El asesor NO digita
+la placa (2026-11-11): las placas salen del sistema (todos los tramos del contrato).
 
 Flujo:
-  1. El asesor digita el CONTRATO (y la placa, propuesta por el sistema si ya llego),
-     elige el TRAMITE y sube SOLO el PDF del contrato.
+  1. El asesor digita el CONTRATO, elige el TRAMITE y sube SOLO el PDF del contrato.
      - RENTA: contrato + addendum + informacion de renta (ES o EN, segun el cliente).
      - SOLO_CONTRATO: solo el contrato (no todo lo que se firma lleva los anexos).
   2. Los anexos salen de PLANTILLAS fijas (operational.doc_plantillas: una activa por
@@ -20,9 +19,9 @@ Flujo:
      <CONTRATO>_<TIPO>_<AAAAMMDD>.pdf. Ademas de lo firmado, la carpeta guarda
      ADJUNTOS que no se firman: comprobante de pago (voucher escaneado) y factura
      electronica (PDF o imagen; mas adelante se leen con IA para quitar la digitacion
-     de Facturas).
-  5. Validacion (como Facturas) contra silver: pendiente / placa no coincide /
-     faltan documentos (segun el tramite) / al dia; y contratos del sistema sin
+     de Facturas). Se pueden cargar despues, pero la validacion los EXIGE.
+  5. Validacion (como Facturas) contra silver: faltan firmados (segun el tramite) /
+     falta comprobante o factura / pendiente / al dia; y contratos del sistema sin
      expediente desde FECHA_INICIO.
 
 Re-firmar un tipo reemplaza al anterior (el viejo queda eliminado = TRUE y se ve como
@@ -45,7 +44,7 @@ from components import storage as S
 from components.common import execute_write, execute_write_returning, get_engine
 from sqlalchemy import text
 
-API_VERSION = 6
+API_VERSION = 7
 
 # Los que se FIRMAN
 TIPOS = {
@@ -53,11 +52,13 @@ TIPOS = {
     "ADENDUM": "Addendum",
     "INFO_GENERAL": "Información de renta",
 }
-# Los que solo se GUARDAN (no se firman). Opcionales: no cuentan en la validacion.
+# Los que solo se GUARDAN (no se firman). Se pueden cargar despues, pero la validacion
+# los exige en todo expediente (ADJUNTOS_REQUERIDOS).
 ADJUNTOS = {
     "COMPROBANTE_PAGO": "Comprobante de pago",
     "FACTURA_ELECTRONICA": "Factura electrónica",
 }
+ADJUNTOS_REQUERIDOS = list(ADJUNTOS)
 EXT_ADJUNTO = {"pdf": "application/pdf", "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}
 # Como se llama cada tipo en el NOMBRE del archivo
 TIPO_ARCHIVO = {"CONTRATO": "CONTRATO", "ADENDUM": "ADDENDUM", "INFO_GENERAL": "INFO_RENTA",
@@ -138,7 +139,7 @@ def ensure_tables() -> bool:
             ON operational.doc_plantillas (tipo, COALESCE(idioma, '')) WHERE activa;
         CREATE TABLE IF NOT EXISTS operational.doc_contratos (
             contrato        bigint PRIMARY KEY,
-            placa           text NOT NULL,
+            placa           text,
             sede_nombre     text,
             creado_por      text,
             creado_at       timestamptz NOT NULL DEFAULT now(),
@@ -151,6 +152,8 @@ def ensure_tables() -> bool:
         ALTER TABLE operational.doc_contratos ADD COLUMN IF NOT EXISTS idioma text;
         ALTER TABLE operational.doc_contratos ADD COLUMN IF NOT EXISTS carpeta_id bigint;
         ALTER TABLE operational.doc_contratos ADD COLUMN IF NOT EXISTS firmado_at timestamptz;
+        -- 2026-11-11: el asesor ya no digita la placa; se llena con las del sistema si ya llego
+        ALTER TABLE operational.doc_contratos ALTER COLUMN placa DROP NOT NULL;
         CREATE INDEX IF NOT EXISTS doc_contratos_placa_idx ON operational.doc_contratos (placa);
         -- un solo documento VIGENTE por (contrato, tipo); re-firmar marca el viejo eliminado
         CREATE UNIQUE INDEX IF NOT EXISTS documentos_contrato_tipo_uq
@@ -171,7 +174,7 @@ def _crear_vista() -> None:
         DROP VIEW IF EXISTS operational.vw_documentos_contratos;
         CREATE VIEW operational.vw_documentos_contratos AS
         SELECT e.contrato,
-               e.placa                               AS placa_al_firmar,
+               e.placa                               AS placas_al_firmar,
                (COALESCE(e.firmado_at, e.creado_at) AT TIME ZONE 'America/Bogota') AS firmado_el,
                e.tramite,
                e.firmante_nombre                     AS cliente,
@@ -332,15 +335,6 @@ def documentos_contrato(contrato: int, vigentes: bool = True) -> pd.DataFrame:
     """, {"c": int(contrato)})
 
 
-def placas_flota() -> pd.DataFrame:
-    """Flota activa (ultimo dia de gold_carro_dia): placa, sede, acriss. Para el selector."""
-    return D.load_query("""
-        SELECT placa, sede, acriss FROM silver.gold_carro_dia
-        WHERE fecha = (SELECT MAX(fecha) FROM silver.gold_carro_dia)
-        ORDER BY placa
-    """)
-
-
 def plantillas_del_tramite(tramite: str, idioma: str, pla: pd.DataFrame) -> pd.DataFrame:
     """Las plantillas que lleva el tramite: addendum (su idioma o el unico que haya)
     + informacion de renta en el idioma del cliente."""
@@ -463,17 +457,18 @@ def _subir_y_registrar(contrato: int, filas: list[dict], usuario: str, upsert_ex
         raise
 
 
-def guardar(contrato: int, placa: str, preparados: list[dict], usuario: str, tramite: str,
+def guardar(contrato: int, preparados: list[dict], usuario: str, tramite: str,
             firmante: str = "", idioma: str | None = None, sede: str | None = None,
             adjuntos: list[dict] | None = None) -> dict:
     """Guarda el expediente en Contratos/<CONTRATO>: contrato SIN firmar (traza) + los
     firmados + los adjuntos opcionales (comprobante de pago / factura electronica, de
-    adjunto()). Re-firmar reemplaza (lo viejo queda como version anterior) y actualiza
-    la placa si cambio. Devuelve {tipo: documento_id}."""
+    adjunto()). Re-firmar reemplaza (lo viejo queda como version anterior). La placa no
+    se digita: se guardan las del sistema si el contrato ya llego. Devuelve {tipo: documento_id}."""
     contrato = int(contrato)
     hoy = pd.Timestamp.now(tz="America/Bogota").date()
     info = D.info_contrato(contrato) or {}
     sede_f = info.get("sede") or sede
+    placa = ", ".join(info.get("placas") or []) or None
     filas = []
     for item in preparados:
         tipo = item["tipo"]
@@ -495,7 +490,7 @@ def guardar(contrato: int, placa: str, preparados: list[dict], usuario: str, tra
             VALUES (:c, :p, :s, :u, :t, :r, :f, :i, :cp, now())
             ON CONFLICT (contrato) DO UPDATE
                 SET actualizado_por = :u, actualizado_at = now(), firmado_at = now(),
-                    placa = EXCLUDED.placa,
+                    placa = COALESCE(EXCLUDED.placa, operational.doc_contratos.placa),
                     tramite = EXCLUDED.tramite, requeridos = EXCLUDED.requeridos,
                     firmante_nombre = EXCLUDED.firmante_nombre, idioma = EXCLUDED.idioma,
                     carpeta_id = EXCLUDED.carpeta_id,
@@ -535,16 +530,6 @@ def eliminar_expediente(contrato: int, usuario: str) -> None:
               AND NOT EXISTS (SELECT 1 FROM operational.documentos d WHERE d.carpeta_id = c.carpeta_id)
               AND NOT EXISTS (SELECT 1 FROM operational.doc_carpetas h WHERE h.parent_id = c.carpeta_id);
         """, {"cp": int(exp["carpeta_id"])})
-
-
-def corregir_placa(contrato: int, placa_nueva: str, usuario: str) -> None:
-    """Corrige la placa digitada. Las carpetas y archivos van por contrato, asi que no
-    se mueve nada: solo el dato."""
-    execute_write("""
-        UPDATE operational.doc_contratos
-        SET placa = :p, actualizado_por = :u, actualizado_at = now()
-        WHERE contrato = :c
-    """, {"c": int(contrato), "p": placa_nueva, "u": usuario})
 
 
 def migrar_a_contrato(usuario: str = "migracion") -> list[str]:
@@ -599,8 +584,8 @@ def migrar_a_contrato(usuario: str = "migracion") -> list[str]:
 ESTADOS = {
     "OK": "Al día",
     "PENDIENTE": "Pendiente: el contrato aún no llega del sistema",
-    "PLACA": "La placa digitada no está en el contrato",
     "INCOMPLETO": "Faltan documentos firmados",
+    "FALTA_ADJ": "Falta comprobante o factura",
     "SIN_DOCS": "Sin documentos",
 }
 
@@ -610,13 +595,13 @@ def validacion(desde: date, hasta: date, sedes: list[str] | None = None) -> pd.D
     sistema entregados en el rango (desde FECHA_INICIO) sin expediente."""
     d0 = max(desde, FECHA_INICIO)
     exp = D.load_query("""
-        SELECT e.contrato, e.placa AS placa_digitada, e.sede_nombre, e.creado_por, e.creado_at,
+        SELECT e.contrato, e.sede_nombre, e.creado_por, e.creado_at,
                e.tramite, e.requeridos, e.firmante_nombre,
                COALESCE(array_agg(DISTINCT d.tipo_documento)
                         FILTER (WHERE d.tipo_documento IS NOT NULL), '{}') AS tipos
         FROM operational.doc_contratos e
         LEFT JOIN operational.documentos d
-               ON d.contrato = e.contrato AND NOT d.eliminado AND d.firmado_por IS NOT NULL
+               ON d.contrato = e.contrato AND NOT d.eliminado
         WHERE (COALESCE(e.firmado_at, e.creado_at) AT TIME ZONE 'America/Bogota')::date BETWEEN :d AND :h
         GROUP BY e.contrato
     """, {"d": desde, "h": hasta})
@@ -654,8 +639,7 @@ def validacion(desde: date, hasta: date, sedes: list[str] | None = None) -> pd.D
         e = exp_by.get(c)
         en_sis = c in hdr.index
         pls = sorted(placas.get(c, set()))
-        fila = {"contrato": c, "placa_digitada": e.placa_digitada if e is not None else "",
-                "placas_sistema": ", ".join(pls),
+        fila = {"contrato": c, "placas_sistema": ", ".join(pls),
                 "sede": hdr.at[c, "sede_handover"] if en_sis else (e.sede_nombre if e is not None else None),
                 "entrega": hdr.at[c, "entrega"] if en_sis else None,
                 "tramite": TRAMITES.get(e.tramite, {}).get("nombre", "") if e is not None else "",
@@ -664,18 +648,21 @@ def validacion(desde: date, hasta: date, sedes: list[str] | None = None) -> pd.D
                 "creado_at": e.creado_at if e is not None else None, "faltan": ""}
         if e is None:
             fila["estado"] = "SIN_DOCS"
-            fila["faltan"] = ", ".join(TIPOS[t] for t in TRAMITES["RENTA"]["requeridos"])
+            fila["faltan"] = ", ".join([TIPOS[t] for t in TRAMITES["RENTA"]["requeridos"]] +
+                                       [ADJUNTOS[t] for t in ADJUNTOS_REQUERIDOS])
         else:
             req = list(e.requeridos) if isinstance(e.requeridos, (list, tuple)) and len(e.requeridos) \
                 else TRAMITES["RENTA"]["requeridos"]
-            faltan = [TIPOS[t] for t in req if t not in set(e.tipos or [])]
-            fila["faltan"] = ", ".join(faltan)
+            tiene = set(e.tipos or [])
+            faltan = [TIPOS[t] for t in req if t not in tiene]
+            faltan_adj = [ADJUNTOS[t] for t in ADJUNTOS_REQUERIDOS if t not in tiene]
+            fila["faltan"] = ", ".join(faltan + faltan_adj)
             if faltan:
                 fila["estado"] = "INCOMPLETO"
+            elif faltan_adj:
+                fila["estado"] = "FALTA_ADJ"
             elif not en_sis:
                 fila["estado"] = "PENDIENTE"
-            elif e.placa_digitada not in pls:
-                fila["estado"] = "PLACA"
             else:
                 fila["estado"] = "OK"
         filas.append(fila)
