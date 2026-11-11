@@ -30,7 +30,7 @@ from sqlalchemy import text
 from components.common import execute_write, execute_write_returning, get_engine, _clean_params
 from components import storage as S
 
-API_VERSION = 5
+API_VERSION = 6
 
 
 def load_query(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -319,7 +319,7 @@ export default function(component) {
   cv.addEventListener('pointerup', fin); cv.addEventListener('pointercancel', fin);
   parentElement.querySelector('.limpiar').onclick = () => {
     trazos = []; ctx.clearRect(0, 0, cv.width, cv.height); estado.textContent = '';
-    setTriggerValue('firma', null);
+    setTriggerValue('firma', { limpiar: true });
   };
   parentElement.querySelector('.usar').onclick = () => {
     const t = trazos.filter(s => s.length > 1)
@@ -341,15 +341,15 @@ def panel_firma(key: str):
     res = _firma_component(key=key, on_firma_change=lambda: None)
     try:
         val = res.firma
-        presente = True
     except (AttributeError, KeyError):
-        val, presente = None, False
-    if presente and val is not None:
-        st.session_state[f"{key}__firma"] = val
-    elif presente and val is None and f"{key}__firma__visto" in st.session_state:
-        # 'Limpiar' manda None explicito: se descarta la firma guardada
+        val = None
+    # OJO: el trigger vuelve a None en CUALQUIER rerun (p.ej. el clic en "Guardar"), asi
+    # que None NO significa "borrar" (bug 2026-11-10: la firma se perdia al guardar).
+    # 'Limpiar' manda {limpiar: true} explicito.
+    if isinstance(val, dict) and val.get("limpiar"):
         st.session_state.pop(f"{key}__firma", None)
-    st.session_state[f"{key}__firma__visto"] = True
+    elif isinstance(val, dict) and val.get("trazos"):
+        st.session_state[f"{key}__firma"] = val
     return st.session_state.get(f"{key}__firma")
 
 

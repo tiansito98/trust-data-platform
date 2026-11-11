@@ -55,9 +55,9 @@ from components import expedientes as E  # noqa: E402
 
 # Streamlit Cloud puede servir modulos viejos tras un push (ver CLAUDE.md): recargarlos.
 import importlib  # noqa: E402
-if getattr(D, "API_VERSION", 0) < 5:
+if getattr(D, "API_VERSION", 0) < 6:
     D = importlib.reload(D)
-if getattr(E, "API_VERSION", 0) < 3:
+if getattr(E, "API_VERSION", 0) < 4:
     E = importlib.reload(E)
 
 try:
@@ -152,6 +152,21 @@ def visor(fila, key: str) -> None:
         st.caption("Vista previa solo para PDF, imágenes y texto. Usa *Abrir* o *Descargar*.")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _flota() -> pd.DataFrame:
+    return E.placas_flota()
+
+
+SEDE_CORTA = {"BOGOTA": "Bogotá", "MEDELLIN AP": "Medellín aeropuerto", "MEDELLIN CITY": "Medellín Poblado",
+              "PEREIRA": "Pereira", "BUCARAMANGA": "Bucaramanga", "CARTAGENA": "Cartagena",
+              "SANTA MARTA": "Santa Marta"}
+
+
+def _sede_corta(s) -> str:
+    s = str(s or "")
+    return next((v for k, v in SEDE_CORTA.items() if s.upper().startswith(k)), s.title())
+
+
 def posicion(key: str, n_paginas: int, defaults=(None, 64.0, 8.0, 28.0)):
     """Selector de pagina/posicion/ancho de la firma. Devuelve (pagina 0-based, x, y, ancho)."""
     pg0, x0, y0, a0 = defaults
@@ -189,18 +204,30 @@ with tab_con:
 
     # ---------------------------------------------------------------- Buscar
     if modo == "Buscar placa o contrato":
-        q = st.text_input("Placa o número de contrato", key="exp_q", placeholder="ej. QQT750 o 9525194370")
-        t = E.normalizar_placa(q)
+        con_docs = E.placas_con_documentos()
+        flota = _flota()
+        # todas las placas: primero las que tienen documentos, luego el resto de la flota
+        info_pl = {r.placa: f"{int(r.contratos)} contrato(s), último {_fecha(r.ultimo)[:10]}"
+                   for r in con_docs.itertuples()}
+        opciones = list(con_docs["placa"]) + [x for x in flota["placa"] if x not in info_pl]
+        b1, b2 = st.columns([2, 1])
+        placa_b = b1.selectbox(
+            "Placa", opciones, index=None, key="exp_q", placeholder="Escribe o elige la placa",
+            format_func=lambda x: f"{x}  ·  {info_pl[x]}" if x in info_pl else f"{x}  ·  sin documentos")
+        ct_b = b2.text_input("o número de contrato", key="exp_q_ct", placeholder="10 dígitos").strip()
         contrato_sel = None
-        if t.isdigit():
-            if E.expediente(int(t)):
-                contrato_sel = int(t)
+        if ct_b:
+            if not ct_b.isdigit():
+                st.error("El contrato son solo números.")
+            elif E.expediente(int(ct_b)):
+                contrato_sel = int(ct_b)
             else:
                 st.info("Ese contrato no tiene documentos todavía.")
-        elif t:
+        elif placa_b:
+            t = placa_b
             exps = E.contratos_de_placa(t)
             if exps.empty:
-                st.info(f"No hay contratos con documentos para la placa {t}.")
+                st.info(f"La placa {t} todavía no tiene contratos con documentos.")
             else:
                 section(f"Placa {t}: {len(exps)} contrato(s), del más reciente al más viejo")
                 n_req = exps["requeridos"].map(lambda r: len(r) if isinstance(r, (list, tuple)) and len(r) else 3)
@@ -270,8 +297,32 @@ with tab_con:
 
         section("1. Placa, contrato y trámite")
         c1, c2 = st.columns(2)
-        placa = E.normalizar_placa(c1.text_input("Placa", key=f"exp_placa_{nonce}", placeholder="ABC123"))
-        ctxt = c2.text_input("Número de contrato (10 dígitos)", key=f"exp_ct_{nonce}").strip()
+        flota = _flota()
+        fl = flota.set_index("placa")
+        OTRA = "__OTRA__"
+        placa_op = c1.selectbox(
+            "Placa", list(flota["placa"]) + [OTRA], index=None, key=f"exp_placa_sel_{nonce}",
+            placeholder="Escribe o elige la placa",
+            format_func=lambda x: "Otra placa (no está en la flota)" if x == OTRA
+            else f"{x}  ·  {_sede_corta(fl.at[x, 'sede'])}  ·  {fl.at[x, 'acriss']}")
+        if placa_op == OTRA:
+            placa = E.normalizar_placa(c1.text_input("Placa", key=f"exp_placa_{nonce}", placeholder="ABC123"))
+        else:
+            placa = placa_op or ""
+        ctxt = ""
+        if placa and E.placa_valida(placa):
+            cts = E.contratos_sistema_placa(placa)
+            OTRO = "__OTRO__"
+            op_ct = {int(r.contrato): f"{int(r.contrato)}  ·  entrega {r.entrega:%d/%m/%Y}  ·  "
+                                      f"{_sede_corta(r.sede_handover)}" for r in cts.itertuples()}
+            ct_op = c2.selectbox(
+                "Contrato", list(op_ct) + [OTRO], index=0 if op_ct else len(op_ct),
+                key=f"exp_ct_sel_{nonce}_{placa}",
+                format_func=lambda x: "Otro número (aún no llega del sistema)" if x == OTRO else op_ct[x])
+            if ct_op == OTRO:
+                ctxt = c2.text_input("Número de contrato (10 dígitos)", key=f"exp_ct_{nonce}").strip()
+            else:
+                ctxt = str(ct_op)
         tramite = st.radio("Trámite", list(E.TRAMITES), format_func=lambda k: E.TRAMITES[k]["nombre"],
                            horizontal=True, key=f"exp_tramite_{nonce}")
         es_renta = tramite == "RENTA"
@@ -372,6 +423,7 @@ with tab_con:
                             st.session_state["exp_nonce"] = nonce + 1
                             st.session_state["exp_modo_pendiente"] = "Buscar placa o contrato"
                             st.session_state["exp_q_pendiente"] = placa
+                            st.session_state["exp_q_ct"] = ""
                             st.rerun()
                         except Exception as e:  # noqa: BLE001
                             st.error(f"No se pudo guardar: {e}")

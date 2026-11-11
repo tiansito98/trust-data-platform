@@ -37,7 +37,7 @@ from components import storage as S
 from components.common import execute_write, execute_write_returning, get_engine
 from sqlalchemy import text
 
-API_VERSION = 3
+API_VERSION = 4
 
 TIPOS = {
     "CONTRATO": "Contrato",
@@ -311,6 +311,44 @@ def contratos_de_placa(placa: str) -> pd.DataFrame:
         GROUP BY e.contrato
         ORDER BY COALESCE(e.firmado_at, e.creado_at) DESC
     """, {"p": placa})
+
+
+def placas_flota() -> pd.DataFrame:
+    """Flota activa (ultimo dia de gold_carro_dia): placa, sede, acriss. Para el selector."""
+    return D.load_query("""
+        SELECT placa, sede, acriss FROM silver.gold_carro_dia
+        WHERE fecha = (SELECT MAX(fecha) FROM silver.gold_carro_dia)
+        ORDER BY placa
+    """)
+
+
+def placas_con_documentos() -> pd.DataFrame:
+    """Placas que ya tienen expedientes, con cuantos contratos y el ultimo firmado."""
+    return D.load_query("""
+        SELECT placa, COUNT(*) AS contratos, MAX(COALESCE(firmado_at, creado_at)) AS ultimo
+        FROM operational.doc_contratos GROUP BY placa ORDER BY placa
+    """)
+
+
+def contratos_sistema_placa(placa: str, limite: int = 15) -> pd.DataFrame:
+    """Contratos recientes de la placa segun el sistema (header + tramos), del mas nuevo
+    al mas viejo, para elegir en vez de digitar."""
+    return D.load_query("""
+        WITH c AS (
+            SELECT numero_contrato::bigint AS contrato FROM silver.vw_rentals_full
+            WHERE TRIM(placa) = :p
+            UNION
+            SELECT rv.rntl_mvnr::bigint FROM silver.fact_rental_vehicles rv
+            JOIN silver.dim_vehicles dv ON dv.vhcl_int_num = rv.vhcl_int_num
+            WHERE rv.mndt_code = 409 AND TRIM(dv.vhcl_plate) = :p
+        )
+        SELECT r.numero_contrato::bigint AS contrato, r.fecha_handover_real::date AS entrega,
+               r.fecha_devolucion_real::date AS devolucion, r.sede_handover
+        FROM silver.vw_rentals_full r JOIN c ON c.contrato = r.numero_contrato::bigint
+        WHERE COALESCE(r.revenue_total_usd, 0) > 0
+        ORDER BY r.fecha_handover_real DESC NULLS LAST
+        LIMIT :n
+    """, {"p": placa, "n": int(limite)})
 
 
 def plantillas_del_tramite(tramite: str, idioma: str, pla: pd.DataFrame) -> pd.DataFrame:
