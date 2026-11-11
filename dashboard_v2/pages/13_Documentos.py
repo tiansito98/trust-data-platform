@@ -59,7 +59,7 @@ import importlib  # noqa: E402
 # que si storage esta viejo hay que recargar los tres en orden (storage -> documentos ->
 # expedientes). 2026-11-10: "module 'components.storage' has no attribute 'project_ref'".
 if (getattr(S, "API_VERSION", 0) < 2 or getattr(D, "API_VERSION", 0) < 6
-        or getattr(E, "API_VERSION", 0) < 4):
+        or getattr(E, "API_VERSION", 0) < 5):
     S = importlib.reload(S)
     D = importlib.reload(D)
     E = importlib.reload(E)

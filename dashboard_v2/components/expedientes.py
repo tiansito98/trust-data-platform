@@ -37,7 +37,7 @@ from components import storage as S
 from components.common import execute_write, execute_write_returning, get_engine
 from sqlalchemy import text
 
-API_VERSION = 4
+API_VERSION = 5
 
 TIPOS = {
     "CONTRATO": "Contrato",
@@ -308,6 +308,15 @@ def contratos_de_placa(placa: str) -> pd.DataFrame:
         WHERE e.placa = :p
            OR EXISTS (SELECT 1 FROM operational.documentos x
                       WHERE x.contrato = e.contrato AND NOT x.eliminado AND :p = ANY(x.placas))
+           -- cambio de carro despues de firmar: la foto de placas se tomo al firmar (casi
+           -- siempre vacia, el contrato llega del sistema al dia siguiente), asi que se
+           -- mira tambien el sistema EN VIVO: header + cada tramo (hard rule 16)
+           OR e.contrato IN (
+                SELECT numero_contrato::bigint FROM silver.vw_rentals_full WHERE TRIM(placa) = :p
+                UNION
+                SELECT rv.rntl_mvnr::bigint FROM silver.fact_rental_vehicles rv
+                JOIN silver.dim_vehicles dv ON dv.vhcl_int_num = rv.vhcl_int_num
+                WHERE rv.mndt_code = 409 AND TRIM(dv.vhcl_plate) = :p)
         GROUP BY e.contrato
         ORDER BY COALESCE(e.firmado_at, e.creado_at) DESC
     """, {"p": placa})
