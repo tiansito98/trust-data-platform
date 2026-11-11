@@ -121,6 +121,22 @@ def signed_url(path: str, segundos: int = 300, bucket: str = BUCKET,
     return full
 
 
+def move(origen: str, destino: str, bucket: str = BUCKET) -> None:
+    """Mueve (renombra) un objeto dentro del bucket."""
+    url, _ = _cfg()
+    r = requests.post(f"{url}/storage/v1/object/move",
+                      headers=_headers({"Content-Type": "application/json"}),
+                      json={"bucketId": bucket, "sourceKey": origen, "destinationKey": destino},
+                      timeout=TIMEOUT)
+    _check(r, "mover")
+
+
+def project_ref() -> str:
+    """'pelpz...' de https://pelpz....supabase.co (para armar enlaces al panel de Supabase)."""
+    url, _ = _cfg()
+    return url.split("//", 1)[-1].split(".", 1)[0]
+
+
 def delete(paths: list[str], bucket: str = BUCKET) -> None:
     url, _ = _cfg()
     r = requests.delete(f"{url}/storage/v1/object/{bucket}",

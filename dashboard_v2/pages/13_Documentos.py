@@ -57,7 +57,7 @@ from components import expedientes as E  # noqa: E402
 import importlib  # noqa: E402
 if getattr(D, "API_VERSION", 0) < 5:
     D = importlib.reload(D)
-if getattr(E, "API_VERSION", 0) < 2:
+if getattr(E, "API_VERSION", 0) < 3:
     E = importlib.reload(E)
 
 try:

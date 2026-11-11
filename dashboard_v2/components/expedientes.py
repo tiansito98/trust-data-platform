@@ -23,8 +23,10 @@ quien FIRMO (el cliente) queda en doc_contratos.firmante_nombre y en el addendum
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import uuid
 from datetime import date, datetime
 
 import pandas as pd
@@ -32,9 +34,10 @@ import streamlit as st
 
 from components import documentos as D
 from components import storage as S
-from components.common import execute_write, execute_write_returning
+from components.common import execute_write, execute_write_returning, get_engine
+from sqlalchemy import text
 
-API_VERSION = 2
+API_VERSION = 3
 
 TIPOS = {
     "CONTRATO": "Contrato",
@@ -135,7 +138,37 @@ def ensure_tables() -> bool:
             ON operational.documentos (contrato, tipo_documento)
             WHERE NOT eliminado AND tipo_documento IS NOT NULL AND contrato IS NOT NULL;
     """, {})
+    _crear_vista()
     return True
+
+
+def _crear_vista() -> None:
+    """operational.vw_documentos_contratos: indice para consultar desde el SQL Editor,
+    1 fila por documento, con enlace a su carpeta en el panel de Supabase (Storage).
+    VIEW de verdad (no tabla): siempre al dia."""
+    ref = S.project_ref()
+    execute_write(f"""
+        CREATE OR REPLACE VIEW operational.vw_documentos_contratos AS
+        SELECT e.placa,
+               e.contrato,
+               (COALESCE(e.firmado_at, e.creado_at) AT TIME ZONE 'America/Bogota') AS firmado_el,
+               e.tramite,
+               e.firmante_nombre                     AS cliente,
+               e.creado_por                          AS usuario,
+               d.tipo_documento,
+               d.nombre                              AS archivo,
+               NOT d.eliminado                       AS vigente,
+               (d.subido_at AT TIME ZONE 'America/Bogota') AS cargado_el,
+               d.firmado_por,
+               d.tamano_bytes,
+               d.storage_path,
+               'https://supabase.com/dashboard/project/{ref}/storage/buckets/documentos?path='
+                   || replace(regexp_replace(d.storage_path, '/[^/]*$', ''), '/', chr(37) || '2F') AS link_carpeta,
+               d.documento_id,
+               e.sede_nombre
+        FROM operational.doc_contratos e
+        JOIN operational.documentos d ON d.contrato = e.contrato AND d.tipo_documento IS NOT NULL
+    """, {})
 
 
 # =============================================================================
@@ -321,11 +354,29 @@ def preparar(contrato_pdf: bytes, firma: dict, pos_contrato: dict, valores: dict
     return out
 
 
+def _storage_dir(placa: str, carpeta_nombre: str) -> str:
+    """Misma estructura que el dashboard: contratos/<PLACA>/<AAAA-MM-DD>_<CONTRATO>"""
+    return f"contratos/{placa}/{carpeta_nombre}"
+
+
+def _objeto(nombre: str) -> str:
+    """Nombre del objeto en Storage: el nombre limpio + hora + 4 hex (unico aunque se
+    re-firme el mismo dia o dos personas guarden en el mismo segundo)."""
+    base = nombre[:-4] if nombre.lower().endswith(".pdf") else nombre
+    return f"{base}_{pd.Timestamp.now(tz='America/Bogota'):%H%M%S}_{uuid.uuid4().hex[:4]}.pdf"
+
+
 def guardar(contrato: int, placa: str, preparados: list[dict], usuario: str, tramite: str,
             firmante: str = "", idioma: str | None = None, sede: str | None = None) -> dict:
-    """Guarda el expediente: el contrato SIN firmar (traza) + los firmados, en
-    Contratos/PLACA/AAAA-MM-DD_CONTRATO. Un tipo que ya existia se reemplaza (el viejo
-    queda eliminado). Devuelve {tipo: documento_id}."""
+    """Guarda el expediente de forma ATOMICA (pensado para ~7 personas a la vez):
+      1. sube todos los PDF a Storage (rutas unicas, no chocan entre usuarios);
+      2. registra TODO en UNA transaccion con un candado por contrato
+         (pg_advisory_xact_lock): si dos personas guardan el mismo contrato a la vez,
+         la segunda espera a la primera y luego reemplaza limpio; nunca queda medio
+         expediente ni dos versiones vigentes del mismo tipo;
+      3. si la transaccion falla, borra lo que subio en el paso 1.
+    Contrato SIN firmar (traza) + los firmados, en Contratos/PLACA/AAAA-MM-DD_CONTRATO.
+    Devuelve {tipo: documento_id}."""
     contrato = int(contrato)
     hoy = pd.Timestamp.now(tz="America/Bogota").date()
     exp = expediente(contrato)
@@ -334,44 +385,88 @@ def guardar(contrato: int, placa: str, preparados: list[dict], usuario: str, tra
                          "Corrige la placa desde Validación antes de volver a firmar.")
     carpeta = int(exp["carpeta_id"]) if exp and pd.notna(exp.get("carpeta_id")) else \
         carpeta_contrato(placa, contrato, hoy, usuario)
+    carpeta_nombre = D.load_query("SELECT nombre FROM operational.doc_carpetas WHERE carpeta_id = :c",
+                                  {"c": carpeta}).iloc[0, 0]
     info = D.info_contrato(contrato) or {"contrato": contrato, "placas": [], "sede": sede}
-    execute_write("""
-        INSERT INTO operational.doc_contratos
-            (contrato, placa, sede_nombre, creado_por, tramite, requeridos, firmante_nombre,
-             idioma, carpeta_id, firmado_at)
-        VALUES (:c, :p, :s, :u, :t, :r, :f, :i, :cp, now())
-        ON CONFLICT (contrato) DO UPDATE
-            SET actualizado_por = :u, actualizado_at = now(), firmado_at = now(),
-                tramite = EXCLUDED.tramite, requeridos = EXCLUDED.requeridos,
-                firmante_nombre = EXCLUDED.firmante_nombre, idioma = EXCLUDED.idioma,
-                carpeta_id = COALESCE(operational.doc_contratos.carpeta_id, EXCLUDED.carpeta_id),
-                sede_nombre = COALESCE(EXCLUDED.sede_nombre, operational.doc_contratos.sede_nombre)
-    """, {"c": contrato, "p": placa, "s": info.get("sede") or sede, "u": usuario, "t": tramite,
-          "r": list(TRAMITES[tramite]["requeridos"]), "f": (firmante or "").strip() or None,
-          "i": idioma, "cp": carpeta})
+    sede_f = info.get("sede") or sede
 
-    ids = {}
-    prefijo = f"contratos/{contrato}"
+    # 1. subir todo a Storage
+    filas = []
     for item in preparados:
         tipo = item["tipo"]
-        execute_write("""
-            UPDATE operational.documentos
-            SET eliminado = TRUE, eliminado_por = :u, eliminado_at = now()
-            WHERE contrato = :c AND tipo_documento IN (:t, :t || '_SIN_FIRMA') AND NOT eliminado
-        """, {"c": contrato, "t": tipo, "u": usuario})
-        orig_id = None
-        if tipo == "CONTRATO":   # el contrato tal como lo subio el asesor, sin firma
-            orig_id = D.subir(carpeta, nombre_archivo(contrato, placa, tipo, hoy, firmado=False),
-                              item["original"], "application/pdf", usuario, contrato=info,
-                              tipo_documento="CONTRATO_SIN_FIRMA", path_prefix=prefijo)
-        ids[tipo] = D.subir(carpeta, nombre_archivo(contrato, placa, tipo, hoy, item.get("idioma")),
-                            item["firmado"], "application/pdf", usuario, contrato=info,
-                            firmado_de=orig_id, firma_pagina=item["pagina"] + 1, tipo_documento=tipo,
-                            plantilla_id=item["plantilla_id"], path_prefix=prefijo)
-        if orig_id is None:      # plantillas: firmado aunque no tengan "original" propio
-            execute_write("UPDATE operational.documentos SET firmado_por = :u, firmado_at = now() "
-                          "WHERE documento_id = :id", {"id": ids[tipo], "u": usuario})
-    return ids
+        if tipo == "CONTRATO":
+            filas.append({"tipo": "CONTRATO_SIN_FIRMA", "data": item["original"], "firmado": False,
+                          "nombre": nombre_archivo(contrato, placa, tipo, hoy, firmado=False),
+                          "plantilla_id": None, "pagina": None})
+        filas.append({"tipo": tipo, "data": item["firmado"], "firmado": True,
+                      "nombre": nombre_archivo(contrato, placa, tipo, hoy, item.get("idioma")),
+                      "plantilla_id": item["plantilla_id"], "pagina": item["pagina"] + 1})
+    subidos = []
+    try:
+        for f in filas:
+            f["path"] = f"{_storage_dir(placa, carpeta_nombre)}/{_objeto(f['nombre'])}"
+            S.upload(f["path"], f["data"], "application/pdf")
+            subidos.append(f["path"])
+
+        # 2. una sola transaccion, con candado por contrato
+        ids = {}
+        with get_engine().begin() as conn:
+            conn.execute(text("SET LOCAL search_path TO operational, public"))
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": contrato})
+            actual = conn.execute(text("SELECT placa FROM operational.doc_contratos WHERE contrato = :c"),
+                                  {"c": contrato}).scalar()
+            if actual is not None and actual != placa:
+                raise ValueError(f"Otro usuario acaba de guardar el contrato {contrato} con la placa {actual}.")
+            conn.execute(text("""
+                INSERT INTO operational.doc_contratos
+                    (contrato, placa, sede_nombre, creado_por, tramite, requeridos, firmante_nombre,
+                     idioma, carpeta_id, firmado_at)
+                VALUES (:c, :p, :s, :u, :t, :r, :f, :i, :cp, now())
+                ON CONFLICT (contrato) DO UPDATE
+                    SET actualizado_por = :u, actualizado_at = now(), firmado_at = now(),
+                        tramite = EXCLUDED.tramite, requeridos = EXCLUDED.requeridos,
+                        firmante_nombre = EXCLUDED.firmante_nombre, idioma = EXCLUDED.idioma,
+                        carpeta_id = COALESCE(operational.doc_contratos.carpeta_id, EXCLUDED.carpeta_id),
+                        sede_nombre = COALESCE(EXCLUDED.sede_nombre, operational.doc_contratos.sede_nombre)
+            """), {"c": contrato, "p": placa, "s": sede_f, "u": usuario, "t": tramite,
+                   "r": list(TRAMITES[tramite]["requeridos"]), "f": (firmante or "").strip() or None,
+                   "i": idioma, "cp": carpeta})
+            tipos = sorted({f["tipo"] for f in filas})
+            conn.execute(text("""
+                UPDATE operational.documentos
+                SET eliminado = TRUE, eliminado_por = :u, eliminado_at = now()
+                WHERE contrato = :c AND tipo_documento = ANY(:t) AND NOT eliminado
+            """), {"c": contrato, "t": tipos, "u": usuario})
+            sin_firma_id = None
+            for f in filas:
+                nid = conn.execute(text("""
+                    INSERT INTO operational.documentos
+                        (carpeta_id, nombre, storage_path, mime_type, tamano_bytes, sha256, subido_por,
+                         firmado_de, firmado_por, firmado_at, contrato, placas, sede_nombre,
+                         firma_pagina, tipo_documento, plantilla_id)
+                    VALUES (:cp, :n, :p, 'application/pdf', :t, :h, :u,
+                            :fd, :fp, CASE WHEN :fp IS NULL THEN NULL ELSE now() END,
+                            :c, :pl, :s, :pg, :td, :pi)
+                    RETURNING documento_id
+                """), {"cp": carpeta, "n": f["nombre"], "p": f["path"], "t": len(f["data"]),
+                       "h": hashlib.sha256(f["data"]).hexdigest(), "u": usuario,
+                       "fd": sin_firma_id if f["tipo"] == "CONTRATO" else None,
+                       "fp": usuario if f["firmado"] else None, "c": contrato,
+                       "pl": list(info.get("placas") or []), "s": sede_f, "pg": f["pagina"],
+                       "td": f["tipo"], "pi": f["plantilla_id"]}).scalar()
+                if f["tipo"] == "CONTRATO_SIN_FIRMA":
+                    sin_firma_id = nid
+                else:
+                    ids[f["tipo"]] = nid
+        return ids
+    except Exception:
+        # 3. nada a medias: lo subido en esta corrida se borra
+        if subidos:
+            try:
+                S.delete(subidos)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
 
 
 def eliminar_expediente(contrato: int, usuario: str) -> None:
@@ -396,14 +491,29 @@ def eliminar_expediente(contrato: int, usuario: str) -> None:
 
 
 def corregir_placa(contrato: int, placa_nueva: str, usuario: str) -> None:
-    """Cambia la placa del expediente: mueve su carpeta bajo Contratos/<nueva> y
-    renombra los archivos. Los objetos de Storage no se mueven (su ruta no lleva la placa)."""
+    """Cambia la placa del expediente: mueve su carpeta bajo Contratos/<nueva>, renombra
+    los archivos y MUEVE los objetos de Storage a contratos/<nueva>/... (misma
+    estructura que el dashboard)."""
     exp = expediente(contrato)
     if not exp:
         raise ValueError("Ese contrato no tiene expediente.")
     vieja = exp["placa"]
     raiz = _carpeta(CARPETA_RAIZ, None, usuario)
     nueva_padre = _carpeta(placa_nueva, raiz, usuario)
+    docs = D.load_query("""
+        SELECT documento_id, storage_path FROM operational.documentos
+        WHERE contrato = :c AND tipo_documento IS NOT NULL
+    """, {"c": int(contrato)})
+    pref_v, pref_n = f"contratos/{vieja}/", f"contratos/{placa_nueva}/"
+    movidos = []
+    for r in docs.itertuples():
+        if r.storage_path.startswith(pref_v):
+            nuevo = pref_n + r.storage_path[len(pref_v):]
+            nuevo = nuevo.replace(f"_{vieja}_", f"_{placa_nueva}_")
+            S.move(r.storage_path, nuevo)
+            movidos.append({"id": int(r.documento_id), "p": nuevo})
+    for m in movidos:
+        execute_write("UPDATE operational.documentos SET storage_path = :p WHERE documento_id = :id", m)
     execute_write("""
         UPDATE operational.doc_carpetas SET parent_id = :np WHERE carpeta_id = :cp;
         UPDATE operational.documentos SET nombre = replace(nombre, :sv, :sn)
