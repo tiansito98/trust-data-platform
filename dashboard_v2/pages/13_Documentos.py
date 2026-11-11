@@ -55,9 +55,9 @@ from components import expedientes as E  # noqa: E402
 
 # Streamlit Cloud puede servir modulos viejos tras un push (ver CLAUDE.md): recargarlos.
 import importlib  # noqa: E402
-if getattr(D, "API_VERSION", 0) < 4:
+if getattr(D, "API_VERSION", 0) < 5:
     D = importlib.reload(D)
-if getattr(E, "API_VERSION", 0) < 1:
+if getattr(E, "API_VERSION", 0) < 2:
     E = importlib.reload(E)
 
 try:
@@ -189,7 +189,7 @@ with tab_con:
 
     # ---------------------------------------------------------------- Buscar
     if modo == "Buscar placa o contrato":
-        q = st.text_input("Placa o número de contrato", key="exp_q", placeholder="ej. QQT746 o 9524178852")
+        q = st.text_input("Placa o número de contrato", key="exp_q", placeholder="ej. QQT750 o 9525194370")
         t = E.normalizar_placa(q)
         contrato_sel = None
         if t.isdigit():
@@ -202,27 +202,36 @@ with tab_con:
             if exps.empty:
                 st.info(f"No hay contratos con documentos para la placa {t}.")
             else:
-                section(f"Placa {t}: {len(exps)} contrato(s)")
+                section(f"Placa {t}: {len(exps)} contrato(s), del más reciente al más viejo")
+                n_req = exps["requeridos"].map(lambda r: len(r) if isinstance(r, (list, tuple)) and len(r) else 3)
                 st.dataframe(pd.DataFrame({
+                    "": ["Más reciente"] + [""] * (len(exps) - 1),
+                    "Firmado": exps["firmado_at"].map(_fecha),
                     "Contrato": exps["contrato"].astype(str),
-                    "Placa": exps["placa"],
-                    "Documentos firmados": exps["firmados"].astype(int).astype(str) + " de 3",
-                    "Creado por": exps["creado_por"],
-                    "Creado": exps["creado_at"].map(_fecha),
-                    "Última carga": exps["ultima_carga"].map(_fecha),
+                    "Trámite": exps["tramite"].map(lambda x: E.TRAMITES.get(x, {}).get("nombre", "")),
+                    "Cliente": exps["firmante_nombre"].fillna(""),
+                    "Documentos": exps["firmados"].astype(int).astype(str) + " de " + n_req.astype(str),
+                    "Usuario": exps["creado_por"],
                 }), width="stretch", hide_index=True)
-                contrato_sel = st.selectbox("Contrato", exps["contrato"].astype(int).tolist(), key="exp_sel")
+                op_c = {int(r.contrato): f"{_fecha(r.firmado_at)[:10]} · {int(r.contrato)}"
+                        for r in exps.itertuples()}
+                contrato_sel = st.selectbox("Contrato", list(op_c), format_func=op_c.get, key="exp_sel")
 
         if contrato_sel:
             exp = E.expediente(contrato_sel)
             docs = E.documentos_contrato(contrato_sel)
+            tram = E.TRAMITES.get(exp.get("tramite"), E.TRAMITES["RENTA"])
+            req = list(exp["requeridos"]) if isinstance(exp.get("requeridos"), (list, tuple)) \
+                and len(exp["requeridos"]) else tram["requeridos"]
             section(f"Contrato {contrato_sel} · placa {exp['placa']}")
-            firmados = docs[docs["tipo_documento"].isin(E.TIPOS_REQUERIDOS)]
-            faltan = [E.TIPOS[x] for x in E.TIPOS_REQUERIDOS if x not in set(firmados["tipo_documento"])]
+            st.caption(f"{tram['nombre']} · cliente: **{exp.get('firmante_nombre') or '-'}** · firmado el "
+                       f"{_fecha(exp.get('firmado_at') or exp['creado_at'])} · usuario {exp['creado_por']}")
+            faltan = [E.TIPOS[x] for x in req if x not in set(docs["tipo_documento"])]
             if faltan:
                 st.warning("Faltan: " + ", ".join(faltan))
             st.dataframe(pd.DataFrame({
-                "Documento": docs["tipo_documento"].map(lambda x: E.TIPOS.get(x, "Contrato sin firma (original)")),
+                "Documento": [E.etiqueta(tp, i if isinstance(i, str) else None)
+                              for tp, i in zip(docs["tipo_documento"], docs["idioma"])],
                 "Archivo": docs["nombre"],
                 "Cargado": docs["subido_at"].map(_fecha),
                 "Usuario": docs["subido_por"],
@@ -233,20 +242,46 @@ with tab_con:
                 op = dict(zip(docs["documento_id"].astype(int), docs["nombre"]))
                 did = st.selectbox("Ver documento", list(op), format_func=op.get, key=f"exp_ver_{contrato_sel}")
                 visor(docs[docs["documento_id"] == did].iloc[0], f"exp{did}")
+            viejos = E.documentos_contrato(contrato_sel, vigentes=False)
+            if not viejos.empty:
+                with st.expander(f"Versiones anteriores ({len(viejos)})"):
+                    st.dataframe(pd.DataFrame({
+                        "Archivo": viejos["nombre"], "Cargado": viejos["subido_at"].map(_fecha),
+                        "Reemplazado": viejos["eliminado_at"].map(_fecha),
+                        "Por": viejos["eliminado_por"].fillna("")}), width="stretch", hide_index=True)
+                    opv = dict(zip(viejos["documento_id"].astype(int), viejos["nombre"]))
+                    dv = st.selectbox("Ver versión anterior", list(opv), format_func=opv.get,
+                                      key=f"exp_old_{contrato_sel}")
+                    visor(viejos[viejos["documento_id"] == dv].iloc[0], f"old{dv}")
+            with st.expander("Eliminar este expediente"):
+                st.caption("Para pruebas o errores. Los archivos quedan guardados en el historial, pero el "
+                           "contrato vuelve a quedar sin documentos.")
+                ok_del = st.checkbox(f"Sí, eliminar el expediente del contrato {contrato_sel}",
+                                     key=f"exp_del_ok_{contrato_sel}")
+                if st.button("Eliminar expediente", disabled=not ok_del, key=f"exp_del_{contrato_sel}"):
+                    E.eliminar_expediente(contrato_sel, USUARIO)
+                    st.session_state["exp_q_pendiente"] = exp["placa"]
+                    st.rerun()
 
     # ---------------------------------------------------------------- Nuevo
     else:
         nonce = st.session_state.setdefault("exp_nonce", 0)
-        pla = E.plantillas_activas()
-        faltan_pl = [E.TIPOS[x] for x in E.TIPOS_PLANTILLA if x not in set(pla["tipo"])]
-        if faltan_pl:
-            st.warning(f"Falta cargar la plantilla de: **{', '.join(faltan_pl)}** (pestaña *Plantillas*). "
-                       "Se puede firmar igual, pero el contrato quedará *incompleto* en Validación.")
+        pla_all = E.plantillas_activas()
 
-        section("1. Placa y contrato")
+        section("1. Placa, contrato y trámite")
         c1, c2 = st.columns(2)
         placa = E.normalizar_placa(c1.text_input("Placa", key=f"exp_placa_{nonce}", placeholder="ABC123"))
         ctxt = c2.text_input("Número de contrato (10 dígitos)", key=f"exp_ct_{nonce}").strip()
+        tramite = st.radio("Trámite", list(E.TRAMITES), format_func=lambda k: E.TRAMITES[k]["nombre"],
+                           horizontal=True, key=f"exp_tramite_{nonce}")
+        es_renta = tramite == "RENTA"
+        firmante, idioma = "", None
+        if es_renta:
+            d1, d2 = st.columns([2, 1])
+            firmante = d1.text_input("Nombre del cliente (como queda en el addendum)",
+                                     key=f"exp_nombre_{nonce}").strip().upper()
+            idioma = d2.radio("Idioma de la información de renta", list(E.IDIOMAS),
+                              format_func=E.IDIOMAS.get, horizontal=True, key=f"exp_idioma_{nonce}")
         ok_datos = True
         if placa and not E.placa_valida(placa):
             c1.error("La placa debe ser 3 letras y 3 números (ej. ABC123).")
@@ -254,8 +289,10 @@ with tab_con:
         if ctxt and not E.contrato_valido(ctxt):
             c2.error("El contrato son 10 dígitos.")
             ok_datos = False
-        ok_datos = ok_datos and bool(placa) and bool(ctxt)
-        if ok_datos:
+        ok_datos = ok_datos and bool(placa) and bool(ctxt) and (bool(firmante) or not es_renta)
+        if placa and ctxt and es_renta and not firmante:
+            st.info("Escribe el nombre del cliente.")
+        if placa and ctxt and E.placa_valida(placa) and E.contrato_valido(ctxt):
             info = D.info_contrato(int(ctxt))
             if info is None:
                 st.caption("El contrato todavía no está en el sistema (llega con el pipeline de la "
@@ -272,7 +309,15 @@ with tab_con:
                     ok_datos = False
                 else:
                     st.warning("Este contrato ya tiene documentos: al guardar se reemplazan por los nuevos "
-                               "(los anteriores quedan en el historial).")
+                               "(los anteriores quedan como *versiones anteriores*).")
+
+        pla = E.plantillas_del_tramite(tramite, idioma or "ES", pla_all)
+        if es_renta:
+            lleva = ["Contrato"] + [E.etiqueta(p.tipo, p.idioma if isinstance(p.idioma, str) else None)
+                                    for p in pla.itertuples()]
+            st.caption("Se firman: **" + "**, **".join(lleva) + "**")
+            if len(pla) < len(E.TIPOS_PLANTILLA):
+                st.warning("Falta cargar alguna plantilla (pestaña *Plantillas*): el contrato quedará incompleto.")
 
         section("2. Sube el contrato (PDF)")
         up = st.file_uploader("Contrato", type=["pdf"], key=f"exp_file_{nonce}")
@@ -291,17 +336,19 @@ with tab_con:
 
             section("4. Dónde va la firma en el contrato")
             pg, x, y, an = posicion(f"exp_pos_{nonce}", n_pag)
-            if not pla.empty:
-                st.caption("En el adendum y la información general la firma va donde lo define la plantilla.")
+            if es_renta:
+                st.caption("En el addendum y la información de renta la firma (y el nombre) van donde lo "
+                           "define la plantilla.")
 
             if not firma:
                 st.info("Dibuja la firma y presiona **Usar esta firma** para ver cómo quedan los documentos.")
             else:
-                section("5. Vista previa")
-                leyenda = f"Firmado el {pd.Timestamp.now(tz='America/Bogota'):%d/%m/%Y %H:%M}"
+                section("5. Vista previa: así quedan los documentos")
+                ahora = pd.Timestamp.now(tz="America/Bogota")
+                valores = {"nombre": firmante, "contrato": ctxt, "fecha": f"{ahora:%d/%m/%Y}"}
                 try:
                     prep = E.preparar(contrato_pdf, firma, {"pagina": pg, "x": x, "y": y, "ancho": an},
-                                      leyenda, pla, _bytes)
+                                      valores, f"Firmado el {ahora:%d/%m/%Y %H:%M}", pla, _bytes)
                 except Exception as e:  # noqa: BLE001
                     st.error(f"No se pudo estampar la firma: {e}")
                     prep = []
@@ -309,20 +356,22 @@ with tab_con:
                     cols = st.columns(len(prep))
                     for col, item in zip(cols, prep):
                         with col:
-                            st.markdown(f"**{E.TIPOS[item['tipo']]}** · pág. {item['pagina'] + 1}")
+                            st.markdown(f"**{E.etiqueta(item['tipo'], item['idioma'])}** · "
+                                        f"pág. {item['pagina'] + 1}")
                             st.image(_png_bytes(item["firmado"], item["pagina"]), width="stretch")
-                            st.download_button("Descargar", item["firmado"],
-                                               file_name=E.nombre_archivo(int(ctxt), placa, item["tipo"]),
-                                               mime="application/pdf", key=f"exp_dl_{item['tipo']}_{nonce}",
-                                               width="stretch")
+                            st.download_button(
+                                "Descargar", item["firmado"],
+                                file_name=E.nombre_archivo(int(ctxt), placa, item["tipo"], ahora.date(),
+                                                           item["idioma"]),
+                                mime="application/pdf", key=f"exp_dl_{item['tipo']}_{nonce}", width="stretch")
                     if st.button("Guardar los documentos firmados", type="primary", key=f"exp_save_{nonce}"):
                         try:
                             with st.spinner("Guardando..."):
-                                E.guardar(int(ctxt), placa, prep, USUARIO)
+                                E.guardar(int(ctxt), placa, prep, USUARIO, tramite, firmante, idioma)
                             D.limpiar_firma(f"exp_firma_{nonce}")
                             st.session_state["exp_nonce"] = nonce + 1
                             st.session_state["exp_modo_pendiente"] = "Buscar placa o contrato"
-                            st.session_state["exp_q_pendiente"] = str(int(ctxt))
+                            st.session_state["exp_q_pendiente"] = placa
                             st.rerun()
                         except Exception as e:  # noqa: BLE001
                             st.error(f"No se pudo guardar: {e}")
@@ -331,7 +380,7 @@ with tab_con:
 # VALIDACION
 # =============================================================================
 with tab_val:
-    st.caption(f"Rango del filtro lateral ({filtros.fecha_desde} → {filtros.fecha_hasta}). Expedientes creados "
+    st.caption(f"Rango del filtro lateral ({filtros.fecha_desde} → {filtros.fecha_hasta}). Expedientes firmados "
                f"en el rango + contratos del sistema entregados en el rango sin documentos (desde "
                f"{E.FECHA_INICIO:%d/%m/%Y}, cuando arranca el uso).")
     try:
@@ -360,9 +409,11 @@ with tab_val:
             "Placa(s) en el sistema": t["placas_sistema"],
             "Sede": t["sede"].fillna(""),
             "Entrega": t["entrega"].map(lambda v: "" if v is None or pd.isna(v) else str(v)),
+            "Trámite": t["tramite"],
+            "Cliente": t["firmante"],
             "Faltan": t["faltan"],
-            "Creado por": t["creado_por"],
-            "Creado": t["creado_at"].map(_fecha),
+            "Usuario": t["creado_por"],
+            "Firmado": t["creado_at"].map(_fecha),
         })
         st.dataframe(vista, width="stretch", hide_index=True)
         xlsx_download_button(vista, file_name=f"validacion_contratos_{dt.date.today()}",
@@ -385,44 +436,71 @@ with tab_val:
 # PLANTILLAS
 # =============================================================================
 with tab_pla:
-    st.caption("Documentos iguales para TODOS los contratos. Cada carga es una versión nueva; los "
+    st.caption("Documentos iguales para TODOS los contratos de renta. Cada carga es una versión nueva; los "
                "contratos ya firmados conservan la versión con la que se firmaron.")
     pla = E.plantillas_activas()
-    for tipo in E.TIPOS_PLANTILLA:
-        section(E.TIPOS[tipo])
-        act = pla[pla["tipo"] == tipo]
-        if act.empty:
-            st.info("Todavía no hay plantilla cargada.")
-        else:
-            a = act.iloc[0]
-            data = _bytes(a["storage_path"])
-            n = len(D.info_pdf(data))
-            st.caption(f"Versión **{int(a['version'])}** · {a['nombre']} · {n} página(s) · cargada el "
-                       f"{_fecha(a['subido_at'])} por {a['subido_por']}")
-            with st.expander("Ajustar dónde va la firma"):
-                pg, x, y, an = posicion(f"pla_{tipo}", n,
-                                        (a["firma_pagina"] if pd.notna(a["firma_pagina"]) else None,
-                                         a["firma_x"], a["firma_y"], a["firma_ancho"]))
-                st.image(_png_bytes(D.estampar_firma(data, FIRMA_EJEMPLO, pg, x, y, an, "Firmado el dd/mm/aaaa hh:mm"),
-                                    pg, 700), caption="Vista previa con una firma de ejemplo", width=520)
-                if st.button("Guardar posición", key=f"pla_pos_btn_{tipo}"):
-                    E.actualizar_posicion(int(a["plantilla_id"]), pg + 1, x, y, an)
-                    st.success("Posición guardada.")
-                    st.rerun()
-        with st.expander(f"Cargar {'nueva versión' if not act.empty else 'plantilla'} de {E.TIPOS[tipo]}"):
-            f = st.file_uploader("PDF", type=["pdf"], key=f"pla_up_{tipo}")
-            if f is not None and st.button("Cargar", key=f"pla_up_btn_{tipo}"):
-                try:
-                    E.subir_plantilla(tipo, f.name, f.getvalue(), USUARIO, None, 64, 8, 28)
-                    st.success("Plantilla cargada. Ajusta dónde va la firma arriba.")
-                    st.rerun()
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"No se pudo cargar: {e}")
+    VALORES_EJEMPLO = {"nombre": "NOMBRE DEL CLIENTE", "contrato": "9520000000", "fecha": "dd/mm/aaaa"}
+    COLS_CAMPOS = ["tipo", "valor", "pagina", "x", "y", "ancho", "alto", "size", "leyenda"]
+    for p in pla.itertuples():
+        idi = p.idioma if isinstance(p.idioma, str) else None
+        section(E.etiqueta(p.tipo, idi))
+        data = _bytes(p.storage_path)
+        n = len(D.info_pdf(data))
+        st.caption(f"Versión **{int(p.version)}** · {p.nombre} · {n} página(s) · cargada el "
+                   f"{_fecha(p.subido_at)} por {p.subido_por}")
+        campos = E.campos_para_estampar(p.campos, n, VALORES_EJEMPLO, "Firmado el dd/mm/aaaa hh:mm")
+        pgs = sorted({c["pagina"] for c in campos}) or [n - 1]
+        cols = st.columns(len(pgs))
+        for col, pg in zip(cols, pgs):
+            col.image(_png_bytes(D.estampar_campos(data, FIRMA_EJEMPLO, campos), pg, 700),
+                      caption=f"Página {pg + 1} con datos de ejemplo", width="stretch")
+        with st.expander("Ajustar los campos (posición en % de la hoja; y se mide desde abajo)"):
+            st.caption("tipo = firma | texto · valor (textos) = nombre | contrato | fecha · página desde 1 · "
+                       "ancho/alto de la firma en % · size = tamaño de letra · leyenda = 'Firmado el ...' bajo la firma.")
+            df_c = pd.DataFrame([{k: c.get(k) for k in COLS_CAMPOS} for c in p.campos], columns=COLS_CAMPOS)
+            ed = st.data_editor(df_c, num_rows="dynamic", width="stretch", key=f"pla_ed_{p.plantilla_id}",
+                                column_config={
+                                    "tipo": st.column_config.SelectboxColumn(options=["firma", "texto"], required=True),
+                                    "valor": st.column_config.SelectboxColumn(options=["nombre", "contrato", "fecha"]),
+                                    "leyenda": st.column_config.CheckboxColumn()})
+            if st.button("Guardar campos", key=f"pla_ed_btn_{p.plantilla_id}"):
+                nuevos = []
+                for r in ed.to_dict("records"):
+                    if r.get("tipo") not in ("firma", "texto"):
+                        continue
+                    c = {"tipo": r["tipo"], "pagina": int(r["pagina"] or n), "x": float(r["x"] or 0),
+                         "y": float(r["y"] or 0)}
+                    if r["tipo"] == "firma":
+                        c.update({"ancho": float(r["ancho"] or 20), "alto": float(r["alto"]) if pd.notna(r["alto"]) else None,
+                                  "leyenda": bool(r["leyenda"]) if pd.notna(r["leyenda"]) else False})
+                    else:
+                        c.update({"valor": r.get("valor") or "nombre",
+                                  "size": float(r["size"]) if pd.notna(r["size"]) else 9})
+                    nuevos.append(c)
+                E.actualizar_campos(int(p.plantilla_id), nuevos)
+                st.success("Campos guardados.")
+                st.rerun()
+
+    section("Cargar una plantilla nueva o una versión nueva")
+    u1, u2 = st.columns(2)
+    tipo_n = u1.selectbox("Documento", list(E.TIPOS_PLANTILLA), format_func=E.TIPOS.get, key="pla_new_tipo")
+    idi_n = u2.selectbox("Idioma", [None, "ES", "EN"],
+                         format_func=lambda i: "Único (sin idioma)" if i is None else E.IDIOMAS[i], key="pla_new_idi")
+    f = st.file_uploader("PDF (si lo tienes en Word: Archivo → Guardar como → PDF)", type=["pdf"], key="pla_new_up")
+    if f is not None and st.button("Cargar", key="pla_new_btn"):
+        try:
+            E.subir_plantilla(tipo_n, idi_n, f.name, f.getvalue(), USUARIO)
+            st.success("Plantilla cargada. Si es nueva, revisa y ajusta los campos arriba.")
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"No se pudo cargar: {e}")
     hist = E.historial_plantillas()
     if not hist.empty:
         with st.expander("Historial de versiones"):
             st.dataframe(pd.DataFrame({
-                "Tipo": hist["tipo"].map(E.TIPOS), "Versión": hist["version"], "Archivo": hist["nombre"],
+                "Documento": [E.etiqueta(tp, i if isinstance(i, str) else None)
+                              for tp, i in zip(hist["tipo"], hist["idioma"])],
+                "Versión": hist["version"], "Archivo": hist["nombre"],
                 "Activa": hist["activa"].map({True: "Sí", False: ""}), "Cargada por": hist["subido_por"],
                 "Cargada": hist["subido_at"].map(_fecha)}), width="stretch", hide_index=True)
 

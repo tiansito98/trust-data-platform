@@ -30,7 +30,7 @@ from sqlalchemy import text
 from components.common import execute_write, execute_write_returning, get_engine, _clean_params
 from components import storage as S
 
-API_VERSION = 4
+API_VERSION = 5
 
 
 def load_query(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -377,76 +377,108 @@ def info_pdf(data: bytes) -> list[tuple[float, float]]:
     return out
 
 
-def estampar_firma(data: bytes, firma: dict, pagina: int, x_pct: float, y_pct: float,
-                   ancho_pct: float, leyenda: str = "") -> bytes:
-    """Dibuja los trazos sobre la `pagina` (0-based). x_pct/y_pct = esquina inferior
-    izquierda de la firma en % de la pagina (y medido desde ABAJO); ancho_pct = ancho
-    de la firma en % del ancho de la pagina. `leyenda` va debajo, en letra pequena."""
-    from pypdf import PdfReader, PdfWriter, Transformation
-    from pypdf.generic import (DecodedStreamObject, DictionaryObject, NameObject)
-
-    reader = PdfReader(io.BytesIO(data))
-    writer = PdfWriter(clone_from=reader)
-    page = writer.pages[pagina]
-    rot = int(page.get("/Rotate", 0) or 0) % 360
-    mb = page.mediabox
-    W, H = float(mb.width), float(mb.height)
-    vw, vh = (H, W) if rot % 180 else (W, H)      # tamano como se VE la pagina
-
+def _ops_firma(firma: dict, vw: float, vh: float, x_pct: float, y_pct: float,
+               ancho_pct: float, alto_pct: float | None, leyenda: str) -> list[bytes]:
     pts = [p for s in firma["trazos"] for p in s]
     minx, maxx = min(p[0] for p in pts), max(p[0] for p in pts)
     miny, maxy = min(p[1] for p in pts), max(p[1] for p in pts)
     bw, bh = max(maxx - minx, 1.0), max(maxy - miny, 1.0)
-    ancho = vw * ancho_pct / 100.0
-    esc = ancho / bw
+    esc = vw * ancho_pct / 100.0 / bw
+    if alto_pct:                       # tope de alto: que no se monte sobre el parrafo de arriba
+        esc = min(esc, vh * alto_pct / 100.0 / bh)
     x0, y0 = vw * x_pct / 100.0, vh * y_pct / 100.0
     lw = max(0.6, min(2.0, 2.2 * esc))
-
     ops = [b"q", b"0.043 0.165 0.435 RG", f"{lw:.2f} w 1 J 1 j".encode()]
     for s in firma["trazos"]:
-        seg = []
         for i, (x, y) in enumerate(s):
             px = x0 + (x - minx) * esc
             py = y0 + (maxy - y) * esc            # canvas: y hacia abajo; PDF: hacia arriba
-            seg.append(f"{px:.2f} {py:.2f} {'m' if i == 0 else 'l'}".encode())
-        ops += seg + [b"S"]
+            ops.append(f"{px:.2f} {py:.2f} {'m' if i == 0 else 'l'}".encode())
+        ops.append(b"S")
     ops.append(b"Q")
     if leyenda:
         ops += [b"BT /FTrustF 7 Tf 0.25 0.25 0.25 rg",
                 f"{x0:.2f} {max(y0 - 9, 2):.2f} Td".encode(),
                 b"(" + _pdf_text(leyenda) + b") Tj ET"]
+    return ops
 
-    # La hoja de la firma se arma en coordenadas "como se ve" y se rota para calzar
-    # con el /Rotate de la pagina destino.
-    w2 = PdfWriter()
-    ov = w2.add_blank_page(width=vw, height=vh)
-    stream = DecodedStreamObject()
-    stream.set_data(b"\n".join(ops))
-    ov[NameObject("/Contents")] = w2._add_object(stream)
-    font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
-                             NameObject("/Subtype"): NameObject("/Type1"),
-                             NameObject("/BaseFont"): NameObject("/Helvetica"),
-                             NameObject("/Encoding"): NameObject("/WinAnsiEncoding")})
-    ov[NameObject("/Resources")] = DictionaryObject(
-        {NameObject("/Font"): DictionaryObject({NameObject("/FTrustF"): font})})
-    buf = io.BytesIO()
-    w2.write(buf)
-    ov_page = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
 
-    ox, oy = float(mb.left), float(mb.bottom)
-    if rot == 0:
-        t = Transformation().translate(ox, oy)
-    elif rot == 90:      # se ve girada 90 horario: (x,y)visto -> (y, ... )
-        t = Transformation().rotate(90).translate(ox + W, oy)
-    elif rot == 180:
-        t = Transformation().rotate(180).translate(ox + W, oy + H)
-    else:                # 270
-        t = Transformation().rotate(270).translate(ox, oy + H)
-    page.merge_transformed_page(ov_page, t)
+def _ops_texto(texto: str, vw: float, vh: float, x_pct: float, y_pct: float, size: float) -> list[bytes]:
+    return [b"BT", f"/FTrustF {size:.1f} Tf 0.04 0.09 0.27 rg".encode(),
+            f"{vw * x_pct / 100.0:.2f} {vh * y_pct / 100.0:.2f} Td".encode(),
+            b"(" + _pdf_text(texto) + b") Tj ET"]
+
+
+def estampar_campos(data: bytes, firma: dict | None, campos: list[dict]) -> bytes:
+    """Estampa varias cosas en un PDF en una sola pasada. Cada campo:
+      {"tipo": "firma", "pagina": 0-based, "x": %, "y": %, "ancho": %, "alto": % (opcional),
+       "leyenda": "Firmado el ..." (opcional)}
+      {"tipo": "texto", "pagina": 0-based, "x": %, "y": %, "size": pt, "texto": "..."}
+    x/y = esquina inferior izquierda en % de la pagina COMO SE VE (y desde abajo).
+    Firma vectorial (nitida, transparente); respeta /Rotate."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(data)))
+    por_pagina: dict[int, list[dict]] = {}
+    for c in campos:
+        if c["tipo"] == "firma" and not firma:
+            continue
+        if c["tipo"] == "texto" and not str(c.get("texto") or "").strip():
+            continue
+        pg = min(max(int(c["pagina"]), 0), len(writer.pages) - 1)
+        por_pagina.setdefault(pg, []).append(c)
+
+    for pg, lista in por_pagina.items():
+        page = writer.pages[pg]
+        rot = int(page.get("/Rotate", 0) or 0) % 360
+        mb = page.mediabox
+        W, H = float(mb.width), float(mb.height)
+        vw, vh = (H, W) if rot % 180 else (W, H)      # tamano como se VE la pagina
+        ops: list[bytes] = []
+        for c in lista:
+            if c["tipo"] == "firma":
+                ops += _ops_firma(firma, vw, vh, float(c["x"]), float(c["y"]), float(c["ancho"]),
+                                  float(c["alto"]) if c.get("alto") else None, c.get("leyenda") or "")
+            else:
+                ops += _ops_texto(str(c["texto"]), vw, vh, float(c["x"]), float(c["y"]),
+                                  float(c.get("size") or 9))
+        # la hoja se arma "como se ve" y se rota para calzar con el /Rotate de la pagina
+        w2 = PdfWriter()
+        ov = w2.add_blank_page(width=vw, height=vh)
+        stream = DecodedStreamObject()
+        stream.set_data(b"\n".join(ops))
+        ov[NameObject("/Contents")] = w2._add_object(stream)
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                                 NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica"),
+                                 NameObject("/Encoding"): NameObject("/WinAnsiEncoding")})
+        ov[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/FTrustF"): font})})
+        buf = io.BytesIO()
+        w2.write(buf)
+        ov_page = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+        ox, oy = float(mb.left), float(mb.bottom)
+        if rot == 0:
+            t = Transformation().translate(ox, oy)
+        elif rot == 90:
+            t = Transformation().rotate(90).translate(ox + W, oy)
+        elif rot == 180:
+            t = Transformation().rotate(180).translate(ox + W, oy + H)
+        else:  # 270
+            t = Transformation().rotate(270).translate(ox, oy + H)
+        page.merge_transformed_page(ov_page, t)
 
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+def estampar_firma(data: bytes, firma: dict, pagina: int, x_pct: float, y_pct: float,
+                   ancho_pct: float, leyenda: str = "") -> bytes:
+    """Una sola firma (compatibilidad). Ver estampar_campos."""
+    return estampar_campos(data, firma, [{"tipo": "firma", "pagina": pagina, "x": x_pct, "y": y_pct,
+                                          "ancho": ancho_pct, "leyenda": leyenda}])
 
 
 def n_paginas(data: bytes) -> int:
