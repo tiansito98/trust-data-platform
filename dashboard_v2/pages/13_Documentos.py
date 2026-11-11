@@ -55,9 +55,13 @@ from components import expedientes as E  # noqa: E402
 
 # Streamlit Cloud puede servir modulos viejos tras un push (ver CLAUDE.md): recargarlos.
 import importlib  # noqa: E402
-if getattr(D, "API_VERSION", 0) < 6:
+# Recarga EN CADENA: documentos y expedientes guardan una referencia al modulo storage, asi
+# que si storage esta viejo hay que recargar los tres en orden (storage -> documentos ->
+# expedientes). 2026-11-10: "module 'components.storage' has no attribute 'project_ref'".
+if (getattr(S, "API_VERSION", 0) < 2 or getattr(D, "API_VERSION", 0) < 6
+        or getattr(E, "API_VERSION", 0) < 4):
+    S = importlib.reload(S)
     D = importlib.reload(D)
-if getattr(E, "API_VERSION", 0) < 4:
     E = importlib.reload(E)
 
 try:

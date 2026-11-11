@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from scripts.get_secret import get_secret  # noqa: E402
 
+API_VERSION = 2   # subir si cambia lo que usan documentos/expedientes (ver CLAUDE.md, gotcha de deploy)
 BUCKET = "documentos"
 TIMEOUT = 60
 
