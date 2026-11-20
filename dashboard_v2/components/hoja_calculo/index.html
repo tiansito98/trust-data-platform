@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<!--
+  Hoja de calculo dentro del dashboard (pagina 13 Documentos).
+  Motor: o-spreadsheet (el mismo de las hojas de Odoo Documents), LGPL-3.0,
+  https://github.com/odoo/o-spreadsheet. Traducciones (es.json): Odoo, LGPL-3.0.
+  Protocolo de componentes de Streamlit hecho a mano (sin bundler):
+    entra  streamlit:render {args}
+    sale   streamlit:setComponentValue {value}  ->  {tipo: "guardar", seq, data}
+-->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@odoo/o-spreadsheet@19.0.57/dist/o_spreadsheet.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; }
+  #app { height: 100vh; }
+  #msg { font: 14px sans-serif; padding: 16px; color: #555; }
+</style>
+</head>
+<body>
+<div id="msg">Cargando la hoja...</div>
+<div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/@odoo/owl@2.8.2/dist/owl.iife.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@odoo/o-spreadsheet@19.0.57/dist/o_spreadsheet.iife.js"></script>
+<script>
+const OSP = "https://cdn.jsdelivr.net/npm/@odoo/o-spreadsheet@19.0.57/dist/o_spreadsheet.xml";
+
+// Colombia: punto de miles, coma decimal, ; entre argumentos (como Odoo en espanol)
+const LOCALE_CO = {
+  name: "Español (Colombia)", code: "es_CO", thousandsSeparator: ".", decimalSeparator: ",",
+  weekStart: 1, dateFormat: "dd/mm/yyyy", timeFormat: "hh:mm:ss", formulaArgSeparator: ";",
+};
+
+// ---------------------------------------------------------------- Streamlit
+function enviar(type, extra) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
+}
+function setValor(v) { enviar("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+
+let montado = false, model = null, seq = 0, pendiente = null, ultimoEnvio = 0;
+
+window.addEventListener("message", (ev) => {
+  const d = ev.data || {};
+  if (d.type !== "streamlit:render" || montado) return;   // solo el primer render monta
+  montado = true;
+  enviar("streamlit:setFrameHeight", { height: d.args.alto || 720 });
+  iniciar(d.args).catch((e) => {
+    document.getElementById("msg").textContent = "No se pudo abrir la hoja: " + e;
+    console.error(e);
+  });
+});
+enviar("streamlit:componentReady", { apiVersion: 1 });
+
+// ---------------------------------------------------------------- Guardado
+// Cada cambio programa un guardado 1,5 s despues del ultimo; al salir de la
+// pestana o perder el foco se guarda de una.
+function programar() {
+  if (pendiente) clearTimeout(pendiente);
+  pendiente = setTimeout(guardarYa, 1500);
+}
+function guardarYa() {
+  if (pendiente) { clearTimeout(pendiente); pendiente = null; }
+  if (!model) return;
+  seq += 1;
+  setValor({ tipo: "guardar", seq: seq, data: model.exportData() });
+  ultimoEnvio = Date.now();
+}
+
+async function descargarXlsx(nombre) {
+  const doc = await model.exportXLSX();
+  const zip = new JSZip();
+  for (const f of doc.files) {
+    if (f.imageSrc) {
+      zip.file(f.path, await (await fetch(f.imageSrc)).blob());
+    } else {
+      zip.file(f.path, f.content.replaceAll(' xmlns=""', ""));
+    }
+  }
+  const blob = await zip.generateAsync({ type: "blob" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (nombre || "hoja") + ".xlsx";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// ---------------------------------------------------------------- Arranque
+async function iniciar(args) {
+  // 1) traducciones (antes de crear nada: el motor traduce constantes al cargar)
+  let tr = {};
+  try { tr = await (await fetch("./es.json")).json(); } catch (e) { console.warn("sin traducciones", e); }
+  const t = (s) => (tr[s] !== undefined && tr[s] !== "") ? tr[s] : s;
+  o_spreadsheet.setTranslationMethod(t, () => true);
+
+  // 2) datos: hoja nativa (JSON) o un xlsx a convertir ({archivo: texto})
+  let data = args.data || {};
+  const desdeXlsx = !!args.xlsx;
+  if (desdeXlsx) data = args.xlsx;
+
+  const { Component, xml } = owl;
+  const { Spreadsheet, Model } = o_spreadsheet;
+  const editable = !args.solo_lectura;
+
+  const { topbarMenuRegistry } = o_spreadsheet.registries;
+  topbarMenuRegistry.addChild("trust_xlsx", ["file"], {
+    name: "Descargar como Excel (.xlsx)", sequence: 5,
+    execute: () => descargarXlsx(args.nombre),
+    icon: "o-spreadsheet-Icon.EXPORT_XLSX",
+  });
+
+  model = new Model(data, {
+    mode: editable ? "normal" : "readonly",
+    external: { loadLocales: async () => [LOCALE_CO, ...o_spreadsheet.constants.DEFAULT_LOCALES] },
+  });
+  // locale de Colombia por defecto en hojas nuevas o importadas
+  if (editable && (desdeXlsx || !args.data || !(args.data.settings && args.data.settings.locale))) {
+    model.dispatch("UPDATE_LOCALE", { locale: LOCALE_CO });
+  }
+  window.model = model;   // para pruebas
+
+  if (editable) {
+    // cambio de DATOS (no de seleccion/scroll) = comando "core"; deshacer/rehacer tambien
+    const core = o_spreadsheet.coreTypes;
+    model.on("command-dispatched", null, (cmd) => {
+      if (core.has(cmd.type) || cmd.type === "UNDO" || cmd.type === "REDO") programar();
+    });
+    window.addEventListener("blur", () => { if (pendiente) guardarYa(); });
+    document.addEventListener("visibilitychange", () => { if (pendiente) guardarYa(); });
+    window.addEventListener("beforeunload", () => { if (pendiente) guardarYa(); });
+  }
+
+  class Raiz extends Component {
+    static template = xml`<Spreadsheet model="model" notifyUser="notify"/>`;
+    static components = { Spreadsheet };
+    static props = {};
+    setup() {
+      this.model = model;
+      this.notify = (n) => console.log("aviso:", n.text || n);
+    }
+  }
+  const templates = await (await fetch(OSP)).text();
+  const app = new owl.App(Raiz, {
+    templates, translateFn: t,
+    translatableAttributes: ["label", "title", "placeholder", "alt", "data-tooltip"],
+  });
+  document.getElementById("msg").remove();
+  await app.mount(document.getElementById("app"));
+  window.listo = true;
+
+  // un xlsx recien convertido se guarda de una (queda como hoja nativa)
+  if (editable && desdeXlsx) guardarYa();
+}
+</script>
+</body>
+</html>

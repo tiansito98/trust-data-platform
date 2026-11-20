@@ -85,3 +85,6 @@ docs/private/*
 # file is ever dropped loose into docs/ again.
 docs/auditoria_comisiones_*.xlsx
 scripts/audit/
+
+# Ejemplos y dumps de Odoo (datos reales: placas, montos). Nunca al repo publico.
+docs/odoo/

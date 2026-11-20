@@ -11,7 +11,8 @@ Pestanas:
     comprobante o factura / pendiente / al dia, y contratos del sistema sin expediente.
   - Plantillas: adendum e informacion general (versionadas) y donde va la firma.
   - Archivos generales: carpetas libres (lo que venga de Odoo, etc.) y los expedientes
-    en Contratos / <CONTRATO> (con sus versiones, adjuntos y eliminar).
+    en Contratos / <CONTRATO> (con sus versiones, adjuntos y eliminar). HOJAS DE CALCULO
+    (components/hojas.py): crear, abrir los .xlsx y editarlos en la app, guardado solo.
 
 Logica en components/expedientes.py, components/documentos.py y components/storage.py.
 """
@@ -55,6 +56,7 @@ if not S.configurado():
 
 from components import documentos as D   # noqa: E402  (registra el componente de firma)
 from components import expedientes as E  # noqa: E402
+from components import hojas as H        # noqa: E402
 
 # Streamlit Cloud puede servir modulos viejos tras un push (ver CLAUDE.md): recargarlos.
 import importlib  # noqa: E402
@@ -66,9 +68,12 @@ if (getattr(S, "API_VERSION", 0) < 2 or getattr(D, "API_VERSION", 0) < 6
     S = importlib.reload(S)
     D = importlib.reload(D)
     E = importlib.reload(E)
+if getattr(H, "API_VERSION", 0) < 1:
+    H = importlib.reload(H)
 
 try:
     E.ensure_tables()
+    H.ensure_tables()
 except Exception as e:  # noqa: BLE001
     st.error(f"No se pudo preparar Storage / tablas: {e}")
     st.stop()
@@ -246,6 +251,77 @@ def panel_expediente(exp: dict) -> None:
             E.eliminar_expediente(c, USUARIO)
             st.rerun()
     section("Archivos")
+
+
+@st.fragment
+def panel_hoja(doc_id: int, nombre: str) -> None:
+    """Hoja de calculo: la abre editable si nadie mas la tiene; si no, en solo lectura.
+    Se guarda sola (cada cambio, 1,5 s despues). Fragmento: el autoguardado solo
+    re-ejecuta este bloque, no toda la pagina."""
+    k = f"hoja_{doc_id}"
+    ses = st.session_state.get(k)
+    if ses is None:                                   # abrir (una vez por sesion de la hoja)
+        solo_ver = st.session_state.pop(f"{k}_solo_ver", False)
+        ok = False if solo_ver else H.tomar(doc_id, USUARIO)[0]
+        ses = {"nonce": st.session_state.get(f"{k}_n", 0), "modo": "editar" if ok else "ver",
+               "ini": H.datos_iniciales(H.abrir(doc_id)), "seq": 0, "guardado": None, "perdida": False}
+        st.session_state[k] = ses
+    est = H.estado(doc_id)
+    otro = bool(est.get("tomada")) and est.get("editor") != USUARIO
+
+    def _reabrir(solo_ver: bool = False) -> None:
+        st.session_state[f"{k}_n"] = ses["nonce"] + 1
+        st.session_state.pop(k, None)
+        if solo_ver:
+            st.session_state[f"{k}_solo_ver"] = True
+        st.rerun(scope="fragment")
+
+    c1, c2, c3 = st.columns([4, 1, 1])
+    if ses["modo"] == "editar":
+        if ses["perdida"]:
+            c1.error("Otra persona tomó la hoja mientras estaba quieta: tus últimos cambios NO se guardaron. "
+                     "Descárgala (Archivo → Descargar como Excel) si los necesitas y vuelve a abrirla.")
+        else:
+            g = ses["guardado"]
+            c1.caption("**Editando.** Se guarda sola mientras escribes"
+                       + (f" · último guardado {g}" if g else "") + ".")
+        if c2.button("Terminar edición", key=f"{k}_fin", width="stretch"):
+            H.soltar(doc_id, USUARIO)
+            _reabrir(solo_ver=True)
+    else:
+        if otro:
+            c1.warning(f"La está editando **{est['editor']}**: la ves en solo lectura. "
+                       f"Presiona *Actualizar* para ver sus cambios.")
+        else:
+            c1.caption("Solo lectura.")
+        if c2.button("Actualizar", key=f"{k}_upd", width="stretch"):
+            _reabrir(solo_ver=True)
+        if not otro and c3.button("Editar", key=f"{k}_edit", type="primary", width="stretch"):
+            _reabrir()
+
+    ev = H.editor(f"{k}_{ses['nonce']}", nombre, ses["ini"], solo_lectura=ses["modo"] != "editar")
+    if ses["modo"] == "editar" and isinstance(ev, dict) and ev.get("tipo") == "guardar" \
+            and int(ev.get("seq", 0)) > ses["seq"]:
+        ses["seq"] = int(ev["seq"])
+        if H.guardar(doc_id, USUARIO, ev["data"]):
+            ses["guardado"] = pd.Timestamp.now(tz="America/Bogota").strftime("%H:%M:%S")
+        else:
+            ses["perdida"] = True
+        st.rerun(scope="fragment")
+
+    with st.expander("Versiones anteriores"):
+        st.caption("Se guarda una versión cada vez que alguien empieza a editar.")
+        v = H.versiones(doc_id)
+        if v.empty:
+            st.caption("Todavía no hay versiones anteriores.")
+        else:
+            opv = {int(r.version_id): f"{_fecha(r.creado_at)} · {r.motivo}" for r in v.itertuples()}
+            vid = st.selectbox("Versión", list(opv), format_func=opv.get, key=f"{k}_ver")
+            if st.button("Volver a esta versión", key=f"{k}_rest"):
+                if H.restaurar(doc_id, vid, USUARIO):
+                    _reabrir()
+                else:
+                    st.error("No se puede: otra persona la está editando.")
 
 
 tab_con, tab_val, tab_pla, tab_gen = st.tabs(["Contratos", "Validación", "Plantillas", "Archivos generales"])
@@ -524,10 +600,28 @@ with tab_gen:
                     else:
                         try:
                             D.crear_carpeta(nombre, padre, USUARIO)
+                            if st.session_state.get("doc_carpeta") is not None:   # ver hoja nueva
+                                st.session_state["doc_carpeta_pendiente"] = st.session_state["doc_carpeta"]
                             st.rerun()
                         except Exception as e:  # noqa: BLE001
                             st.error("Ya existe una carpeta con ese nombre ahí." if "unique" in str(e).lower()
                                      else f"No se pudo crear: {e}")
+        if rutas:
+            with st.expander("Nueva hoja de cálculo"):
+                with st.form("doc_new_sheet", clear_on_submit=True):
+                    nombre_h = st.text_input("Nombre (ej. FOTOMULTAS 2027)")
+                    st.caption("Se crea en la carpeta seleccionada.")
+                    if st.form_submit_button("Crear hoja"):
+                        try:
+                            cp = int(st.session_state["doc_carpeta"])
+                            nid = H.crear(cp, nombre_h, USUARIO)
+                            # el rerun corta el script ANTES del selector de carpeta y Streamlit
+                            # borra su estado: se re-aplica con el "pendiente"
+                            st.session_state["doc_carpeta_pendiente"] = cp
+                            st.session_state["doc_abrir_pendiente"] = nid
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"No se pudo crear: {e}")
     if not rutas:
         st.info("Todavía no hay carpetas.")
     else:
@@ -547,7 +641,9 @@ with tab_gen:
             st.info("La carpeta está vacía.")
         else:
             st.dataframe(pd.DataFrame({
-                "Documento": docs["tipo_documento"].map(lambda t: E.etiqueta(t) if isinstance(t, str) else ""),
+                "Documento": [E.etiqueta(t) if isinstance(t, str) else
+                              ("Hoja de cálculo" if m == H.HOJA_MIME else "")
+                              for t, m in zip(docs["tipo_documento"], docs["mime_type"])],
                 "Nombre": docs["nombre"],
                 "Contrato": docs["contrato"].map(lambda v: "" if pd.isna(v) else str(int(v))),
                 "Tamaño": docs["tamano_bytes"].map(_tam),
@@ -555,9 +651,35 @@ with tab_gen:
                 "Cargado": docs["subido_at"].map(_fecha),
             }), width="stretch", hide_index=True)
             op = dict(zip(docs["documento_id"].astype(int), docs["nombre"]))
+            _pa = st.session_state.pop("doc_abrir_pendiente", None)
+            if _pa in op:
+                st.session_state["doc_abrir"] = _pa
+            elif st.session_state.get("doc_abrir") not in op:
+                st.session_state.pop("doc_abrir", None)
             doc_id = st.selectbox("Ver archivo", list(op), format_func=op.get, key="doc_abrir")
             fila = docs[docs["documento_id"] == doc_id].iloc[0]
-            visor(fila, f"g{doc_id}")
+            # si deja una hoja que estaba editando, suelta el turno
+            _prev = st.session_state.get("hoja_abierta")
+            if _prev and _prev != doc_id:
+                ps = st.session_state.pop(f"hoja_{_prev}", None)
+                if ps and ps.get("modo") == "editar":
+                    H.soltar(_prev, USUARIO)
+                    st.session_state[f"hoja_{_prev}_n"] = ps["nonce"] + 1
+            st.session_state["hoja_abierta"] = int(doc_id) if H.es_hoja(fila) else None
+            if H.es_hoja(fila):
+                panel_hoja(int(doc_id), fila["nombre"])
+            else:
+                visor(fila, f"g{doc_id}")
+                if H.es_xlsx(fila):
+                    if st.button("Abrir y editar en la app", key=f"doc_conv_{doc_id}", type="primary"):
+                        try:
+                            nid = H.convertir_xlsx(fila.to_dict() | {"carpeta_id": carpeta}, USUARIO)
+                            st.session_state["doc_abrir_pendiente"] = nid
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"No se pudo abrir: {e}")
+                    st.caption("La convierte en una hoja de cálculo de la app (fórmulas, pestañas y formato) "
+                               "que se edita aquí y se guarda sola. El .xlsx original queda en el historial.")
             # los firmados del expediente no se borran sueltos (eliminar expediente arriba);
             # los adjuntos y los archivos libres si
             if pd.isna(fila.get("tipo_documento")) or fila.get("tipo_documento") in E.ADJUNTOS:
