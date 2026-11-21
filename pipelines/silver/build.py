@@ -2454,6 +2454,62 @@ def build_gold_cargo_dia(engine):
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")
 
 
+def build_gold_tarifa_dia(engine):
+    """gold_tarifa_dia: tarifa (cargo T) por (fecha x sede), prorrateada por dia 24h
+    sobre la duracion COMPLETA del contrato: real si cerro, PROGRAMADA si sigue
+    abierto (como fact_comision_dia). Incluye los dias FUTUROS de las rentas abiertas.
+    Alimenta 14_Metas_Sede (cumplimiento semanal del presupuesto para los asesores).
+
+    Por que no gold_cargo_dia: ese reparte una renta abierta solo sobre los dias que
+    ya pasaron (LEAST(devolucion, NOW())), asi que a mitad de mes el real sale inflado
+    (272% en Bogota el 2-oct con 1 dia de datos). Aca cada dia lleva valor/N con N
+    fijo; en contratos cerrados es identico a gold_cargo_dia codigo T.
+    `tar_abierto_*` = la parte que viene de contratos todavia abiertos (puede cambiar
+    si el cliente devuelve antes o extiende). Solo RENTAL_COUNTER, sin no-shows.
+    """
+    log("\n>> Construyendo gold_tarifa_dia")
+    started = time.time()
+    _exec(engine, "DROP TABLE IF EXISTS silver.gold_tarifa_dia__nuevo CASCADE")
+    _exec(engine, f"""
+        CREATE TABLE silver.gold_tarifa_dia__nuevo AS
+        WITH cargos AS (
+            SELECT d.numero_contrato, d.sede_handover,
+                   d.fecha_handover_real::date AS f_ini,
+                   SUM(d.subtotal_usd) AS val_usd,
+                   MAX(COALESCE(t.trm_cop_per_usd, 0)) AS trm
+            FROM silver.vw_rentals_detail d
+            LEFT JOIN silver.dim_trm_diaria t ON t.fecha = d.fecha_handover_real::date
+            WHERE d.fecha_handover_real >= DATE '{GOLD_START}'
+              AND d.fecha_handover_real::date <= CURRENT_DATE
+              AND TRIM(COALESCE(d.placa, '')) <> ''
+              AND d.fuente_cargo = 'RENTAL_COUNTER'
+              AND d.cargo_codigo = 'T'
+            GROUP BY 1, 2, 3
+        ),
+        conteo AS (
+            -- Dia = bloque de 24h con 1 HORA DE GRACIA; N sobre la duracion completa.
+            SELECT c.*, (rf.estado_rental = 'Open') AS abierto,
+                   GREATEST(CEIL((EXTRACT(EPOCH FROM (
+                       COALESCE(rf.hora_devolucion, NOW())
+                       - COALESCE(rf.hora_handover, c.f_ini::timestamp))) - 3600) / 86400.0)::int, 1) AS n
+            FROM cargos c
+            JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
+        )
+        SELECT (f_ini + gs)::date AS fecha, sede_handover AS sede,
+               ROUND(SUM(val_usd / n)::numeric, 2)                           AS tar_usd,
+               ROUND(SUM(val_usd * trm / n)::numeric, 0)                     AS tar_cop,
+               ROUND(SUM(val_usd / n) FILTER (WHERE abierto)::numeric, 2)    AS tar_abierto_usd,
+               ROUND(SUM(val_usd * trm / n) FILTER (WHERE abierto)::numeric, 0) AS tar_abierto_cop,
+               COUNT(DISTINCT numero_contrato)                               AS contratos
+        FROM conteo CROSS JOIN generate_series(0, n - 1) AS gs
+        GROUP BY 1, 2
+    """)
+    _exec(engine, "CREATE INDEX idx_gold_tarifa_dia_fecha__nuevo ON silver.gold_tarifa_dia__nuevo(fecha)")
+    _swap_table(engine, "gold_tarifa_dia", ["idx_gold_tarifa_dia_fecha"])
+    n = _scalar(engine, "SELECT COUNT(*) FROM silver.gold_tarifa_dia")
+    log(f"   {n:,} filas ({time.time()-started:.1f}s)")
+
+
 # =============================================================================
 # main
 # =============================================================================
@@ -2514,6 +2570,7 @@ def main():
     # 14. Capa gold: analitica acida prorrateada (pagina 9_Analitica, solo admin)
     build_gold_carro_dia(engine)
     build_gold_cargo_dia(engine)
+    build_gold_tarifa_dia(engine)
 
     report_counts(engine)
 

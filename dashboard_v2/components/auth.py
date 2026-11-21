@@ -144,6 +144,12 @@ def require_auth() -> None:
     st.stop()
 
 
+# Paginas abiertas a TODO usuario logueado, sin tener que agregarlas a `pages` en los
+# secrets de cada sede. 14_Metas_Sede (2026-11-21): cada asesor ve solo la meta y el
+# cumplimiento de SU ciudad (el filtro de sedes del sidebar lo bloquea a su sede).
+PAGINAS_PARA_TODOS = {"14_Metas_Sede"}
+
+
 def require_page(page_key: str) -> None:
     """Bloquea la pagina si el usuario no tiene acceso.
 
@@ -152,7 +158,7 @@ def require_page(page_key: str) -> None:
     Para admin (pages=["*"]) siempre pasa.
     """
     allowed = get_user_pages()
-    if "*" in allowed:
+    if "*" in allowed or page_key in PAGINAS_PARA_TODOS:
         return
     if page_key not in allowed:
         st.warning("Acceso restringido. Tu usuario no tiene permiso para "

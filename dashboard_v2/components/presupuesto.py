@@ -56,7 +56,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 8
+API_VERSION = 9
 
 # Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
 # FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
@@ -565,3 +565,64 @@ def real_t(desde_iso: str, hasta_iso: str, suf: str) -> pd.Series:
     d["t_val"] = pd.to_numeric(d["t_val"], errors="coerce").fillna(0.0)
     d["g"] = d["sede"].map(grp)
     return d.groupby("g")["t_val"].sum()
+
+
+# =============================================================================
+# Metas de la sede (14_Metas_Sede): presupuesto oficial del mes + real sin inflar
+# =============================================================================
+
+def presupuesto_ciudad(target: dt.date, suf: str, today: dt.date) -> pd.Series:
+    """Presupuesto de tarifa del mes por CIUDAD con el escenario GUARDADO (Base), igual
+    al total de 10_Presupuesto sin filtro de sedes: flota de la foto x dias del mes x
+    ocupacion del escenario x RPD de la celda. Lo usa 14_Metas_Sede, donde los
+    asesores ven la meta pero no la pueden editar."""
+    days = calendar.monthrange(target.year, target.month)[1]
+    win_start, win_end = window_for(target, today)
+    snap = snapshot_date(target, last_gold_day())
+    excl = excluded_plates(target.isoformat())
+    excl_t = excluded_plates_rates(target.isoformat(), win_start.isoformat())
+    base_df, factor, _plates, rates = base_inputs(
+        win_start.isoformat(), win_end.isoformat(), target.isoformat(), suf, snap.isoformat(),
+        excl, recat_map(), excl_t, ubicaciones(target.isoformat()))
+    if base_df.empty:
+        return pd.Series(dtype=float)
+    ss, sc, scell = saved_overrides(target.isoformat())
+    occ = scenario_occ(base_df, rates, factor, ss, sc, scell)
+    rev = base_df.apply(lambda r: r["n"] * days * occ(r["sede"], r["acriss"]) * r["rpd"], axis=1)
+    return rev.groupby(base_df["sede"]).sum()
+
+
+@st.cache_data(ttl=600)
+def tarifa_dia(desde_iso: str, hasta_iso: str, suf: str) -> pd.DataFrame:
+    """Tarifa (cargo T) por (fecha x ciudad x sede) de silver.gold_tarifa_dia: cada
+    contrato repartido sobre su duracion COMPLETA (programada si sigue abierto), asi
+    que el real a la fecha NO sale inflado a mitad de mes como con gold_cargo_dia.
+    Trae tambien los dias futuros de las rentas abiertas (ya vendidos)."""
+    d = load_query(f"""
+        SELECT fecha, sede, tar_{suf} AS t_val, tar_abierto_{suf} AS t_abierto
+        FROM silver.gold_tarifa_dia WHERE fecha BETWEEN :a AND :b
+    """, {"a": desde_iso, "b": hasta_iso})
+    d["fecha"] = pd.to_datetime(d["fecha"]).dt.date
+    for c in ("t_val", "t_abierto"):
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    d["g"] = d["sede"].map(grp)
+    return d
+
+
+def semanas_mes(target: dt.date) -> list:
+    """Semanas del mes: bloques lunes-domingo recortados al mes; un pedazo de MENOS de
+    4 dias al inicio o al final se une a la semana vecina (nov-2026 empieza domingo y
+    termina lunes: sin esto habria semanas de 1 dia). [(n, desde, hasta), ...]"""
+    last = dt.date(target.year, target.month, calendar.monthrange(target.year, target.month)[1])
+    tramos, d = [], target
+    while d <= last:
+        h = min(d + dt.timedelta(days=6 - d.weekday()), last)
+        tramos.append([d, h])
+        d = h + dt.timedelta(days=1)
+    if len(tramos) > 1 and (tramos[0][1] - tramos[0][0]).days + 1 < 4:
+        tramos[1][0] = tramos[0][0]
+        tramos.pop(0)
+    if len(tramos) > 1 and (tramos[-1][1] - tramos[-1][0]).days + 1 < 4:
+        tramos[-2][1] = tramos[-1][1]
+        tramos.pop()
+    return [(i + 1, a, b) for i, (a, b) in enumerate(tramos)]
