@@ -42,7 +42,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 8
+P_API_REQUERIDA = 12
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -75,15 +75,15 @@ DAYS = calendar.monthrange(target.year, target.month)[1]
 mstart, mend = target, target + dt.timedelta(days=DAYS - 1)
 win_start, win_end = P.window_for(target, today)
 last_day = P.last_gold_day()
-snap = P.snapshot_date(target, last_day)
+snap = P.snapshot_mes(target, today)   # la de la foto congelada si el mes esta congelado
 
 EXCL = P.excluded_plates(target.isoformat())   # mismas exclusiones que Presupuesto
 EXCL_T = P.excluded_plates_rates(target.isoformat(), win_start.isoformat())
 RECAT = P.recat_map()                          # mismas categorias corregidas
 UBIC = P.ubicaciones(target.isoformat())       # mismas ciudades corregidas (proyeccion)
-base_df, factor, _plates_snap, rates = P.base_inputs(
-    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap.isoformat(),
-    EXCL, RECAT, EXCL_T, UBIC)
+# Mes CONGELADO: celdas, placas, tasas y factores salen de la foto (los mismos de
+# Presupuesto y Metas de la sede). Lo unico que se mueve es donde estuvo cada placa.
+base_df, factor, _plates_snap, rates, CONGELADO = P.base_mes(target, SUF, today)
 if base_df.empty:
     st.info("No hay datos suficientes en la ventana para presupuestar.")
     st.stop()
@@ -97,12 +97,36 @@ _hay_override = bool(saved_sede or saved_cat or saved_cell)
 real_end = min(mend, last_day)
 parts = []
 # Se carga tambien el dia ANTERIOR al mes para detectar un cambio de ciudad el dia 1.
-if real_end >= mstart:
+if CONGELADO:
+    # Las MISMAS placas de la foto, con su categoria de la foto. Cada dia: la ciudad real
+    # de gold; si gold no la trae (Sixt la dio de baja y borro su historia) sigue en su
+    # ultima ciudad conocida; los dias que faltan se proyectan donde quedo. Un carro que
+    # entro despues de la foto no cuenta.
+    _fp = _plates_snap[["placa", "g", "acriss", "acriss_sixt"]].rename(columns={"g": "g_foto"})
+    _dias = pd.date_range(mstart - dt.timedelta(days=1), mend).date
+    _grid = _fp.merge(pd.DataFrame({"fecha": _dias}), how="cross")
+    if real_end >= mstart:
+        _r = P.daily_rows((mstart - dt.timedelta(days=1)).isoformat(), real_end.isoformat(),
+                          (), RECAT)
+        _grid = _grid.merge(_r[["placa", "fecha", "g", "rented_day"]], on=["placa", "fecha"],
+                            how="left")
+    else:
+        _grid["g"], _grid["rented_day"] = None, None
+    _grid = _grid.sort_values(["placa", "fecha"])
+    _grid["tipo"] = ["real" if pd.notna(r) else ("proyectado" if f > real_end else "sin dato (foto)")
+                     for r, f in zip(_grid["rented_day"], _grid["fecha"])]
+    _grid["g"] = _grid.groupby("placa")["g"].ffill().fillna(_grid["g_foto"])
+    _grid["rented_day"] = pd.to_numeric(_grid["rented_day"], errors="coerce").fillna(0).astype(int)
+    parts.append(_grid.drop(columns=["g_foto"]))
+    _nuevas = (P.daily_rows(real_end.isoformat(), real_end.isoformat(), (), RECAT)
+               if real_end >= mstart else pd.DataFrame(columns=["placa"]))
+    PLACAS_NUEVAS = sorted(set(_nuevas["placa"]) - set(_fp["placa"]) - set(EXCL))
+elif real_end >= mstart:
     _r = P.daily_rows((mstart - dt.timedelta(days=1)).isoformat(), real_end.isoformat(),
                       EXCL, RECAT)
     _r["tipo"] = "real"
     parts.append(_r)
-if real_end < mend:
+if real_end < mend and not CONGELADO:
     # Proyeccion: cada placa activa al ultimo dia de gold se queda donde esta hoy.
     _now = P.fleet_snapshot(last_day.isoformat(), win_start.isoformat(), win_end.isoformat(),
                             EXCL, RECAT, UBIC)
@@ -118,7 +142,7 @@ daily = daily_all[(daily_all["fecha"] >= mstart) & (daily_all["fecha"] <= mend)]
 # Valor esperado de cada carro-dia en su ciudad x categoria = ocupacion x RPD.
 _cells = daily[["g", "acriss"]].drop_duplicates()
 _cells["occ"] = [occ_final(g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
-_cells["rpd"] = [P.cell_rpd(rates, g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
+_cells["rpd"] = [P.rpd_celda(base_df, rates, g, a) for g, a in zip(_cells["g"], _cells["acriss"])]
 # una ocupacion por escenario (Conservador / Base / Optimista), misma regla que Presupuesto
 for _k, _lbl, _m in P.ESCENARIOS:
     _cells[f"occ_{_k}"] = [occ_final(g, a, _m) for g, a in zip(_cells["g"], _cells["acriss"])]
@@ -156,6 +180,12 @@ st.caption(
        else "Mes futuro: todavía no hay días reales, así que coincide con la página "
             "Presupuesto. ")
     + ("**Escenario guardado activo.** " if _hay_override else "Sin escenario guardado (pre-calculado). ")
+    + ((f"**Mes congelado** el {pd.to_datetime(P.info_congelado(target.isoformat())[0]).tz_convert('America/Bogota'):%d/%m/%Y}: "
+        f"se siguen las {len(_plates_snap)} placas de la foto con sus tasas (las mismas de "
+        "Presupuesto); un carro que Sixt dio de baja sigue en su última ciudad conocida"
+        + (f" y no cuentan {len(PLACAS_NUEVAS)} placas que entraron después de la foto "
+           f"({', '.join(PLACAS_NUEVAS)})" if PLACAS_NUEVAS else "") + ". ")
+       if CONGELADO else "")
     + (f"**{len(EXCL)} placas excluidas** del presupuesto para este mes (se gestionan en la "
        f"página Presupuesto): {', '.join(EXCL)}." if EXCL else ""))
 

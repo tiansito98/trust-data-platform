@@ -6,7 +6,7 @@ direccion en 10_Presupuesto (escenario guardado); aqui se reparte por semana y s
 compara con lo vendido.
 
 - Meta = presupuesto CONGELADO del mes (P.meta_ciudad: foto por celda en
-  operational.presupuesto_congelado_celda, la misma base de 10_Presupuesto;
+  operational.presupuesto_foto, la misma base de 10_Presupuesto;
   se congela solo la primera vez que se abre la pagina en el mes, o desde 10_Presupuesto).
   El valor congelado es el presupuesto de la CIUDAD, SOLO tarifa (cargo T: renta del
   carro, sin adicionales, coberturas ni tax), = total de 10_Presupuesto sin filtro de
@@ -35,7 +35,7 @@ from components.common import inject_styles, render_header, section, kpi, fmt_mo
 from components.filters import render_sidebar_filters
 from components import presupuesto as P
 
-P_API_REQUERIDA = 11
+P_API_REQUERIDA = 12
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)

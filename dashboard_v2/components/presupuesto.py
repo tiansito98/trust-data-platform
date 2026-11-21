@@ -56,7 +56,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 11
+API_VERSION = 12
 
 # Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
 # FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
@@ -626,54 +626,91 @@ def semanas_mes(target: dt.date) -> list:
 # =============================================================================
 # Presupuesto CONGELADO del mes (2026-11-21)
 # =============================================================================
-# El modelo se recalcula con los datos de cada noche y se MUEVE solo: si Sixt da de
+# El modelo se recalcula con los datos de cada noche y se MOVIA solo: si Sixt da de
 # baja un carro, gold borra su historia (tambien el dia 1 del mes) y la flota baja; una
 # correccion en la ventana de 3 meses mueve ocupacion y RPD. Nov-2026 arranco en
-# 126.465 USD y al 21-nov daba 123.948 sin que nadie editara nada. Por eso se congelan
-# los DATOS DE ENTRADA de cada celda (ciudad x categoria): flota, ocupacion base y RPD
-# (USD y COP). Presupuesto y Metas de la sede calculan sobre esa foto + el escenario
-# guardado, asi que dicen lo mismo; solo una edicion deliberada de la ocupacion mueve
-# la meta. Las tasas de celdas que no estan en la foto siguen en vivo (fallback).
+# 126.465 USD y al 21-nov daba 123.948 sin que nadie editara nada.
+#
+# Se congela TODO lo que entra al presupuesto del mes, en una foto (jsonb):
+#   - celdas (ciudad x categoria): flota, ocupacion base, RPD en USD y COP
+#   - placas de la foto (el listado auditable, con ciudad y categoria)
+#   - tasas (ocupacion/RPD por celda y por categoria, globales) y factores estacionales
+# 10_Presupuesto, 11_Presupuesto_Traslados y 14_Metas_Sede leen la foto. Traslados
+# sigue el movimiento REAL de las placas de la foto dia a dia (para comparar contra la
+# foto); un carro nuevo que entra a mitad de mes no cuenta, uno que Sixt da de baja
+# sigue contando en su ultima ciudad conocida. Solo una edicion deliberada de la
+# ocupacion esperada (escenario guardado) mueve el presupuesto de un mes congelado.
 
-CELDA_TABLE = "operational.presupuesto_congelado_celda"
+FOTO_TABLE = "operational.presupuesto_foto"
 
 
 @st.cache_resource
 def ensure_congelado_table() -> None:
     execute_write(f"""
-        CREATE TABLE IF NOT EXISTS {CELDA_TABLE} (
-            mes            date NOT NULL,
-            ciudad         text NOT NULL,
-            acriss         text NOT NULL,
-            n              integer NOT NULL,
-            occ_base       numeric NOT NULL,
-            rpd_usd        numeric NOT NULL,
-            rpd_cop        numeric NOT NULL,
+        CREATE TABLE IF NOT EXISTS {FOTO_TABLE} (
+            mes            date PRIMARY KEY,
+            data           jsonb NOT NULL,
             origen         text,
             congelado_por  text,
-            congelado_at   timestamptz DEFAULT now(),
-            PRIMARY KEY (mes, ciudad, acriss)
+            congelado_at   timestamptz DEFAULT now()
         )
     """, {})
 
 
-def celdas_congeladas(target_iso: str) -> pd.DataFrame:
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(f) else f
+
+
+def _rates_a_json(r: dict) -> dict:
+    return {
+        "cell": [{"g": g, "a": a, **{k: _num(v) for k, v in d.items()}}
+                 for (g, a), d in r["cell"].items()],
+        "cat": {a: {k: _num(v) for k, v in d.items()} for a, d in r["cat"].items()},
+        **{k: _num(r[k]) for k in ("occ_glob", "rpd_glob", "f_occ", "f_rpd")},
+    }
+
+
+def _rates_de_json(j: dict) -> dict:
+    nan = float("nan")
+    fix = lambda d: {k: (nan if v is None else v) for k, v in d.items()}
+    return {
+        "cell": {(c["g"], c["a"]): fix({k: v for k, v in c.items() if k not in ("g", "a")})
+                 for c in j["cell"]},
+        "cat": {a: fix(d) for a, d in j["cat"].items()},
+        **{k: (j[k] if j[k] is not None else 0.0) for k in ("occ_glob", "rpd_glob", "f_occ", "f_rpd")},
+    }
+
+
+@st.cache_data(ttl=600)
+def _foto_cache(target_iso: str, _v: str):
+    d = load_query(f"""SELECT data, origen, congelado_por, congelado_at
+                       FROM {FOTO_TABLE} WHERE mes = :m""", {"m": target_iso})
+    return None if d.empty else d.iloc[0].to_dict()
+
+
+def foto(target_iso: str):
+    """Foto congelada del mes (dict con data/origen/congelado_por/congelado_at) o None."""
     ensure_congelado_table()
-    d = load_query(f"""SELECT ciudad, acriss, n, occ_base, rpd_usd, rpd_cop, origen,
-                              congelado_por, congelado_at
-                       FROM {CELDA_TABLE} WHERE mes = :m""", {"m": target_iso})
-    for c in ("n", "occ_base", "rpd_usd", "rpd_cop"):
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
-    return d
+    v = load_query(f"SELECT MAX(congelado_at)::text AS v FROM {FOTO_TABLE} WHERE mes = :m",
+                   {"m": target_iso})
+    ver = str(v.iloc[0]["v"]) if len(v) else "None"
+    if ver in ("None", "nan"):
+        return None
+    f = _foto_cache(target_iso, ver)
+    if f is not None and isinstance(f["data"], str):
+        import json
+        f = dict(f, data=json.loads(f["data"]))
+    return f
 
 
 def info_congelado(target_iso: str):
     """(congelado_at, congelado_por, origen) de la foto del mes, o None."""
-    d = celdas_congeladas(target_iso)
-    if d.empty:
-        return None
-    r = d.sort_values("congelado_at").iloc[-1]
-    return r["congelado_at"], r["congelado_por"], r["origen"]
+    f = foto(target_iso)
+    return None if f is None else (f["congelado_at"], f["congelado_por"], f["origen"])
 
 
 def _base_vivo(target: dt.date, suf: str, today: dt.date):
@@ -687,24 +724,44 @@ def _base_vivo(target: dt.date, suf: str, today: dt.date):
 
 
 def base_mes(target: dt.date, suf: str, today: dt.date, vivo: bool = False):
-    """base_inputs del mes + si esta congelado: (base_df, factor, plates, rates, congelado).
-    Con foto, base_df (flota, ocupacion base y RPD por celda) sale de la foto; plates
-    (listado de placas) y rates (fallback de celdas nuevas) siguen en vivo.
-    vivo=True ignora la foto (para comparar)."""
-    base_df, factor, plates, rates = _base_vivo(target, suf, today)
-    cg = pd.DataFrame() if vivo else celdas_congeladas(target.isoformat())
-    if cg.empty:
+    """(base_df, factor, plates, rates, congelado) del mes. Con foto, TODO sale de la
+    foto: celdas, placas, tasas y factores. vivo=True ignora la foto (para comparar)."""
+    f = None if vivo else foto(target.isoformat())
+    if f is None:
+        base_df, factor, plates, rates = _base_vivo(target, suf, today)
         return base_df, factor, plates, rates, False
-    fz = pd.DataFrame({"sede": cg["ciudad"], "acriss": cg["acriss"], "n": cg["n"].astype(int),
-                       "occ_base": cg["occ_base"].astype(float),
-                       "rpd": cg[f"rpd_{suf}"].astype(float)})
-    return fz, factor, plates, rates, True
+    d = f["data"]
+    c = pd.DataFrame(d["celdas"])
+    base_df = pd.DataFrame({"sede": c["sede"], "acriss": c["acriss"], "n": c["n"].astype(int),
+                            "occ_base": c["occ_base"].astype(float),
+                            "rpd": c[f"rpd_{suf}"].astype(float)})
+    plates = pd.DataFrame(d["placas"])
+    for col in ("ult_dia_libre", "ult_renta"):
+        if col in plates:
+            plates[col] = pd.to_datetime(plates[col], errors="coerce").dt.date
+    return base_df, float(d["factor"]), plates, _rates_de_json(d["rates"][suf]), True
 
 
-def presupuesto_ciudad_de(base_df: pd.DataFrame, target: dt.date, today: dt.date) -> pd.Series:
+def snapshot_mes(target: dt.date, today: dt.date) -> dt.date:
+    """Dia de la foto de flota del mes: la congelada si existe."""
+    f = foto(target.isoformat())
+    if f is not None and f["data"].get("snap"):
+        return dt.date.fromisoformat(f["data"]["snap"])
+    return snapshot_date(target, last_gold_day())
+
+
+def rpd_celda(base_df: pd.DataFrame, rates: dict, g: str, a: str) -> float:
+    """RPD de la celda: el de la foto si la celda esta en la foto, si no el de las tasas."""
+    m = base_df[(base_df["sede"] == g) & (base_df["acriss"] == a)]
+    return float(m["rpd"].iloc[0]) if len(m) else cell_rpd(rates, g, a)
+
+
+def presupuesto_ciudad_de(base_df: pd.DataFrame, target: dt.date, today: dt.date,
+                          rates: dict = None, factor: float = None) -> pd.Series:
     """Total por ciudad de un base_df dado (columna rpd) con el escenario guardado."""
     days = calendar.monthrange(target.year, target.month)[1]
-    _b, factor, _p, rates = _base_vivo(target, "usd", today)
+    if rates is None:
+        _b, factor, _p, rates = _base_vivo(target, "usd", today)
     ss, sc, scell = saved_overrides(target.isoformat())
     occ = scenario_occ(base_df, rates, factor, ss, sc, scell)
     rev = base_df.apply(lambda r: r["n"] * days * occ(r["sede"], r["acriss"]) * r["rpd"], axis=1)
@@ -714,33 +771,50 @@ def presupuesto_ciudad_de(base_df: pd.DataFrame, target: dt.date, today: dt.date
 def congelar(target: dt.date, today: dt.date, usuario: str, origen: str,
              ajuste_ciudad_usd: dict = None) -> None:
     """Guarda (o reemplaza) la foto del mes con los datos de HOY. ajuste_ciudad_usd
-    {CIUDAD: total_usd} escala el RPD de cada ciudad para que el total con el escenario
-    guardado de exactamente ese valor (nov-2026: arranco antes de que existiera la foto
-    y se cargo con los valores que tenia la direccion al inicio del mes)."""
+    {CIUDAD: total_usd} escala el RPD de cada ciudad (celdas y tasas) para que el total
+    con el escenario guardado de exactamente ese valor (nov-2026: arranco antes de que
+    existiera la foto y se cargo con los valores que tenia la direccion al inicio)."""
+    import json
     ensure_congelado_table()
-    b_usd = _base_vivo(target, "usd", today)[0]
-    b_cop = _base_vivo(target, "cop", today)[0]
+    b_usd, factor, plates, r_usd = _base_vivo(target, "usd", today)
+    b_cop, _f, _p, r_cop = _base_vivo(target, "cop", today)
     if b_usd.empty:
         return
     b = b_usd.merge(b_cop[["sede", "acriss", "rpd"]].rename(columns={"rpd": "rpd_cop"}),
                     on=["sede", "acriss"], how="left").rename(columns={"rpd": "rpd_usd"})
     if ajuste_ciudad_usd:
-        actual = presupuesto_ciudad_de(b.rename(columns={"rpd_usd": "rpd"}), target, today)
+        actual = presupuesto_ciudad_de(b.rename(columns={"rpd_usd": "rpd"}), target, today,
+                                       r_usd, factor)
         for g, v in ajuste_ciudad_usd.items():
-            if actual.get(g, 0):
-                k = float(v) / float(actual[g])
-                b.loc[b["sede"] == g, "rpd_usd"] *= k
-                b.loc[b["sede"] == g, "rpd_cop"] *= k
-    rows = [{"m": target.isoformat(), "c": r["sede"], "a": r["acriss"], "n": int(r["n"]),
-             "o": float(r["occ_base"]), "ru": float(r["rpd_usd"]),
-             "rc": float(r["rpd_cop"]) if pd.notna(r["rpd_cop"]) else 0.0,
-             "og": origen, "by": usuario} for _, r in b.iterrows()]
-    execute_write(f"DELETE FROM {CELDA_TABLE} WHERE mes = :m", {"m": target.isoformat()})
+            if not actual.get(g, 0):
+                continue
+            k = float(v) / float(actual[g])
+            b.loc[b["sede"] == g, "rpd_usd"] *= k
+            b.loc[b["sede"] == g, "rpd_cop"] *= k
+            for r in (r_usd, r_cop):
+                for (cg, ca), d in r["cell"].items():
+                    if cg == g and d.get("rpd") is not None and pd.notna(d.get("rpd")):
+                        d["rpd"] = float(d["rpd"]) * k
+    pl = plates.copy()
+    for col in ("ult_dia_libre", "ult_renta"):
+        if col in pl:
+            pl[col] = pl[col].map(lambda x: x.isoformat() if hasattr(x, "isoformat") else None)
+    data = {
+        "snap": snapshot_date(target, last_gold_day()).isoformat(),
+        "factor": float(factor),
+        "celdas": [{"sede": r["sede"], "acriss": r["acriss"], "n": int(r["n"]),
+                    "occ_base": float(r["occ_base"]), "rpd_usd": float(r["rpd_usd"]),
+                    "rpd_cop": float(r["rpd_cop"]) if pd.notna(r["rpd_cop"]) else 0.0}
+                   for _, r in b.iterrows()],
+        "placas": json.loads(pl.to_json(orient="records")),
+        "rates": {"usd": _rates_a_json(r_usd), "cop": _rates_a_json(r_cop)},
+    }
     execute_write(f"""
-        INSERT INTO {CELDA_TABLE} (mes, ciudad, acriss, n, occ_base, rpd_usd, rpd_cop,
-                                   origen, congelado_por, congelado_at)
-        VALUES (:m, :c, :a, :n, :o, :ru, :rc, :og, :by, NOW())
-    """, rows)
+        INSERT INTO {FOTO_TABLE} (mes, data, origen, congelado_por, congelado_at)
+        VALUES (:m, CAST(:d AS jsonb), :o, :u, NOW())
+        ON CONFLICT (mes) DO UPDATE SET data = EXCLUDED.data, origen = EXCLUDED.origen,
+            congelado_por = EXCLUDED.congelado_por, congelado_at = NOW()
+    """, {"m": target.isoformat(), "d": json.dumps(data), "o": origen, "u": usuario})
     load_query.clear()
 
 

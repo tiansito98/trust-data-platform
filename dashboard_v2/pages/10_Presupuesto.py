@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 11
+P_API_REQUERIDA = 12
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -109,7 +109,7 @@ target = P.month_selector(today)
 DAYS = calendar.monthrange(target.year, target.month)[1]
 win_start, win_end = P.window_for(target, today)
 _last_day = P.last_gold_day()
-snap_date = P.snapshot_date(target, _last_day)
+snap_date = P.snapshot_mes(target, today)   # la de la foto si el mes esta congelado
 
 _es_pasado = target < dt.date(today.year, today.month, 1)
 _cap_base = (
@@ -125,8 +125,8 @@ EXCL_T = P.excluded_plates_rates(target.isoformat(), win_start.isoformat())
 RECAT = P.recat_map()   # categorias corregidas solo para el presupuesto
 UBIC = P.ubicaciones(target.isoformat())   # ciudades corregidas (solo la foto)
 # Si el mes esta CONGELADO, flota / ocupacion base / RPD por celda salen de la foto
-# (operational.presupuesto_congelado_celda): es la misma base que usa Metas de la sede,
-# asi que las dos paginas dan el mismo presupuesto. El listado de placas sigue en vivo.
+# (operational.presupuesto_foto): celdas, placas del listado, tasas y factores. Es la
+# misma base de Metas de la sede y de Presupuesto con traslados.
 base_df_all, factor, plates_all, _rates, CONGELADO = P.base_mes(target, SUF, today)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
@@ -285,9 +285,10 @@ with st.expander(
         expanded=False):
     st.caption("Los datos de cada noche mueven el presupuesto aunque nadie edite nada (Sixt "
                "da de baja un carro, corrige contratos de los meses de referencia). Por eso "
-               "se congela una FOTO de la flota, la ocupación base y el RPD de cada ciudad y "
-               "categoría: esta página y *Metas de la sede* calculan sobre esa foto y dan lo "
-               "mismo. La ocupación esperada se sigue editando aquí y mueve las dos páginas. "
+               "se congela una FOTO de todo: las placas (listado), la flota, la ocupación y el "
+               "RPD de cada ciudad y categoría y los factores estacionales. Esta página, "
+               "*Presupuesto con traslados* (que sigue a esas mismas placas día a día) y "
+               "*Metas de la sede* calculan sobre esa foto. La ocupación esperada se sigue editando aquí y mueve las dos páginas. "
                "La foto se toma sola la primera vez que alguien abre *Metas de la sede* en el "
                "mes, o con el botón de abajo.")
     if _info_cg:
