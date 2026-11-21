@@ -129,16 +129,26 @@ else:
     kpi(k3, "Cumplimiento a la fecha",
         fmt_pct(real / meta_a_fecha * 100) if meta_a_fecha else "-",
         f"meta a la fecha {fmt_money(meta_a_fecha, MON)} ({dias_corridos} de {DAYS} días)")
-    falta = max(meta_mes - real - vendido, 0.0)
+    asegurado = real + vendido
+    falta = max(meta_mes - asegurado, 0.0)
     dias_rest = DAYS - dias_corridos
-    kpi(k4, "Ya vendido para lo que queda", fmt_money(vendido, MON),
-        (f"faltan {fmt_money(falta, MON)} · {fmt_money(falta / dias_rest, MON)} por día"
-         if falta > 0 and dias_rest else "con esto la meta del mes queda cubierta"))
+    kpi(k4, "Asegurado del mes", fmt_money(asegurado, MON),
+        f"{fmt_pct(asegurado / meta_mes * 100)} de la meta · incluye "
+        f"{fmt_money(vendido, MON)} ya vendido para los días que vienen")
+    if falta > 0:
+        st.warning(f"**Hueco por llenar: {fmt_money(falta, MON)}** para cumplir la meta del mes"
+                   + (f" · {fmt_money(falta / dias_rest, MON)} por día en los {dias_rest} días "
+                      "que quedan." if dias_rest else "."))
+    else:
+        st.success("Con lo vendido y lo ya vendido para los días que vienen, la meta del mes "
+                   "queda cubierta.")
 
 if not cerrado and meta_mes:
     st.progress(min(real / meta_mes, 1.0),
-                text=f"Mes: {fmt_pct(real / meta_mes * 100)} vendido · "
+                text=f"Vendido: {fmt_pct(real / meta_mes * 100)} de la meta · "
                      f"{fmt_pct(dias_corridos / DAYS * 100)} del mes transcurrido")
+    st.progress(min((real + vendido) / meta_mes, 1.0),
+                text=f"Asegurado (vendido + ya vendido): {fmt_pct((real + vendido) / meta_mes * 100)} de la meta")
 
 # --- Por semana --------------------------------------------------------------
 section("Metas semanales")
@@ -164,6 +174,9 @@ for n, a, b in P.semanas_mes(target):
         "Vendido": r,
         "Cumplimiento (%)": (r / base * 100) if base else None,
         "Ya vendido (rentas abiertas)": v,
+        "Asegurado": r + v,
+        "Cubierto (%)": (r + v) / meta_s * 100 if meta_s else None,
+        "Falta": max(meta_s - r - v, 0.0),
         "Estado": estado,
     })
 sem = pd.DataFrame(filas)
@@ -172,7 +185,7 @@ def _fmt_col(c):
     return sem[c].map(lambda x: fmt_money(x, MON))
 
 vista = sem.copy()
-for c in ("Meta", "Vendido", "Ya vendido (rentas abiertas)"):
+for c in ("Meta", "Vendido", "Ya vendido (rentas abiertas)", "Asegurado", "Falta"):
     vista[c] = _fmt_col(c)
 st.dataframe(
     vista, hide_index=True, width="stretch",
@@ -181,6 +194,13 @@ st.dataframe(
             "Cumplimiento (%)", min_value=0, max_value=100, format="%.1f%%",
             help="Vendido ÷ meta. En la semana en curso se compara contra la meta de "
                  "los días que ya pasaron."),
+        "Cubierto (%)": st.column_config.ProgressColumn(
+            "Cubierto (%)", min_value=0, max_value=100, format="%.1f%%",
+            help="(Vendido + ya vendido) ÷ meta de la semana completa: qué parte de la "
+                 "meta ya está asegurada, incluidas las semanas que todavía no empiezan."),
+        "Falta": st.column_config.TextColumn(
+            help="Lo que falta vender para la meta de la semana, descontando lo vendido y "
+                 "lo ya vendido."),
         "Ya vendido (rentas abiertas)": st.column_config.TextColumn(
             help="Días que todavía no pasaron de rentas que ya están abiertas: ya están "
                  "vendidos, pero pueden cambiar si el cliente devuelve antes o extiende."),
@@ -200,9 +220,11 @@ with st.expander("Ver día por día"):
     dd["Meta acumulada"] = dd["Meta"].cumsum()
     dd["Vendido acumulado"] = dd["Vendido"].fillna(0.0).cumsum()
     dd.loc[dd["Fecha"] > corte, "Vendido acumulado"] = None
+    dd["Asegurado acumulado"] = (dd["Vendido"].fillna(0.0) + dd["Ya vendido (rentas abiertas)"]).cumsum()
     vd = dd.copy()
     vd["Fecha"] = vd["Fecha"].map(lambda d: f"{d:%d/%m} {['lun','mar','mié','jue','vie','sáb','dom'][d.weekday()]}")
-    for c in ("Meta", "Vendido", "Ya vendido (rentas abiertas)", "Meta acumulada", "Vendido acumulado"):
+    for c in ("Meta", "Vendido", "Ya vendido (rentas abiertas)", "Meta acumulada", "Vendido acumulado",
+              "Asegurado acumulado"):
         vd[c] = vd[c].map(lambda x: fmt_money(x, MON) if pd.notna(x) else "")
     st.dataframe(vd, hide_index=True, width="stretch")
 

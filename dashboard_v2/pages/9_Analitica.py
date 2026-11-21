@@ -327,3 +327,48 @@ xlsx_download_button(
     sheet_name="Por ciudad",
     key="xlsx_analitica_ciudad",
 )
+
+# =============================================================================
+# Ya vendido para los dias que vienen (2026-11-21)
+# =============================================================================
+# El periodo de arriba solo puede llegar hasta hoy, pero una renta abierta ya trae
+# vendidos sus dias futuros (hasta la devolucion programada). Con esto se ve cuanto
+# ingreso de TARIFA (cargo T) esta asegurado para lo que queda del mes y despues,
+# para saber el hueco que falta llenar. Misma regla de reparto que todo gold:
+# valor / dias de la duracion completa. Fuente: silver.gold_tarifa_dia.
+section("Ya vendido para los días que vienen (tarifa T)")
+_hoy = dt.date.today()
+_fin_mes = (dt.date(_hoy.year + (_hoy.month == 12), _hoy.month % 12 + 1, 1) - dt.timedelta(days=1))
+FUT_SQL = f"""
+    SELECT sede,
+           SUM(tar_{SUF}) FILTER (WHERE fecha <= :fm) AS resto_mes,
+           SUM(tar_{SUF}) FILTER (WHERE fecha >  :fm) AS despues,
+           SUM(tar_{SUF})                             AS total,
+           MAX(fecha)                                 AS hasta
+    FROM silver.gold_tarifa_dia
+    WHERE fecha >= :hoy AND sede = ANY(:sedes)
+    GROUP BY sede
+"""
+fut = load_query(FUT_SQL, {"hoy": _hoy.isoformat(), "fm": _fin_mes.isoformat(), "sedes": sedes_use})
+if fut.empty:
+    st.info("No hay rentas abiertas con días por delante en las sedes seleccionadas.")
+else:
+    for _c in ("resto_mes", "despues", "total"):
+        fut[_c] = pd.to_numeric(fut[_c], errors="coerce").fillna(0.0)
+    f1, f2, f3 = st.columns(3)
+    kpi(f1, f"Resto de {_fin_mes:%m/%Y} (desde hoy)", fmt_money(fut["resto_mes"].sum(), MON),
+        f"{_hoy:%d/%m} → {_fin_mes:%d/%m}")
+    kpi(f2, "Meses siguientes", fmt_money(fut["despues"].sum(), MON),
+        f"hasta el {pd.to_datetime(fut['hasta']).max():%d/%m/%Y}")
+    kpi(f3, "Total ya vendido", fmt_money(fut["total"].sum(), MON), "rentas abiertas")
+    st.dataframe(pd.DataFrame({
+        "Sede": fut["sede"],
+        f"Resto de {_fin_mes:%m/%Y}": fut["resto_mes"].map(lambda v: fmt_money(v, MON)),
+        "Meses siguientes": fut["despues"].map(lambda v: fmt_money(v, MON)),
+        "Total": fut["total"].map(lambda v: fmt_money(v, MON)),
+    }).sort_values("Sede"), hide_index=True, use_container_width=True)
+    st.caption("Tarifa (renta del carro, cargo T) de los días que todavía no pasan de las "
+               "rentas que ya están abiertas, repartida por día igual que arriba. Puede "
+               "cambiar si el cliente devuelve antes o extiende. No incluye las reservas que "
+               "todavía no se entregaron ni las rentas entregadas hoy (entran con la carga de "
+               "esta noche). Para compararlo con la meta, ver **Metas de la sede**.")
