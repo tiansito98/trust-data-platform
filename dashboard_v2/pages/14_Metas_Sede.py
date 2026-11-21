@@ -5,7 +5,8 @@ Para los asesores de cada sede (y el admin). Solo LECTURA: el presupuesto lo arm
 direccion en 10_Presupuesto (escenario guardado); aqui se reparte por semana y se
 compara con lo vendido.
 
-- Meta = presupuesto CONGELADO del mes (operational.presupuesto_congelado, P.meta_ciudad;
+- Meta = presupuesto CONGELADO del mes (P.meta_ciudad: foto por celda en
+  operational.presupuesto_congelado_celda, la misma base de 10_Presupuesto;
   se congela solo la primera vez que se abre la pagina en el mes, o desde 10_Presupuesto).
   El valor congelado es el presupuesto de la CIUDAD, SOLO tarifa (cargo T: renta del
   carro, sin adicionales, coberturas ni tax), = total de 10_Presupuesto sin filtro de
@@ -34,7 +35,7 @@ from components.common import inject_styles, render_header, section, kpi, fmt_mo
 from components.filters import render_sidebar_filters
 from components import presupuesto as P
 
-P_API_REQUERIDA = 10
+P_API_REQUERIDA = 11
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -109,7 +110,7 @@ st.caption(
     f"**{P.mes_label(target)}** · {', '.join(P.SEDE_NICE.get(g, g) for g in alcance)} · {MON}. "
     "Solo **tarifa** (renta del carro, cargo T): sin adicionales, coberturas ni tax. "
     + ("La meta es el presupuesto que definió la dirección para el mes, **congelado el "
-       f"{pd.to_datetime(congelada['congelado_at']).tz_convert('America/Bogota'):%d/%m/%Y}**: "
+       f"{pd.to_datetime(congelada[0]).tz_convert('America/Bogota'):%d/%m/%Y}**: "
        "no cambia aunque se actualicen los datos. " if congelada is not None
        else "Meta calculada con los datos de hoy (este mes no se congeló). ")
     + (f"Datos hasta el **{corte:%d/%m/%Y}** (ayer; se actualiza cada madrugada)."

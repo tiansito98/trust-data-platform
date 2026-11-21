@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 10
+P_API_REQUERIDA = 11
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -124,9 +124,10 @@ EXCL = P.excluded_plates(target.isoformat())
 EXCL_T = P.excluded_plates_rates(target.isoformat(), win_start.isoformat())
 RECAT = P.recat_map()   # categorias corregidas solo para el presupuesto
 UBIC = P.ubicaciones(target.isoformat())   # ciudades corregidas (solo la foto)
-base_df_all, factor, plates_all, _rates = P.base_inputs(
-    win_start.isoformat(), win_end.isoformat(), target.isoformat(), SUF, snap_date.isoformat(),
-    EXCL, RECAT, EXCL_T, UBIC)
+# Si el mes esta CONGELADO, flota / ocupacion base / RPD por celda salen de la foto
+# (operational.presupuesto_congelado_celda): es la misma base que usa Metas de la sede,
+# asi que las dos paginas dan el mismo presupuesto. El listado de placas sigue en vivo.
+base_df_all, factor, plates_all, _rates, CONGELADO = P.base_mes(target, SUF, today)
 if base_df_all.empty:
     st.info("No hay datos suficientes en la ventana reciente para presupuestar.")
     st.stop()
@@ -274,31 +275,38 @@ kpi(k3, "Ocupación", f"{occ_glob*100:.1f}%", f"{fmt_int(round(tot_rented))} dí
 kpi(k4, f"RPD tarifa ({MON})", fmt_money(tot_rev / tot_rented if tot_rented else 0, MON),
     "tarifa por día rentado")
 
-# --- Meta congelada (la que ven los asesores en Metas de la sede) -------------
-_cg = P.congelado(target.isoformat())
+# --- Foto congelada del mes (la misma base que usa Metas de la sede) ----------
+_info_cg = P.info_congelado(target.isoformat())
 with st.expander(
-        ("Meta congelada del mes: " + fmt_money(_cg[f"valor_{SUF}"].sum(), MON)
-         + " (la que ven los asesores en Metas de la sede)") if not _cg.empty
-        else "Meta congelada del mes: todavía no se congeló", expanded=False):
-    st.caption("El presupuesto de esta página se recalcula con los datos de cada noche (si "
-               "Sixt da de baja un carro o corrige contratos, se mueve). La meta de los "
-               "asesores es una FOTO que no cambia sola: se toma automáticamente la primera "
-               "vez que alguien abre *Metas de la sede* en el mes, o con el botón de abajo.")
-    if not _cg.empty:
-        _modelo = P.presupuesto_ciudad(target, SUF, today)
-        _t = _cg.set_index("ciudad").reindex([g for g in SEDE_ORDER if g in set(_cg["ciudad"])])
-        _info = _cg.sort_values("congelado_at").iloc[-1]
+        ("Presupuesto CONGELADO el "
+         + f"{pd.to_datetime(_info_cg[0]).tz_convert('America/Bogota'):%d/%m/%Y}"
+         + " (el mismo que ven los asesores en Metas de la sede)") if _info_cg
+        else "Presupuesto sin congelar (se recalcula con los datos de cada noche)",
+        expanded=False):
+    st.caption("Los datos de cada noche mueven el presupuesto aunque nadie edite nada (Sixt "
+               "da de baja un carro, corrige contratos de los meses de referencia). Por eso "
+               "se congela una FOTO de la flota, la ocupación base y el RPD de cada ciudad y "
+               "categoría: esta página y *Metas de la sede* calculan sobre esa foto y dan lo "
+               "mismo. La ocupación esperada se sigue editando aquí y mueve las dos páginas. "
+               "La foto se toma sola la primera vez que alguien abre *Metas de la sede* en el "
+               "mes, o con el botón de abajo.")
+    if _info_cg:
+        _cong = P.presupuesto_ciudad(target, SUF, today)
+        _vivo = P.presupuesto_ciudad_de(
+            P.base_mes(target, SUF, today, vivo=True)[0], target, today)
+        _gs = [g for g in SEDE_ORDER if g in set(_cong.index) | set(_vivo.index)]
         st.dataframe(pd.DataFrame({
-            "Ciudad": [SEDE_NICE.get(g, g) for g in _t.index],
-            "Meta congelada": [fmt_money(v, MON) for v in _t[f"valor_{SUF}"]],
-            "Modelo hoy (escenario guardado)": [fmt_money(_modelo.get(g, 0.0), MON) for g in _t.index],
+            "Ciudad": [SEDE_NICE.get(g, g) for g in _gs],
+            "Con la foto congelada": [fmt_money(_cong.get(g, 0.0), MON) for g in _gs],
+            "Con los datos de hoy": [fmt_money(_vivo.get(g, 0.0), MON) for g in _gs],
         }), hide_index=True, width="stretch")
-        st.caption(f"Congelada el {pd.to_datetime(_info['congelado_at']).tz_convert('America/Bogota'):%d/%m/%Y %H:%M} "
-                   f"por {_info['congelado_por']} ({_info['origen']}).")
-    if st.button("Congelar con los valores de hoy" if _cg.empty
-                 else "Reemplazar la meta congelada con los valores de hoy",
+        st.caption(f"Foto tomada el {pd.to_datetime(_info_cg[0]).tz_convert('America/Bogota'):%d/%m/%Y %H:%M} "
+                   f"por {_info_cg[1]} ({_info_cg[2]}). Ambas columnas usan el escenario guardado "
+                   "de todas las ciudades.")
+    if st.button("Congelar con los datos de hoy" if not _info_cg
+                 else "Reemplazar la foto con los datos de hoy",
                  key=f"congelar_{target.isoformat()}",
-                 help="Usa el escenario GUARDADO de todas las ciudades (no el filtro de sedes)."):
+                 help="Toma la flota, la ocupación base y el RPD de hoy. Cambia la meta de los asesores."):
         P.congelar(target, today, _u.get("username"), "manual desde Presupuesto")
         st.rerun()
 

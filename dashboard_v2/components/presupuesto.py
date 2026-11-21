@@ -56,7 +56,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 10
+API_VERSION = 11
 
 # Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
 # FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
@@ -574,16 +574,11 @@ def real_t(desde_iso: str, hasta_iso: str, suf: str) -> pd.Series:
 def presupuesto_ciudad(target: dt.date, suf: str, today: dt.date) -> pd.Series:
     """Presupuesto de tarifa del mes por CIUDAD con el escenario GUARDADO (Base), igual
     al total de 10_Presupuesto sin filtro de sedes: flota de la foto x dias del mes x
-    ocupacion del escenario x RPD de la celda. Lo usa 14_Metas_Sede, donde los
+    ocupacion del escenario x RPD de la celda, sobre las celdas CONGELADAS del mes
+    si existen (base_mes). Lo usa 14_Metas_Sede, donde los
     asesores ven la meta pero no la pueden editar."""
     days = calendar.monthrange(target.year, target.month)[1]
-    win_start, win_end = window_for(target, today)
-    snap = snapshot_date(target, last_gold_day())
-    excl = excluded_plates(target.isoformat())
-    excl_t = excluded_plates_rates(target.isoformat(), win_start.isoformat())
-    base_df, factor, _plates, rates = base_inputs(
-        win_start.isoformat(), win_end.isoformat(), target.isoformat(), suf, snap.isoformat(),
-        excl, recat_map(), excl_t, ubicaciones(target.isoformat()))
+    base_df, factor, _plates, rates, _cong = base_mes(target, suf, today)
     if base_df.empty:
         return pd.Series(dtype=float)
     ss, sc, scell = saved_overrides(target.isoformat())
@@ -629,74 +624,130 @@ def semanas_mes(target: dt.date) -> list:
 
 
 # =============================================================================
-# Meta CONGELADA del mes (2026-11-21)
+# Presupuesto CONGELADO del mes (2026-11-21)
 # =============================================================================
-# El presupuesto se recalcula con los datos de cada noche: si Sixt da de baja un
-# carro, gold borra su historia (tambien el dia 1 del mes) y la meta baja; una
-# correccion en la ventana de 3 meses mueve tasas. Nov-2026 arranco en 126.465 USD y
-# al 21-nov el modelo daba 123.948. La meta que ven los asesores NO puede moverse
-# sola: se guarda una foto por (mes, ciudad) y 14_Metas_Sede lee esa foto.
+# El modelo se recalcula con los datos de cada noche y se MUEVE solo: si Sixt da de
+# baja un carro, gold borra su historia (tambien el dia 1 del mes) y la flota baja; una
+# correccion en la ventana de 3 meses mueve ocupacion y RPD. Nov-2026 arranco en
+# 126.465 USD y al 21-nov daba 123.948 sin que nadie editara nada. Por eso se congelan
+# los DATOS DE ENTRADA de cada celda (ciudad x categoria): flota, ocupacion base y RPD
+# (USD y COP). Presupuesto y Metas de la sede calculan sobre esa foto + el escenario
+# guardado, asi que dicen lo mismo; solo una edicion deliberada de la ocupacion mueve
+# la meta. Las tasas de celdas que no estan en la foto siguen en vivo (fallback).
 
-CONG_TABLE = "operational.presupuesto_congelado"
+CELDA_TABLE = "operational.presupuesto_congelado_celda"
 
 
 @st.cache_resource
 def ensure_congelado_table() -> None:
     execute_write(f"""
-        CREATE TABLE IF NOT EXISTS {CONG_TABLE} (
+        CREATE TABLE IF NOT EXISTS {CELDA_TABLE} (
             mes            date NOT NULL,
             ciudad         text NOT NULL,
-            valor_usd      numeric NOT NULL,
-            valor_cop      numeric NOT NULL,
+            acriss         text NOT NULL,
+            n              integer NOT NULL,
+            occ_base       numeric NOT NULL,
+            rpd_usd        numeric NOT NULL,
+            rpd_cop        numeric NOT NULL,
             origen         text,
             congelado_por  text,
             congelado_at   timestamptz DEFAULT now(),
-            PRIMARY KEY (mes, ciudad)
+            PRIMARY KEY (mes, ciudad, acriss)
         )
     """, {})
 
 
-def congelado(target_iso: str) -> pd.DataFrame:
-    """Meta congelada del mes: 1 fila por ciudad (vacio si no se congelo)."""
+def celdas_congeladas(target_iso: str) -> pd.DataFrame:
     ensure_congelado_table()
-    d = load_query(f"""SELECT ciudad, valor_usd, valor_cop, origen, congelado_por, congelado_at
-                       FROM {CONG_TABLE} WHERE mes = :m""", {"m": target_iso})
-    for c in ("valor_usd", "valor_cop"):
+    d = load_query(f"""SELECT ciudad, acriss, n, occ_base, rpd_usd, rpd_cop, origen,
+                              congelado_por, congelado_at
+                       FROM {CELDA_TABLE} WHERE mes = :m""", {"m": target_iso})
+    for c in ("n", "occ_base", "rpd_usd", "rpd_cop"):
         d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
     return d
 
 
-def congelar(target: dt.date, today: dt.date, usuario: str, origen: str) -> pd.DataFrame:
-    """Guarda (o reemplaza) la meta del mes con el valor ACTUAL del modelo
-    (escenario guardado), en USD y COP, para todas las ciudades."""
+def info_congelado(target_iso: str):
+    """(congelado_at, congelado_por, origen) de la foto del mes, o None."""
+    d = celdas_congeladas(target_iso)
+    if d.empty:
+        return None
+    r = d.sort_values("congelado_at").iloc[-1]
+    return r["congelado_at"], r["congelado_por"], r["origen"]
+
+
+def _base_vivo(target: dt.date, suf: str, today: dt.date):
+    win_start, win_end = window_for(target, today)
+    snap = snapshot_date(target, last_gold_day())
+    return base_inputs(
+        win_start.isoformat(), win_end.isoformat(), target.isoformat(), suf, snap.isoformat(),
+        excluded_plates(target.isoformat()), recat_map(),
+        excluded_plates_rates(target.isoformat(), win_start.isoformat()),
+        ubicaciones(target.isoformat()))
+
+
+def base_mes(target: dt.date, suf: str, today: dt.date, vivo: bool = False):
+    """base_inputs del mes + si esta congelado: (base_df, factor, plates, rates, congelado).
+    Con foto, base_df (flota, ocupacion base y RPD por celda) sale de la foto; plates
+    (listado de placas) y rates (fallback de celdas nuevas) siguen en vivo.
+    vivo=True ignora la foto (para comparar)."""
+    base_df, factor, plates, rates = _base_vivo(target, suf, today)
+    cg = pd.DataFrame() if vivo else celdas_congeladas(target.isoformat())
+    if cg.empty:
+        return base_df, factor, plates, rates, False
+    fz = pd.DataFrame({"sede": cg["ciudad"], "acriss": cg["acriss"], "n": cg["n"].astype(int),
+                       "occ_base": cg["occ_base"].astype(float),
+                       "rpd": cg[f"rpd_{suf}"].astype(float)})
+    return fz, factor, plates, rates, True
+
+
+def presupuesto_ciudad_de(base_df: pd.DataFrame, target: dt.date, today: dt.date) -> pd.Series:
+    """Total por ciudad de un base_df dado (columna rpd) con el escenario guardado."""
+    days = calendar.monthrange(target.year, target.month)[1]
+    _b, factor, _p, rates = _base_vivo(target, "usd", today)
+    ss, sc, scell = saved_overrides(target.isoformat())
+    occ = scenario_occ(base_df, rates, factor, ss, sc, scell)
+    rev = base_df.apply(lambda r: r["n"] * days * occ(r["sede"], r["acriss"]) * r["rpd"], axis=1)
+    return rev.groupby(base_df["sede"]).sum()
+
+
+def congelar(target: dt.date, today: dt.date, usuario: str, origen: str,
+             ajuste_ciudad_usd: dict = None) -> None:
+    """Guarda (o reemplaza) la foto del mes con los datos de HOY. ajuste_ciudad_usd
+    {CIUDAD: total_usd} escala el RPD de cada ciudad para que el total con el escenario
+    guardado de exactamente ese valor (nov-2026: arranco antes de que existiera la foto
+    y se cargo con los valores que tenia la direccion al inicio del mes)."""
     ensure_congelado_table()
-    usd = presupuesto_ciudad(target, "usd", today)
-    cop = presupuesto_ciudad(target, "cop", today)
-    rows = [{"m": target.isoformat(), "c": g, "u": round(float(usd.get(g, 0.0)), 2),
-             "p": round(float(cop.get(g, 0.0)), 0), "o": origen, "by": usuario}
-            for g in usd.index if float(usd.get(g, 0.0)) > 0]
-    if rows:
-        execute_write(f"""
-            INSERT INTO {CONG_TABLE} (mes, ciudad, valor_usd, valor_cop, origen, congelado_por, congelado_at)
-            VALUES (:m, :c, :u, :p, :o, :by, NOW())
-            ON CONFLICT (mes, ciudad) DO UPDATE SET valor_usd = EXCLUDED.valor_usd,
-                valor_cop = EXCLUDED.valor_cop, origen = EXCLUDED.origen,
-                congelado_por = EXCLUDED.congelado_por, congelado_at = NOW()
-        """, rows)
-        load_query.clear()
-    return congelado(target.isoformat())
+    b_usd = _base_vivo(target, "usd", today)[0]
+    b_cop = _base_vivo(target, "cop", today)[0]
+    if b_usd.empty:
+        return
+    b = b_usd.merge(b_cop[["sede", "acriss", "rpd"]].rename(columns={"rpd": "rpd_cop"}),
+                    on=["sede", "acriss"], how="left").rename(columns={"rpd": "rpd_usd"})
+    if ajuste_ciudad_usd:
+        actual = presupuesto_ciudad_de(b.rename(columns={"rpd_usd": "rpd"}), target, today)
+        for g, v in ajuste_ciudad_usd.items():
+            if actual.get(g, 0):
+                k = float(v) / float(actual[g])
+                b.loc[b["sede"] == g, "rpd_usd"] *= k
+                b.loc[b["sede"] == g, "rpd_cop"] *= k
+    rows = [{"m": target.isoformat(), "c": r["sede"], "a": r["acriss"], "n": int(r["n"]),
+             "o": float(r["occ_base"]), "ru": float(r["rpd_usd"]),
+             "rc": float(r["rpd_cop"]) if pd.notna(r["rpd_cop"]) else 0.0,
+             "og": origen, "by": usuario} for _, r in b.iterrows()]
+    execute_write(f"DELETE FROM {CELDA_TABLE} WHERE mes = :m", {"m": target.isoformat()})
+    execute_write(f"""
+        INSERT INTO {CELDA_TABLE} (mes, ciudad, acriss, n, occ_base, rpd_usd, rpd_cop,
+                                   origen, congelado_por, congelado_at)
+        VALUES (:m, :c, :a, :n, :o, :ru, :rc, :og, :by, NOW())
+    """, rows)
+    load_query.clear()
 
 
 def meta_ciudad(target: dt.date, suf: str, today: dt.date, usuario: str = "sistema"):
     """Meta del mes por ciudad para 14_Metas_Sede: (Series ciudad -> valor, info).
-    - Hay foto congelada -> la foto (no se mueve aunque cambien los datos).
-    - Mes EN CURSO sin foto -> se congela en este momento (la primera vez que alguien
-      abre la pagina en el mes) y se usa la foto.
-    - Mes pasado sin foto -> el modelo en vivo (aviso en la pagina)."""
-    cg = congelado(target.isoformat())
-    if cg.empty and target == dt.date(today.year, today.month, 1):
-        cg = congelar(target, today, usuario, "automatico al iniciar el mes")
-    if cg.empty:
-        return presupuesto_ciudad(target, suf, today), None
-    info = cg.sort_values("congelado_at").iloc[-1]
-    return cg.set_index("ciudad")[f"valor_{suf}"], info
+    Mes EN CURSO sin foto -> se congela en este momento (la primera vez que alguien
+    abre la pagina en el mes). Mes pasado sin foto -> modelo en vivo (info None)."""
+    if target == dt.date(today.year, today.month, 1) and info_congelado(target.isoformat()) is None:
+        congelar(target, today, usuario, "automatico al iniciar el mes")
+    return presupuesto_ciudad(target, suf, today), info_congelado(target.isoformat())
