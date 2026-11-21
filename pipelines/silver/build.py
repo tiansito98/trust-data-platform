@@ -2252,6 +2252,9 @@ segraw AS (
                 ELSE v.rvnc_return_datm END ret_seg,
            CASE WHEN r.rntl_return_datm < TIMESTAMP '1900-01-01' OR r.rntl_return_datm > NOW()
                 THEN NULL ELSE r.rntl_return_datm END ret_hdr,
+           -- devolucion PROGRAMADA del header (aunque sea futura): divisor del revenue
+           CASE WHEN r.rntl_return_datm < TIMESTAMP '1900-01-01' THEN NULL
+                ELSE r.rntl_return_datm END ret_prog,
            LEAD(v.rvnc_handover_datm) OVER (PARTITION BY v.vhcl_int_num
                 ORDER BY v.rvnc_handover_datm, v.rntl_mvnr, v.rvnc_hser) next_ho_veh,
            LEAD(v.rvnc_handover_datm) OVER (PARTITION BY v.rntl_mvnr
@@ -2278,7 +2281,12 @@ seg0 AS (
            v.ret_eff,
            -- ret_eff NULL = renta realmente abierta -> capada a hoy.
            EXTRACT(EPOCH FROM (LEAST(COALESCE(v.ret_eff, NOW()), NOW())
-                               - v.rvnc_handover_datm)) dur_s
+                               - v.rvnc_handover_datm)) dur_s,
+           -- duracion COMPLETA (2026-11-21): la renta abierta hasta su devolucion
+           -- programada (o hoy si ya se paso). Solo para DIVIDIR el revenue: los dias
+           -- que se emiten siguen siendo los que ya pasaron (dur_s).
+           EXTRACT(EPOCH FROM (COALESCE(v.ret_eff, GREATEST(COALESCE(v.ret_prog, NOW()), NOW()))
+                               - v.rvnc_handover_datm)) dur_full_s
     FROM segret v
     JOIN plate p ON p.vhcl_int_num=v.vhcl_int_num
     LEFT JOIN silver.dim_branches bh ON bh.brnc_code=v.brnc_code_handover
@@ -2300,14 +2308,19 @@ ctrflag AS (
 seg AS (
     SELECT s.*,
            (NOT s.is_transfer AND s.dur_s < 3600 AND (cf.has_real OR cf.neto < 1)) is_admin,
-           GREATEST(CEIL((s.dur_s - 3600)/86400.0)::int, 1) seg_days  -- 24h con hora de gracia
+           GREATEST(CEIL((s.dur_s - 3600)/86400.0)::int, 1) seg_days,  -- 24h con hora de gracia
+           GREATEST(CEIL((s.dur_full_s - 3600)/86400.0)::int, 1) seg_days_full
     FROM seg0 s JOIN ctrflag cf ON cf.numero_contrato=s.numero_contrato
 ),
 -- N por contrato = suma de dias 24h(gracia) de los segmentos REALES (no transfer,
 -- no admin). El neto se reparte exacto entre esos dias -> revenue total conservado.
 ctr AS (
     SELECT numero_contrato,
-           SUM(seg_days) FILTER (WHERE NOT is_transfer AND NOT is_admin) n_contract
+           SUM(seg_days) FILTER (WHERE NOT is_transfer AND NOT is_admin) n_contract,
+           -- divisor del revenue: duracion COMPLETA. Antes era n_contract (dias hasta
+           -- hoy) y una renta abierta cargaba todo su valor en los dias transcurridos:
+           -- una semana ya pasada se recalculaba cada noche (Analitica != Metas).
+           SUM(seg_days_full) FILTER (WHERE NOT is_transfer AND NOT is_admin) n_full
     FROM seg GROUP BY 1
 ),
 -- ubicacion por placa (dias LIBRES; los rentados van a la sede de su renta): cada
@@ -2340,10 +2353,10 @@ first_ho AS (
 -- SU renta (no al timeline global, que un traslado espurio puede corromper).
 rented AS (
     SELECT s.placa, (s.ho_date+gs)::date fecha, s.sede_ho sede_r, s.ts_ho,
-           res.neto/NULLIF(ctr.n_contract,0) rev_usd,
-           (res.neto*res.trm)/NULLIF(ctr.n_contract,0) rev_cop,
-           res.t_rev/NULLIF(ctr.n_contract,0) tar_usd,
-           (res.t_rev*res.trm)/NULLIF(ctr.n_contract,0) tar_cop
+           res.neto/NULLIF(ctr.n_full,0) rev_usd,
+           (res.neto*res.trm)/NULLIF(ctr.n_full,0) rev_cop,
+           res.t_rev/NULLIF(ctr.n_full,0) tar_usd,
+           (res.t_rev*res.trm)/NULLIF(ctr.n_full,0) tar_cop
     FROM seg s
     JOIN ctr ON ctr.numero_contrato=s.numero_contrato
     JOIN resumen res ON res.numero_contrato=s.numero_contrato
@@ -2399,7 +2412,8 @@ LEFT JOIN rented_sede rs ON rs.placa=s.placa AND rs.fecha=s.fecha;
 def build_gold_cargo_dia(engine):
     """gold_cargo_dia: cargos por codigo prorrateados por dia 24h, grano
     (fecha x sede x codigo). TODO el cargo (prepago+counter, todos los periodos:
-    para ingreso cuentan completos), sin no-shows. Solo USD. Capado a hoy.
+    para ingreso cuentan completos), sin no-shows. Solo USD. Dias emitidos hasta hoy,
+    pero cada contrato dividido por su duracion COMPLETA (2026-11-21).
     Alimenta el desglose de cargos de 9_Analitica.
     """
     log("\n>> Construyendo gold_cargo_dia")
@@ -2430,8 +2444,14 @@ def build_gold_cargo_dia(engine):
         ),
         conteo AS (
             -- Dia = bloque de 24h con 1 HORA DE GRACIA (resta 3600s antes del CEIL).
+            -- N = duracion COMPLETA (2026-11-21, igual que gold_tarifa_dia): abierta ->
+            -- devolucion programada (o hoy si ya se paso). Antes LEAST(devolucion, NOW()):
+            -- una renta abierta cargaba todo su valor en los dias transcurridos y las
+            -- semanas ya pasadas cambiaban cada noche. Se emiten solo dias <= hoy.
             SELECT c.*, GREATEST(CEIL((EXTRACT(EPOCH FROM (
-                       LEAST(COALESCE(rf.hora_devolucion, NOW()), NOW())
+                       CASE WHEN rf.estado_rental = 'Open'
+                            THEN GREATEST(COALESCE(rf.hora_devolucion, NOW()), NOW())
+                            ELSE COALESCE(rf.hora_devolucion, NOW()) END
                        - COALESCE(rf.hora_handover, c.f_ini::timestamp))) - 3600) / 86400.0)::int, 1) AS n
             FROM cargos c
             JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato
@@ -2490,7 +2510,9 @@ def build_gold_tarifa_dia(engine):
             -- Dia = bloque de 24h con 1 HORA DE GRACIA; N sobre la duracion completa.
             SELECT c.*, (rf.estado_rental = 'Open') AS abierto,
                    GREATEST(CEIL((EXTRACT(EPOCH FROM (
-                       COALESCE(rf.hora_devolucion, NOW())
+                       CASE WHEN rf.estado_rental = 'Open'
+                            THEN GREATEST(COALESCE(rf.hora_devolucion, NOW()), NOW())
+                            ELSE COALESCE(rf.hora_devolucion, NOW()) END
                        - COALESCE(rf.hora_handover, c.f_ini::timestamp))) - 3600) / 86400.0)::int, 1) AS n
             FROM cargos c
             JOIN silver.vw_rentals_full rf ON rf.numero_contrato = c.numero_contrato

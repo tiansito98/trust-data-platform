@@ -591,7 +591,8 @@ def presupuesto_ciudad(target: dt.date, suf: str, today: dt.date) -> pd.Series:
 def tarifa_dia(desde_iso: str, hasta_iso: str, suf: str) -> pd.DataFrame:
     """Tarifa (cargo T) por (fecha x ciudad x sede) de silver.gold_tarifa_dia: cada
     contrato repartido sobre su duracion COMPLETA (programada si sigue abierto), asi
-    que el real a la fecha NO sale inflado a mitad de mes como con gold_cargo_dia.
+    que el real a la fecha no sale inflado a mitad de mes (desde 2026-11-21 gold_cargo_dia
+    usa la misma regla y cuadra con esta tabla).
     Trae tambien los dias futuros de las rentas abiertas (ya vendidos)."""
     d = load_query(f"""
         SELECT fecha, sede, tar_{suf} AS t_val, tar_abierto_{suf} AS t_abierto

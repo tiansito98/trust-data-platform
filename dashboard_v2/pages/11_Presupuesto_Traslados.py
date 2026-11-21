@@ -200,12 +200,12 @@ real_rev = (P.real_t(mstart.isoformat(), cut.isoformat(), SUF) if cut >= mstart
 real_rev = real_rev[real_rev.index.isin(ciudades)]
 presup_al_corte = (daily[daily["fecha"] <= cut].groupby("g")["val"].sum()
                    if cut >= mstart else pd.Series(dtype=float))
-# Mes en curso: NO se calcula cumplimiento. gold_cargo_dia reparte un contrato ABIERTO
-# solo sobre los dias ya transcurridos (LEAST(devolucion, NOW())), asi que el real a la
-# fecha sale inflado al principio del mes (una renta de 30 dias entregada ayer carga
-# todo su valor en 1-2 dias) y se corrige solo cuando el contrato cierra. Visto el
-# 2-oct-2026: "cumplimiento" de 272% en Bogota con 1 dia de datos.
-parcial = cut < mend
+# Hasta el 2026-11-21 el mes en curso NO mostraba cumplimiento: gold_cargo_dia repartia
+# un contrato ABIERTO solo sobre los dias ya transcurridos y el real a la fecha salia
+# inflado (272% en Bogota el 2-oct con 1 dia de datos). Ahora gold reparte cada contrato
+# sobre su duracion COMPLETA (programada si sigue abierto), asi que el real al corte es
+# comparable y una semana ya pasada no cambia de una noche a otra.
+parcial = False
 
 k1, k2, k3, k4 = st.columns(4)
 kpi(k1, f"Presupuesto foto ({MON})", fmt_money(tot_base, MON),
