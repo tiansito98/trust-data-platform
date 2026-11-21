@@ -56,7 +56,7 @@ from .common import load_query, execute_write
 # pagina pero puede seguir sirviendo este modulo VIEJO desde sys.modules; la pagina
 # nueva + el modulo viejo revento con KeyError: 'f_occ' (2026-10-02). Con la version,
 # la pagina detecta el modulo viejo y lo recarga (ver load_presupuesto_module()).
-API_VERSION = 9
+API_VERSION = 10
 
 # Ciudades del presupuesto. Una sede que no matchee ninguna cae en "OTRA" y queda
 # FUERA del presupuesto: al abrir una sede nueva hay que agregarla aca.
@@ -626,3 +626,77 @@ def semanas_mes(target: dt.date) -> list:
         tramos[-2][1] = tramos[-1][1]
         tramos.pop()
     return [(i + 1, a, b) for i, (a, b) in enumerate(tramos)]
+
+
+# =============================================================================
+# Meta CONGELADA del mes (2026-11-21)
+# =============================================================================
+# El presupuesto se recalcula con los datos de cada noche: si Sixt da de baja un
+# carro, gold borra su historia (tambien el dia 1 del mes) y la meta baja; una
+# correccion en la ventana de 3 meses mueve tasas. Nov-2026 arranco en 126.465 USD y
+# al 21-nov el modelo daba 123.948. La meta que ven los asesores NO puede moverse
+# sola: se guarda una foto por (mes, ciudad) y 14_Metas_Sede lee esa foto.
+
+CONG_TABLE = "operational.presupuesto_congelado"
+
+
+@st.cache_resource
+def ensure_congelado_table() -> None:
+    execute_write(f"""
+        CREATE TABLE IF NOT EXISTS {CONG_TABLE} (
+            mes            date NOT NULL,
+            ciudad         text NOT NULL,
+            valor_usd      numeric NOT NULL,
+            valor_cop      numeric NOT NULL,
+            origen         text,
+            congelado_por  text,
+            congelado_at   timestamptz DEFAULT now(),
+            PRIMARY KEY (mes, ciudad)
+        )
+    """, {})
+
+
+def congelado(target_iso: str) -> pd.DataFrame:
+    """Meta congelada del mes: 1 fila por ciudad (vacio si no se congelo)."""
+    ensure_congelado_table()
+    d = load_query(f"""SELECT ciudad, valor_usd, valor_cop, origen, congelado_por, congelado_at
+                       FROM {CONG_TABLE} WHERE mes = :m""", {"m": target_iso})
+    for c in ("valor_usd", "valor_cop"):
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    return d
+
+
+def congelar(target: dt.date, today: dt.date, usuario: str, origen: str) -> pd.DataFrame:
+    """Guarda (o reemplaza) la meta del mes con el valor ACTUAL del modelo
+    (escenario guardado), en USD y COP, para todas las ciudades."""
+    ensure_congelado_table()
+    usd = presupuesto_ciudad(target, "usd", today)
+    cop = presupuesto_ciudad(target, "cop", today)
+    rows = [{"m": target.isoformat(), "c": g, "u": round(float(usd.get(g, 0.0)), 2),
+             "p": round(float(cop.get(g, 0.0)), 0), "o": origen, "by": usuario}
+            for g in usd.index if float(usd.get(g, 0.0)) > 0]
+    if rows:
+        execute_write(f"""
+            INSERT INTO {CONG_TABLE} (mes, ciudad, valor_usd, valor_cop, origen, congelado_por, congelado_at)
+            VALUES (:m, :c, :u, :p, :o, :by, NOW())
+            ON CONFLICT (mes, ciudad) DO UPDATE SET valor_usd = EXCLUDED.valor_usd,
+                valor_cop = EXCLUDED.valor_cop, origen = EXCLUDED.origen,
+                congelado_por = EXCLUDED.congelado_por, congelado_at = NOW()
+        """, rows)
+        load_query.clear()
+    return congelado(target.isoformat())
+
+
+def meta_ciudad(target: dt.date, suf: str, today: dt.date, usuario: str = "sistema"):
+    """Meta del mes por ciudad para 14_Metas_Sede: (Series ciudad -> valor, info).
+    - Hay foto congelada -> la foto (no se mueve aunque cambien los datos).
+    - Mes EN CURSO sin foto -> se congela en este momento (la primera vez que alguien
+      abre la pagina en el mes) y se usa la foto.
+    - Mes pasado sin foto -> el modelo en vivo (aviso en la pagina)."""
+    cg = congelado(target.isoformat())
+    if cg.empty and target == dt.date(today.year, today.month, 1):
+        cg = congelar(target, today, usuario, "automatico al iniciar el mes")
+    if cg.empty:
+        return presupuesto_ciudad(target, suf, today), None
+    info = cg.sort_values("congelado_at").iloc[-1]
+    return cg.set_index("ciudad")[f"valor_{suf}"], info

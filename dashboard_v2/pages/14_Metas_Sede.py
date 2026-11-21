@@ -5,9 +5,11 @@ Para los asesores de cada sede (y el admin). Solo LECTURA: el presupuesto lo arm
 direccion en 10_Presupuesto (escenario guardado); aqui se reparte por semana y se
 compara con lo vendido.
 
-- Meta = presupuesto del mes de la CIUDAD, SOLO tarifa (cargo T: renta del carro, sin
-  adicionales, coberturas ni tax). Es el mismo total de 10_Presupuesto sin filtro de
-  sedes (P.presupuesto_ciudad). Medellin tiene dos sedes y UNA meta.
+- Meta = presupuesto CONGELADO del mes (operational.presupuesto_congelado, P.meta_ciudad;
+  se congela solo la primera vez que se abre la pagina en el mes, o desde 10_Presupuesto).
+  El valor congelado es el presupuesto de la CIUDAD, SOLO tarifa (cargo T: renta del
+  carro, sin adicionales, coberturas ni tax), = total de 10_Presupuesto sin filtro de
+  sedes en ese momento (P.presupuesto_ciudad). Medellin tiene dos sedes y UNA meta.
 - Meta semanal = meta del mes x dias de la semana / dias del mes. Semanas lunes-domingo;
   un pedazo de menos de 4 dias al inicio o al final del mes se une a la semana vecina.
 - Real = silver.gold_tarifa_dia: tarifa T repartida por dia 24h sobre la duracion
@@ -32,7 +34,7 @@ from components.common import inject_styles, render_header, section, kpi, fmt_mo
 from components.filters import render_sidebar_filters
 from components import presupuesto as P
 
-P_API_REQUERIDA = 9
+P_API_REQUERIDA = 10
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -40,7 +42,7 @@ from components import auth as _auth
 if not hasattr(_auth, "PAGINAS_PARA_TODOS"):   # Streamlit Cloud con el auth viejo en memoria
     import importlib
     _auth = importlib.reload(_auth)
-from components.auth import require_auth, require_page, logout_button, is_admin
+from components.auth import require_auth, require_page, logout_button, is_admin, get_current_user
 
 st.set_page_config(page_title="TRUST - Metas de la sede", layout="wide")
 require_auth()
@@ -82,7 +84,8 @@ ciudad = c_ciudad.selectbox(
 alcance = grupos if ciudad == TODAS else [ciudad]
 
 # --- Meta del mes ------------------------------------------------------------
-ppto = P.presupuesto_ciudad(target, SUF, today)
+_usr = (get_current_user() or {}).get("username", "sistema")
+ppto, congelada = P.meta_ciudad(target, SUF, today, _usr)
 meta_mes = float(ppto.reindex(alcance).fillna(0).sum())
 if meta_mes <= 0:
     st.info(f"Todavía no hay presupuesto para {P.mes_label(target)} en esta ciudad.")
@@ -105,7 +108,10 @@ cerrado = corte >= fin_mes
 st.caption(
     f"**{P.mes_label(target)}** · {', '.join(P.SEDE_NICE.get(g, g) for g in alcance)} · {MON}. "
     "Solo **tarifa** (renta del carro, cargo T): sin adicionales, coberturas ni tax. "
-    "La meta es el presupuesto que define la dirección para el mes. "
+    + ("La meta es el presupuesto que definió la dirección para el mes, **congelado el "
+       f"{pd.to_datetime(congelada['congelado_at']).tz_convert('America/Bogota'):%d/%m/%Y}**: "
+       "no cambia aunque se actualicen los datos. " if congelada is not None
+       else "Meta calculada con los datos de hoy (este mes no se congeló). ")
     + (f"Datos hasta el **{corte:%d/%m/%Y}** (ayer; se actualiza cada madrugada)."
        if not cerrado else "Mes cerrado.")
     + " El rango de fechas del menú lateral no aplica en esta página.")

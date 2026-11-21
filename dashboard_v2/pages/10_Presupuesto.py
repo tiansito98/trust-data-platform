@@ -55,7 +55,7 @@ from components import presupuesto as P
 # Streamlit Cloud puede seguir sirviendo una version VIEJA de components/presupuesto
 # despues de un push (recarga la pagina, no siempre los modulos ya importados). Si el
 # modulo cargado es anterior a lo que esta pagina necesita, se recarga.
-P_API_REQUERIDA = 8
+P_API_REQUERIDA = 10
 if getattr(P, "API_VERSION", 0) < P_API_REQUERIDA:
     import importlib
     P = importlib.reload(P)
@@ -273,6 +273,35 @@ kpi(k2, "Flota", fmt_int(tot_fleet), f"{fmt_int(tot_cardays)} carro-días")
 kpi(k3, "Ocupación", f"{occ_glob*100:.1f}%", f"{fmt_int(round(tot_rented))} días rentados")
 kpi(k4, f"RPD tarifa ({MON})", fmt_money(tot_rev / tot_rented if tot_rented else 0, MON),
     "tarifa por día rentado")
+
+# --- Meta congelada (la que ven los asesores en Metas de la sede) -------------
+_cg = P.congelado(target.isoformat())
+with st.expander(
+        ("Meta congelada del mes: " + fmt_money(_cg[f"valor_{SUF}"].sum(), MON)
+         + " (la que ven los asesores en Metas de la sede)") if not _cg.empty
+        else "Meta congelada del mes: todavía no se congeló", expanded=False):
+    st.caption("El presupuesto de esta página se recalcula con los datos de cada noche (si "
+               "Sixt da de baja un carro o corrige contratos, se mueve). La meta de los "
+               "asesores es una FOTO que no cambia sola: se toma automáticamente la primera "
+               "vez que alguien abre *Metas de la sede* en el mes, o con el botón de abajo.")
+    if not _cg.empty:
+        _modelo = P.presupuesto_ciudad(target, SUF, today)
+        _t = _cg.set_index("ciudad").reindex([g for g in SEDE_ORDER if g in set(_cg["ciudad"])])
+        _info = _cg.sort_values("congelado_at").iloc[-1]
+        st.dataframe(pd.DataFrame({
+            "Ciudad": [SEDE_NICE.get(g, g) for g in _t.index],
+            "Meta congelada": [fmt_money(v, MON) for v in _t[f"valor_{SUF}"]],
+            "Modelo hoy (escenario guardado)": [fmt_money(_modelo.get(g, 0.0), MON) for g in _t.index],
+        }), hide_index=True, width="stretch")
+        st.caption(f"Congelada el {pd.to_datetime(_info['congelado_at']).tz_convert('America/Bogota'):%d/%m/%Y %H:%M} "
+                   f"por {_info['congelado_por']} ({_info['origen']}).")
+    if st.button("Congelar con los valores de hoy" if _cg.empty
+                 else "Reemplazar la meta congelada con los valores de hoy",
+                 key=f"congelar_{target.isoformat()}",
+                 help="Usa el escenario GUARDADO de todas las ciudades (no el filtro de sedes)."):
+        P.congelar(target, today, _u.get("username"), "manual desde Presupuesto")
+        st.rerun()
+
 
 def _rev_at(mult):
     occ = (df["occ_base"] * df["fs"] * df["fc"] * mult).clip(upper=0.98)
