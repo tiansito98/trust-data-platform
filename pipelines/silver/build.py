@@ -2036,6 +2036,15 @@ def build_comision_dia(engine):
       - Dias = fechas consecutivas desde la entrega (entrega + 0..N-1).
       - Atribuida al operador de HANDOVER (quien abrio/vendio), aunque el pedazo
         caiga en un mes posterior. Consistente con hard rule 13.
+      - EXCEPCION UPGRADE (2026-11-21): el cargo UP comisiona a quien ENTREGO el
+        carro de mayor categoria, si el upgrade se hizo despues de abrir (tramo
+        rvnc_hser>0 de fact_rental_vehicles cuya letra de tamano ACRISS sube vs el
+        tramo anterior). El datashare NO trae quien carga cada cargo (la tabla de
+        cargos no tiene operador ni log de cambios); el cambio de carro es la unica
+        huella. Un cambio a la MISMA categoria (reemplazo) no mueve la comision.
+        Caso: 9524830927 (abre 7798873 en SFAR, upgrade a RFAR lo entrega 7798630).
+        `operador_comision_codigo` = a quien se le paga; `operador_handover_codigo`
+        sigue siendo quien abrio; `regla_operador` = APERTURA | UPGRADE.
 
     La comision final = 5% de la base (el 5% lo aplica quien paga).
     Impacto vs el metodo por-entrega anterior: docs/private/comparativa_comisiones_prorrateo.md
@@ -2047,10 +2056,31 @@ def build_comision_dia(engine):
     _exec(engine, "DROP VIEW  IF EXISTS silver.fact_comision_dia CASCADE")
     _exec(engine, f"""
         CREATE TABLE silver.fact_comision_dia AS
-        WITH cargos AS (
+        WITH tramos AS (
+            -- rango de tamano ACRISS (1a letra) de cada carro de la renta
+            SELECT v.rntl_mvnr, v.rvnc_hser, v.oprt_bed_handover AS op,
+                   NULLIF(POSITION(LEFT(dv.vhgr_crs, 1) IN 'MNEHCDIJSRFGPULWOX'), 0) AS rk,
+                   LAG(NULLIF(POSITION(LEFT(dv.vhgr_crs, 1) IN 'MNEHCDIJSRFGPULWOX'), 0))
+                       OVER (PARTITION BY v.rntl_mvnr ORDER BY v.rvnc_hser) AS rk_prev
+            FROM silver.fact_rental_vehicles v
+            LEFT JOIN silver.dim_vehicles dv ON dv.vhcl_int_num = v.vhcl_int_num
+            WHERE v.mndt_code = 409
+        ),
+        upgrade AS (
+            -- primer cambio de carro a una categoria MAYOR, con su asesor de entrega
+            SELECT DISTINCT ON (rntl_mvnr) rntl_mvnr AS numero_contrato, op AS operador_upgrade
+            FROM tramos
+            WHERE rvnc_hser > 0 AND rk > rk_prev AND op IS NOT NULL
+            ORDER BY rntl_mvnr, rvnc_hser
+        ),
+        cargos AS (
             SELECT
                 d.numero_contrato,
                 d.operador_handover_codigo,
+                CASE WHEN d.cargo_codigo = 'UP' AND u.operador_upgrade IS NOT NULL
+                     THEN u.operador_upgrade ELSE d.operador_handover_codigo END AS operador_comision_codigo,
+                CASE WHEN d.cargo_codigo = 'UP' AND u.operador_upgrade IS NOT NULL
+                     THEN 'UPGRADE' ELSE 'APERTURA' END                       AS regla_operador,
                 d.sede_handover,
                 d.sede_handover_codigo,
                 d.fecha_handover_real::date AS f_handover_date,
@@ -2058,12 +2088,13 @@ def build_comision_dia(engine):
                 SUM(ROUND(d.counter_cargo_usd::numeric * COALESCE(t.trm_cop_per_usd, 0), 0)) AS base_cop
             FROM silver.vw_rentals_detail d
             LEFT JOIN silver.dim_trm_diaria t ON t.fecha = d.fecha_handover_real::date
+            LEFT JOIN upgrade u ON u.numero_contrato = d.numero_contrato
             WHERE d.cargo_codigo IN ({codes})
               AND d.counter_cargo_usd > 0.01
               AND COALESCE(d.prepagado_cargo_usd, 0) < 0.01
               AND COALESCE(d.cargo_periodo, 0) = 0
               AND TRIM(COALESCE(d.placa, '')) <> ''
-            GROUP BY 1, 2, 3, 4, 5
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
             HAVING SUM(d.counter_cargo_usd) > 0.01
         ),
         conteo AS (
@@ -2090,6 +2121,8 @@ def build_comision_dia(engine):
         SELECT
             numero_contrato,
             operador_handover_codigo,
+            operador_comision_codigo,
+            regla_operador,
             sede_handover,
             sede_handover_codigo,
             (f_handover_date + gs)::date                  AS fecha,
@@ -2099,7 +2132,7 @@ def build_comision_dia(engine):
         FROM conteo
         CROSS JOIN generate_series(0, n_dias - 1) AS gs
     """)
-    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_comision_dia_op_fecha ON silver.fact_comision_dia(operador_handover_codigo, fecha)")
+    _exec(engine, "CREATE INDEX IF NOT EXISTS idx_comision_dia_op_fecha ON silver.fact_comision_dia(operador_comision_codigo, fecha)")
     _exec(engine, "CREATE INDEX IF NOT EXISTS idx_comision_dia_fecha    ON silver.fact_comision_dia(fecha)")
     n = _scalar(engine, "SELECT COUNT(*) FROM silver.fact_comision_dia")
     log(f"   {n:,} filas ({time.time()-started:.1f}s)")

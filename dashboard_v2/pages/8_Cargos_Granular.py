@@ -510,10 +510,12 @@ df["counter_comisionable_cop"] = df["counter_cop"].where(df["es_base_comision"],
 # Cada renta aporta SOLO sus dias dentro de la ventana [desde,hasta]: una renta
 # que cruza meses ya NO cuenta completa en el mes de entrega, sino que reparte
 # su base por dia (regla 24h). La base viene YA con IVA y en COP a TRM Banrep
-# del dia de entrega. Atribuida al operador de handover. Los flags es_base_comision
+# del dia de entrega. Atribuida al operador de handover, salvo el UPGRADE hecho
+# despues de abrir: ese va a quien entrego el carro mayor (operador_comision_codigo,
+# ver build_comision_dia). Los flags es_base_comision
 # de df siguen alimentando las secciones 1-2 (cargos/codigos por entrega).
 comision_sql = f"""
-    SELECT operador_handover_codigo         AS asesor_codigo,
+    SELECT operador_comision_codigo         AS asesor_codigo,
            COUNT(DISTINCT numero_contrato)  AS contratos,
            SUM(base_comision_usd_civa_dia)  AS base_comisionable_usd,
            SUM(base_comision_cop_civa_dia)  AS base_comisionable_cop
@@ -816,7 +818,7 @@ else:
                        SUM(base_comision_cop_civa_dia) AS base_cop
                 FROM silver.fact_comision_dia
                 WHERE fecha BETWEEN :desde AND :hasta
-                  AND operador_handover_codigo = :cod
+                  AND operador_comision_codigo = :cod
                   {sede_clause_comision}
                 GROUP BY numero_contrato
                 ORDER BY base_cop DESC
