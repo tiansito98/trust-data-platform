@@ -103,6 +103,45 @@ def _table_exists(engine, target: str) -> bool:
     return row is not None
 
 
+def _pg_type(dtype) -> str:
+    """Tipo Postgres para una columna NUEVA, a partir del dtype de pandas."""
+    s = str(dtype)
+    if s.startswith(("int", "Int")):
+        return "bigint"
+    if s.startswith(("float", "Float")):
+        return "double precision"
+    if s in ("bool", "boolean"):
+        return "boolean"
+    if s.startswith("datetime64"):
+        return "timestamp"
+    return "text"
+
+
+def ensure_columns(engine, target: str, df: pd.DataFrame) -> list[str]:
+    """Agrega a bronze.<target> las columnas del df que todavia no existen.
+
+    Bronze es espejo de Redshift (hard rule 2): cuando Sixt agrega una columna al
+    datashare, el SELECT * la trae y el INSERT reventaba con UndefinedColumn
+    (2026-11-26: rsrv_profile_auto_linked_flg en rs_fct_reservations tumbo el
+    pipeline). Ahora la columna se crea sola (ALTER TABLE ... ADD COLUMN IF NOT
+    EXISTS), las filas viejas quedan en NULL y se avisa en el log."""
+    target = _safe(target)
+    if not _table_exists(engine, target):
+        return []
+    with engine.begin() as conn:
+        existing = {r[0] for r in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'bronze' AND table_name = :t"), {"t": target}).fetchall()}
+        nuevas = [c for c in df.columns if c not in existing]
+        for c in nuevas:
+            conn.execute(text(
+                f'ALTER TABLE bronze."{target}" ADD COLUMN IF NOT EXISTS '
+                f'"{_safe(c)}" {_pg_type(df[c].dtype)}'))
+    if nuevas:
+        log(f"   COLUMNAS NUEVAS en la fuente, agregadas a bronze: {', '.join(nuevas)}")
+    return nuevas
+
+
 def upsert_to_bronze(engine, target: str, df: pd.DataFrame, pk_cols: list[str]):
     """
     DELETE filas con PK presente en df + INSERT con bulk via pandas.to_sql.
@@ -238,6 +277,7 @@ def refresh_table(rs_conn, engine, tbl_cfg: dict):
             else:
                 df["_loaded_at"] = datetime.now()
                 df["_source_table"] = source
+                ensure_columns(engine, target, df)
                 if pk:
                     upsert_to_bronze(engine, target, df, pk)
                 else:
